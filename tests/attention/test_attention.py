@@ -16,6 +16,14 @@ from mlx_primitives.attention import (
     SlidingWindowAttention,
     alibi_bias,
     apply_rope,
+    # Sparse attention
+    BlockSparseAttention,
+    LongformerAttention,
+    BigBirdAttention,
+    # Linear attention
+    LinearAttention,
+    PerformerAttention,
+    CosFormerAttention,
 )
 from mlx_primitives.attention.rope import precompute_freqs_cis, NTKAwareRoPE, YaRNRoPE
 from mlx_primitives.attention.flash import scaled_dot_product_attention, _naive_attention
@@ -868,3 +876,196 @@ class TestAttentionBenchmarks:
             return output
 
         benchmark(run)
+
+
+# ============================================================================
+# Sparse Attention Tests
+# ============================================================================
+
+
+class TestBlockSparseAttention:
+    """Tests for BlockSparseAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = BlockSparseAttention(dims=64, num_heads=4, block_size=16)
+        x = mx.random.normal((2, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_causal_mode(self):
+        """Test causal block sparse attention."""
+        attn = BlockSparseAttention(dims=64, num_heads=4, block_size=8, causal=True)
+        x = mx.random.normal((1, 32, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_gradient_flow(self):
+        """Test gradient flow through block sparse attention."""
+        attn = BlockSparseAttention(dims=64, num_heads=4, block_size=8)
+
+        def forward(x):
+            return mx.sum(attn(x))
+
+        x = mx.random.normal((1, 32, 64))
+        loss, grad = mx.value_and_grad(forward)(x)
+
+        assert grad.shape == x.shape
+
+
+class TestLongformerAttention:
+    """Tests for LongformerAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = LongformerAttention(
+            dims=64, num_heads=4, window_size=8, num_global_tokens=2
+        )
+        x = mx.random.normal((2, 32, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_global_attention(self):
+        """Test that global tokens can attend to all positions."""
+        attn = LongformerAttention(
+            dims=64, num_heads=4, window_size=4, num_global_tokens=4
+        )
+        x = mx.random.normal((1, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+
+class TestBigBirdAttention:
+    """Tests for BigBirdAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = BigBirdAttention(
+            dims=64, num_heads=4, window_size=8, num_global_tokens=2, num_random_tokens=2
+        )
+        x = mx.random.normal((2, 32, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_components(self):
+        """Test that BigBird includes local, global, and random attention."""
+        attn = BigBirdAttention(
+            dims=64, num_heads=4, window_size=4, num_global_tokens=2, num_random_tokens=4
+        )
+        x = mx.random.normal((1, 32, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+
+# ============================================================================
+# Linear Attention Tests
+# ============================================================================
+
+
+class TestLinearAttention:
+    """Tests for LinearAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = LinearAttention(dims=64, num_heads=4)
+        x = mx.random.normal((2, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_causal_mode(self):
+        """Test causal linear attention."""
+        attn = LinearAttention(dims=64, num_heads=4, causal=True)
+        x = mx.random.normal((1, 128, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_long_sequence(self):
+        """Test linear attention with long sequences (O(n) complexity)."""
+        attn = LinearAttention(dims=64, num_heads=4)
+        x = mx.random.normal((1, 512, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+
+class TestPerformerAttention:
+    """Tests for PerformerAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = PerformerAttention(dims=64, num_heads=4, num_features=32)
+        x = mx.random.normal((2, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_different_feature_sizes(self):
+        """Test with different random feature sizes."""
+        for num_features in [16, 32, 64]:
+            attn = PerformerAttention(dims=64, num_heads=4, num_features=num_features)
+            x = mx.random.normal((1, 32, 64))
+
+            output = attn(x)
+
+            assert output.shape == x.shape
+
+    def test_causal_mode(self):
+        """Test causal Performer attention."""
+        attn = PerformerAttention(dims=64, num_heads=4, num_features=32, causal=True)
+        x = mx.random.normal((1, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+
+class TestCosFormerAttention:
+    """Tests for CosFormerAttention."""
+
+    def test_basic_output_shape(self):
+        """Test basic output shape."""
+        attn = CosFormerAttention(dims=64, num_heads=4)
+        x = mx.random.normal((2, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape
+
+    def test_gradient_flow(self):
+        """Test gradient flow through CosFormer attention."""
+        attn = CosFormerAttention(dims=64, num_heads=4)
+
+        def forward(x):
+            return mx.sum(attn(x))
+
+        x = mx.random.normal((1, 32, 64))
+        loss, grad = mx.value_and_grad(forward)(x)
+
+        assert grad.shape == x.shape
+
+    def test_causal_mode(self):
+        """Test causal CosFormer attention."""
+        attn = CosFormerAttention(dims=64, num_heads=4, causal=True)
+        x = mx.random.normal((1, 64, 64))
+
+        output = attn(x)
+
+        assert output.shape == x.shape

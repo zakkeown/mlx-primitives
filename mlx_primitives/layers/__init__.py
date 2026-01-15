@@ -4,6 +4,7 @@ This module provides layers not included in mlx.nn:
 - Normalization: RMSNorm, GroupNorm, InstanceNorm, AdaLayerNorm
 - Activations: SwiGLU, GeGLU, ReGLU, Mish
 - Pooling: AdaptiveAvgPool, AdaptiveMaxPool, GeM
+- Embeddings: SinusoidalEmbedding, LearnedPositionalEmbedding
 """
 
 # Normalization layers
@@ -54,6 +55,15 @@ from mlx_primitives.layers.pooling import (
     MaxPool1d,
 )
 
+# Embedding layers
+from mlx_primitives.layers.embeddings import (
+    SinusoidalEmbedding,
+    LearnedPositionalEmbedding,
+    RotaryEmbedding,
+    AlibiEmbedding,
+    RelativePositionalEmbedding,
+)
+
 __all__ = [
     # Normalization
     "RMSNorm",
@@ -94,4 +104,10 @@ __all__ = [
     "SpatialPyramidPooling",
     "AvgPool1d",
     "MaxPool1d",
+    # Embeddings
+    "SinusoidalEmbedding",
+    "LearnedPositionalEmbedding",
+    "RotaryEmbedding",
+    "AlibiEmbedding",
+    "RelativePositionalEmbedding",
 ]

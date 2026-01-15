@@ -8,35 +8,117 @@ This module provides efficient data pipelines:
 """
 
 # Data loading
-# from mlx_primitives.data.dataloader import DataLoader
-# from mlx_primitives.data.dataset import Dataset, IterableDataset
-# from mlx_primitives.data.sampler import (
-#     Sampler,
-#     RandomSampler,
-#     SequentialSampler,
-#     WeightedRandomSampler,
-# )
+from mlx_primitives.data.dataloader import (
+    DataLoader,
+    InfiniteDataLoader,
+    default_collate,
+)
+from mlx_primitives.data.dataset import (
+    Dataset,
+    IterableDataset,
+    TensorDataset,
+    ListDataset,
+    ConcatDataset,
+    SubsetDataset,
+    TransformDataset,
+    ChainDataset,
+    random_split,
+)
+from mlx_primitives.data.sampler import (
+    Sampler,
+    SequentialSampler,
+    RandomSampler,
+    WeightedRandomSampler,
+    SubsetRandomSampler,
+    BatchSampler,
+    DistributedSampler,
+)
 
 # Vision transforms
-# from mlx_primitives.data.transforms import (
-#     Compose,
-#     Normalize,
-#     RandomCrop,
-#     RandomHorizontalFlip,
-#     RandomRotation,
-#     ColorJitter,
-#     MixUp,
-#     CutMix,
-#     CutOut,
-# )
+from mlx_primitives.data.transforms import (
+    Compose,
+    Normalize,
+    ToTensor,
+    RandomHorizontalFlip,
+    RandomVerticalFlip,
+    RandomRotation,
+    RandomCrop,
+    CenterCrop,
+    Resize,
+    ColorJitter,
+    GaussianNoise,
+    CutOut,
+    MixUpTransform,
+    CutMixTransform,
+    RandomAugment,
+    TrivialAugmentWide,
+    mixup,
+    cutmix,
+)
 
-# Text transforms
-# from mlx_primitives.data.text_transforms import (
-#     RandomMask,
-#     SpanMask,
-#     TokenDropout,
-#     SequencePadding,
-#     PackedSequences,
-# )
+# Text/sequence transforms
+from mlx_primitives.data.text_transforms import (
+    pad_sequence,
+    pad_to_length,
+    create_attention_mask,
+    create_causal_mask,
+    RandomMask,
+    SpanMask,
+    TokenDropout,
+    pack_sequences,
+    truncate_sequences,
+)
 
-__all__: list[str] = []
+__all__ = [
+    # DataLoader
+    "DataLoader",
+    "InfiniteDataLoader",
+    "default_collate",
+    # Dataset
+    "Dataset",
+    "IterableDataset",
+    "TensorDataset",
+    "ListDataset",
+    "ConcatDataset",
+    "SubsetDataset",
+    "TransformDataset",
+    "ChainDataset",
+    "random_split",
+    # Samplers
+    "Sampler",
+    "SequentialSampler",
+    "RandomSampler",
+    "WeightedRandomSampler",
+    "SubsetRandomSampler",
+    "BatchSampler",
+    "DistributedSampler",
+    # Vision transforms
+    "Compose",
+    "Normalize",
+    "ToTensor",
+    "RandomHorizontalFlip",
+    "RandomVerticalFlip",
+    "RandomRotation",
+    "RandomCrop",
+    "CenterCrop",
+    "Resize",
+    "ColorJitter",
+    "GaussianNoise",
+    "CutOut",
+    "MixUpTransform",
+    "CutMixTransform",
+    "RandomAugment",
+    "TrivialAugmentWide",
+    "mixup",
+    "cutmix",
+    # Text transforms
+    "pad_sequence",
+    "pad_to_length",
+    "create_attention_mask",
+    "create_causal_mask",
+    "RandomMask",
+    "SpanMask",
+    "TokenDropout",
+    "pack_sequences",
+    "truncate_sequences",
+]

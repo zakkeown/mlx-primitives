@@ -101,3 +101,5 @@ docs/_build/
 # Metal compilation artifacts
 *.air
 *.metallib
+
+*.npz
