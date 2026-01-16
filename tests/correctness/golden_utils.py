@@ -1,35 +1,14 @@
-"""Pytest configuration for correctness tests.
+"""Golden file utilities for correctness tests.
 
-This module provides:
-- Dual-mode testing: golden files (no PyTorch) vs live comparison (with PyTorch)
-- Golden file loading utilities
-- Numerical comparison utilities with configurable tolerances
-- Standard fixtures for test inputs
+This module provides utilities for loading and comparing against golden files.
 """
 
-import sys
-from pathlib import Path
-
-# Add tests/correctness to path so golden_utils can be imported
-_THIS_DIR = Path(__file__).parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
-
 import json
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-import pytest
-
 import mlx.core as mx
-
-# Try to import PyTorch for live comparison mode
-try:
-    import torch
-
-    HAS_PYTORCH = True
-except ImportError:
-    HAS_PYTORCH = False
 
 
 # =============================================================================
@@ -37,31 +16,6 @@ except ImportError:
 # =============================================================================
 
 GOLDEN_DIR = Path(__file__).parent.parent / "golden"
-
-
-# =============================================================================
-# Pytest Configuration
-# =============================================================================
-
-
-def pytest_addoption(parser):
-    """Add custom command line options."""
-    parser.addoption(
-        "--comparison-mode",
-        action="store",
-        default="golden",
-        choices=["golden", "live"],
-        help="Comparison mode: 'golden' uses pre-generated files, 'live' compares against PyTorch",
-    )
-
-
-@pytest.fixture
-def comparison_mode(request):
-    """Get the comparison mode from command line option."""
-    mode = request.config.getoption("--comparison-mode", default="golden")
-    if mode == "live" and not HAS_PYTORCH:
-        pytest.skip("Live comparison requires PyTorch: pip install torch")
-    return mode
 
 
 # =============================================================================
@@ -88,8 +42,10 @@ def load_golden(category: str, name: str) -> Dict[str, Any]:
         - __metadata__: parsed metadata dict with tolerance info
 
     Raises:
-        pytest.skip: If golden file not found
+        FileNotFoundError: If golden file not found
     """
+    import pytest
+
     path = GOLDEN_DIR / category / f"{name}.npz"
     if not path.exists():
         pytest.skip(
@@ -255,51 +211,3 @@ def assert_close_golden(
         mean_diff=mean_diff,
         msg=msg,
     )
-
-
-# =============================================================================
-# Standard Fixtures
-# =============================================================================
-
-
-@pytest.fixture(autouse=True)
-def reset_random_seed():
-    """Reset random seed before each test for reproducibility."""
-    mx.random.seed(42)
-    np.random.seed(42)
-    if HAS_PYTORCH:
-        torch.manual_seed(42)
-    yield
-
-
-@pytest.fixture
-def tolerance():
-    """Default tolerance for numerical comparisons."""
-    return {"atol": 1e-5, "rtol": 1e-5}
-
-
-@pytest.fixture
-def loose_tolerance():
-    """Looser tolerance for approximate algorithms."""
-    return {"atol": 1e-3, "rtol": 1e-3}
-
-
-@pytest.fixture
-def sample_input_1d():
-    """Sample 1D input tensor."""
-    return mx.random.normal((2, 32, 64))
-
-
-@pytest.fixture
-def sample_input_2d():
-    """Sample 2D input tensor (images)."""
-    return mx.random.normal((2, 16, 16, 64))
-
-
-@pytest.fixture
-def sample_attention_input():
-    """Sample input for attention layers."""
-    batch_size = 2
-    seq_len = 32
-    dims = 128
-    return mx.random.normal((batch_size, seq_len, dims))
