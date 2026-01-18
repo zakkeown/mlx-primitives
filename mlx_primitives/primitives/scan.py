@@ -130,7 +130,9 @@ def _simple_scan(
         )
 
         return metal_associative_scan(x, operator, axis, inclusive)
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("associative_scan", e)
         # Fall back to MLX builtins
         if operator == "add":
             return mx.cumsum(x, axis=axis)
@@ -189,7 +191,9 @@ def _ssm_scan(
             result = mx.transpose(result, (0, 2, 1))
 
         return result
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("ssm_scan", e)
         # Fall back to sequential
         return _sequential_ssm_scan(A, x)
 

@@ -139,7 +139,9 @@ def selective_gather(
             result = result.squeeze(-1)
 
         return result
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("selective_gather", e)
         # Fallback to simple indexing
         return x[indices]
 
@@ -215,7 +217,9 @@ def selective_scatter_add(
         )
 
         return outputs[0]
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("selective_scatter_add", e)
         # Fallback to pure MLX
         weighted_values = values * weights[:, None]
         for i in range(capacity):

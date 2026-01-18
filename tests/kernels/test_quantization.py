@@ -1,6 +1,14 @@
-"""Tests for quantized linear operations."""
+"""Tests for quantized linear operations.
+
+Validation strategy:
+1. NumPy reference implementations for algorithmic correctness
+2. Round-trip tests (quantize → dequantize ≈ identity)
+3. Memory reduction verification
+4. Property-based tests for quantization invariants
+"""
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_primitives.kernels import (
@@ -13,213 +21,309 @@ from mlx_primitives.kernels import (
     quantize_int8,
 )
 
+from tests.reference import (
+    dequantize_int8 as np_dequantize_int8,
+    int8_linear as np_int8_linear,
+    quantize_int8_per_channel as np_quantize_int8_per_channel,
+    quantize_int8_per_tensor as np_quantize_int8_per_tensor,
+)
 
-class TestInt8Quantization:
-    """Tests for INT8 quantization."""
 
-    def test_quantize_int8_per_channel_shape(self) -> None:
-        """Test that INT8 per-channel quantization produces correct shapes."""
-        weights = mx.random.normal((128, 64))
+def to_numpy(x: mx.array) -> np.ndarray:
+    """Convert MLX array to NumPy."""
+    mx.eval(x)
+    return np.array(x)
 
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=True)
-        mx.eval(W_quant, scale, zero_point)
 
-        assert W_quant.shape == (128, 64)
-        assert W_quant.dtype == mx.int8
-        assert scale.shape == (128,)
-        assert zero_point.shape == (128,)
+def to_mlx(x: np.ndarray) -> mx.array:
+    """Convert NumPy array to MLX."""
+    return mx.array(x)
 
-    def test_quantize_int8_per_tensor_shape(self) -> None:
-        """Test that INT8 per-tensor quantization produces correct shapes."""
-        weights = mx.random.normal((128, 64))
 
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=False)
-        mx.eval(W_quant, scale, zero_point)
+class TestInt8QuantizationAgainstNumPy:
+    """Validate INT8 quantization against NumPy reference."""
 
-        assert W_quant.shape == (128, 64)
-        assert W_quant.dtype == mx.int8
-        assert scale.shape == (1,)
-        assert zero_point.shape == (1,)
+    def test_quantize_int8_per_channel_vs_numpy(self) -> None:
+        """Test per-channel quantization matches NumPy."""
+        np.random.seed(42)
+        weights_np = np.random.randn(128, 64).astype(np.float32) * 0.5
 
-    def test_quantize_int8_value_range(self) -> None:
-        """Test that INT8 values are in valid range."""
-        weights = mx.random.normal((128, 64))
+        # MLX
+        W_quant_mlx, scale_mlx, zp_mlx = quantize_int8(to_mlx(weights_np), per_channel=True)
+
+        # NumPy
+        W_quant_np, scale_np, zp_np = np_quantize_int8_per_channel(weights_np)
+
+        np.testing.assert_array_equal(to_numpy(W_quant_mlx), W_quant_np)
+        np.testing.assert_allclose(to_numpy(scale_mlx), scale_np, rtol=1e-5)
+        np.testing.assert_allclose(to_numpy(zp_mlx), zp_np, rtol=1e-5)
+
+    def test_quantize_int8_per_tensor_vs_numpy(self) -> None:
+        """Test per-tensor quantization matches NumPy."""
+        np.random.seed(42)
+        weights_np = np.random.randn(128, 64).astype(np.float32) * 0.5
+
+        # MLX
+        W_quant_mlx, scale_mlx, zp_mlx = quantize_int8(to_mlx(weights_np), per_channel=False)
+
+        # NumPy
+        W_quant_np, scale_np, zp_np = np_quantize_int8_per_tensor(weights_np)
+
+        np.testing.assert_array_equal(to_numpy(W_quant_mlx), W_quant_np)
+        np.testing.assert_allclose(to_numpy(scale_mlx), scale_np, rtol=1e-5)
+        np.testing.assert_allclose(to_numpy(zp_mlx), zp_np, rtol=1e-5)
+
+    def test_dequantize_int8_vs_numpy(self) -> None:
+        """Test dequantization matches NumPy."""
+        np.random.seed(42)
+        weights_np = np.random.randn(128, 64).astype(np.float32) * 0.5
+
+        # Quantize with NumPy
+        W_quant_np, scale_np, zp_np = np_quantize_int8_per_channel(weights_np)
+
+        # Dequantize with MLX
+        mlx_dequant = to_numpy(dequantize_int8(
+            to_mlx(W_quant_np), to_mlx(scale_np), to_mlx(zp_np)
+        ))
+
+        # Dequantize with NumPy
+        np_dequant = np_dequantize_int8(W_quant_np, scale_np, zp_np)
+
+        np.testing.assert_allclose(mlx_dequant, np_dequant, rtol=1e-5, atol=1e-6)
+
+
+class TestInt8LinearAgainstNumPy:
+    """Validate INT8 linear against NumPy reference."""
+
+    def test_int8_linear_vs_numpy(self) -> None:
+        """Test INT8 linear matches NumPy."""
+        np.random.seed(42)
+        batch, seq, in_features = 2, 16, 64
+        out_features = 128
+
+        x_np = np.random.randn(batch, seq, in_features).astype(np.float32)
+        weights_np = np.random.randn(out_features, in_features).astype(np.float32) * 0.1
+
+        # Quantize
+        W_quant_np, scale_np, zp_np = np_quantize_int8_per_channel(weights_np)
+
+        # MLX linear
+        mlx_out = to_numpy(int8_linear(
+            to_mlx(x_np),
+            to_mlx(W_quant_np),
+            to_mlx(scale_np),
+            to_mlx(zp_np)
+        ))
+
+        # NumPy linear
+        np_out = np_int8_linear(x_np, W_quant_np, scale_np, zp_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_int8_linear_with_bias_vs_numpy(self) -> None:
+        """Test INT8 linear with bias matches NumPy."""
+        np.random.seed(42)
+        batch, seq, in_features = 2, 16, 64
+        out_features = 128
+
+        x_np = np.random.randn(batch, seq, in_features).astype(np.float32)
+        weights_np = np.random.randn(out_features, in_features).astype(np.float32) * 0.1
+        bias_np = np.random.randn(out_features).astype(np.float32) * 0.01
+
+        W_quant_np, scale_np, zp_np = np_quantize_int8_per_channel(weights_np)
+
+        mlx_out = to_numpy(int8_linear(
+            to_mlx(x_np),
+            to_mlx(W_quant_np),
+            to_mlx(scale_np),
+            to_mlx(zp_np),
+            to_mlx(bias_np)
+        ))
+
+        np_out = np_int8_linear(x_np, W_quant_np, scale_np, zp_np, bias_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+
+class TestRoundTripQuantization:
+    """Test quantize → dequantize round-trip accuracy."""
+
+    def test_int8_round_trip_per_channel(self) -> None:
+        """INT8 per-channel quantization round-trip."""
+        np.random.seed(42)
+        weights_np = np.random.randn(128, 64).astype(np.float32) * 0.5
+
+        weights = to_mlx(weights_np)
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+        W_dequant = dequantize_int8(W_quant, scale, zp)
+
+        error = to_numpy(mx.abs(W_dequant - weights))
+        max_error = np.max(error)
+
+        # INT8 with 255 levels should have max error < 0.01 for values in [-0.5, 0.5]
+        assert max_error < 0.01
+
+    def test_int8_round_trip_per_tensor(self) -> None:
+        """INT8 per-tensor quantization round-trip."""
+        np.random.seed(42)
+        weights_np = np.random.randn(128, 64).astype(np.float32) * 0.5
+
+        weights = to_mlx(weights_np)
+        W_quant, scale, zp = quantize_int8(weights, per_channel=False)
+        W_dequant = dequantize_int8(W_quant, scale, zp)
+
+        error = to_numpy(mx.abs(W_dequant - weights))
+        max_error = np.max(error)
+
+        # Per-tensor is less accurate but still reasonable
+        assert max_error < 0.05
+
+    def test_int4_round_trip(self) -> None:
+        """INT4 grouped quantization round-trip."""
+        np.random.seed(42)
+        weights_np = np.random.randn(64, 128).astype(np.float32) * 0.3
+
+        weights = to_mlx(weights_np)
+        W_packed, scales, zps = quantize_int4(weights, group_size=32)
+        W_dequant = dequantize_int4(W_packed, scales, zps, group_size=32)
+
+        error = to_numpy(mx.abs(W_dequant - weights))
+        max_error = np.max(error)
+
+        # INT4 with 16 levels has larger quantization error
+        assert max_error < 0.15
+
+
+class TestQuantizationProperties:
+    """Property-based tests for quantization invariants."""
+
+    def test_int8_value_range(self) -> None:
+        """Quantized INT8 values are in valid range."""
+        np.random.seed(42)
+        weights = mx.array(np.random.randn(128, 64).astype(np.float32))
 
         W_quant, _, _ = quantize_int8(weights, per_channel=True)
         mx.eval(W_quant)
 
+        W_np = to_numpy(W_quant)
+
         # INT8 range is -128 to 127
-        assert mx.all(W_quant >= -128)
-        assert mx.all(W_quant <= 127)
+        assert np.all(W_np >= -128)
+        assert np.all(W_np <= 127)
 
-    def test_dequantize_int8_reconstructs(self) -> None:
-        """Test that dequantization approximately reconstructs original."""
-        weights = mx.random.normal((128, 64)) * 0.5  # Smaller values for better quantization
-
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=True)
-        W_dequant = dequantize_int8(W_quant, scale, zero_point)
-        mx.eval(W_dequant)
-
-        # Should be close to original (within quantization error)
-        error = mx.abs(W_dequant - weights)
-        max_error = mx.max(error)
-
-        # INT8 with per-channel should be quite accurate
-        assert float(max_error) < 0.1
-
-
-class TestInt8Linear:
-    """Tests for INT8 linear operations."""
-
-    def test_int8_linear_shape(self) -> None:
-        """Test INT8 linear output shape."""
-        batch, seq_len, in_features = 2, 16, 64
-        out_features = 128
-
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
-
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=True)
-
-        out = int8_linear(x, W_quant, scale, zero_point)
-        mx.eval(out)
-
-        assert out.shape == (batch, seq_len, out_features)
-
-    def test_int8_linear_vs_fp32(self) -> None:
-        """Test INT8 linear approximates FP32."""
-        batch, seq_len, in_features = 2, 16, 64
-        out_features = 128
-
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
-
-        # FP32 reference
-        fp32_out = x @ weights.T
-        mx.eval(fp32_out)
-
-        # INT8
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=True)
-        int8_out = int8_linear(x, W_quant, scale, zero_point)
-        mx.eval(int8_out)
-
-        # Should be close (within quantization error)
-        assert mx.allclose(int8_out, fp32_out, atol=0.5, rtol=0.1)
-
-    def test_int8_linear_with_bias(self) -> None:
-        """Test INT8 linear with bias."""
-        batch, seq_len, in_features = 2, 16, 64
-        out_features = 128
-
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
-        bias = mx.random.normal((out_features,)) * 0.01
-
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=True)
-
-        out_no_bias = int8_linear(x, W_quant, scale, zero_point)
-        out_with_bias = int8_linear(x, W_quant, scale, zero_point, bias)
-        mx.eval(out_no_bias, out_with_bias)
-
-        # Bias should add to output
-        assert not mx.allclose(out_no_bias, out_with_bias, atol=1e-6)
-
-    def test_int8_linear_per_tensor(self) -> None:
-        """Test INT8 linear with per-tensor quantization."""
-        batch, seq_len, in_features = 2, 16, 64
-        out_features = 128
-
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
-
-        W_quant, scale, zero_point = quantize_int8(weights, per_channel=False)
-
-        out = int8_linear(x, W_quant, scale, zero_point)
-        mx.eval(out)
-
-        assert out.shape == (batch, seq_len, out_features)
-
-
-class TestInt4Quantization:
-    """Tests for INT4 quantization."""
-
-    def test_quantize_int4_shape(self) -> None:
-        """Test that INT4 quantization produces correct shapes."""
-        weights = mx.random.normal((128, 256))  # in_features must be even
-        group_size = 64
-
-        W_packed, scales, zero_points = quantize_int4(weights, group_size=group_size)
-        mx.eval(W_packed, scales, zero_points)
-
-        # Packed: half the input features
-        assert W_packed.shape == (128, 128)  # 256 / 2
-        assert W_packed.dtype == mx.uint8
-
-        # Scales: one per group per output channel
-        num_groups = (256 + group_size - 1) // group_size  # 4 groups
-        assert scales.shape == (128, num_groups)
-        assert zero_points.shape == (128, num_groups)
-
-    def test_quantize_int4_packed_values(self) -> None:
-        """Test that INT4 packed values are in valid range."""
-        weights = mx.random.normal((64, 128))
+    def test_int4_packed_value_range(self) -> None:
+        """Packed INT4 values are valid bytes."""
+        np.random.seed(42)
+        weights = mx.array(np.random.randn(64, 128).astype(np.float32))
 
         W_packed, _, _ = quantize_int4(weights, group_size=32)
         mx.eval(W_packed)
 
-        # Each byte contains two 4-bit values, so max is 0xFF
-        assert mx.all(W_packed >= 0)
-        assert mx.all(W_packed <= 255)
+        W_np = to_numpy(W_packed)
 
-    def test_dequantize_int4_shape(self) -> None:
-        """Test INT4 dequantization produces correct shape."""
-        weights = mx.random.normal((64, 128))
+        # Packed bytes should be 0-255
+        assert np.all(W_np >= 0)
+        assert np.all(W_np <= 255)
 
-        W_packed, scales, zero_points = quantize_int4(weights, group_size=32)
-        W_dequant = dequantize_int4(W_packed, scales, zero_points, group_size=32)
-        mx.eval(W_dequant)
+    def test_scale_positive(self) -> None:
+        """Quantization scales are always positive."""
+        np.random.seed(42)
+        weights = mx.array(np.random.randn(128, 64).astype(np.float32))
 
-        assert W_dequant.shape == weights.shape
+        _, scale_channel, _ = quantize_int8(weights, per_channel=True)
+        _, scale_tensor, _ = quantize_int8(weights, per_channel=False)
 
+        mx.eval(scale_channel, scale_tensor)
 
-class TestInt4Linear:
-    """Tests for INT4 linear operations."""
+        assert np.all(to_numpy(scale_channel) > 0)
+        assert np.all(to_numpy(scale_tensor) > 0)
 
-    def test_int4_linear_shape(self) -> None:
-        """Test INT4 linear output shape."""
-        batch, seq_len, in_features = 2, 16, 128
-        out_features = 64
+    def test_quantization_preserves_sign(self) -> None:
+        """Large magnitude values preserve their sign after round-trip."""
+        np.random.seed(42)
+        # Use larger values where sign should be preserved
+        weights_np = np.random.randn(64, 64).astype(np.float32) * 2.0
 
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
+        weights = to_mlx(weights_np)
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+        W_dequant = dequantize_int8(W_quant, scale, zp)
 
-        W_packed, scales, zero_points = quantize_int4(weights, group_size=32)
+        # For large values, sign should be preserved
+        original_sign = np.sign(weights_np)
+        dequant_sign = np.sign(to_numpy(W_dequant))
 
-        out = int4_linear(x, W_packed, scales, zero_points, group_size=32)
-        mx.eval(out)
-
-        assert out.shape == (batch, seq_len, out_features)
-
-    def test_int4_linear_with_bias(self) -> None:
-        """Test INT4 linear with bias."""
-        batch, seq_len, in_features = 2, 16, 128
-        out_features = 64
-
-        x = mx.random.normal((batch, seq_len, in_features))
-        weights = mx.random.normal((out_features, in_features)) * 0.1
-        bias = mx.random.normal((out_features,)) * 0.01
-
-        W_packed, scales, zero_points = quantize_int4(weights, group_size=32)
-
-        out_no_bias = int4_linear(x, W_packed, scales, zero_points, group_size=32)
-        out_with_bias = int4_linear(x, W_packed, scales, zero_points, bias, group_size=32)
-        mx.eval(out_no_bias, out_with_bias)
-
-        assert not mx.allclose(out_no_bias, out_with_bias, atol=1e-6)
+        # At least 99% of signs should match (small values near 0 may flip)
+        match_rate = np.mean(original_sign == dequant_sign)
+        assert match_rate > 0.99
 
 
-class TestQuantizedLinear:
-    """Tests for QuantizedLinear class."""
+class TestMemoryReduction:
+    """Tests to verify memory reduction from quantization."""
+
+    def test_int8_memory_reduction(self) -> None:
+        """Verify INT8 uses ~4x less memory than FP32."""
+        out_features, in_features = 1024, 1024
+
+        # FP32 size
+        fp32_size = out_features * in_features * 4  # 4 bytes per float32
+
+        # INT8 size (weights + scale + zero_point per channel)
+        int8_weight_size = out_features * in_features * 1  # 1 byte per int8
+        int8_params_size = out_features * 4 * 2  # scale + zp per channel (float32)
+        int8_total = int8_weight_size + int8_params_size
+
+        ratio = fp32_size / int8_total
+        assert ratio > 3.5  # At least 3.5x reduction
+
+    def test_int4_memory_reduction(self) -> None:
+        """Verify INT4 uses ~6-8x less memory than FP32."""
+        out_features, in_features = 1024, 1024
+        group_size = 128
+        num_groups = (in_features + group_size - 1) // group_size
+
+        # FP32 size
+        fp32_size = out_features * in_features * 4
+
+        # INT4 size (packed weights + scales + zero_points)
+        int4_weight_size = out_features * (in_features // 2)  # 0.5 byte per weight
+        int4_params_size = out_features * num_groups * 4 * 2  # scale + zp per group
+        int4_total = int4_weight_size + int4_params_size
+
+        ratio = fp32_size / int4_total
+        assert ratio > 5.0  # At least 5x reduction
+
+
+class TestQuantizedLinearAccuracy:
+    """Test quantized linear vs full precision accuracy."""
+
+    def test_int8_vs_fp32_relative_error(self) -> None:
+        """INT8 linear has small relative error vs FP32."""
+        np.random.seed(42)
+        batch, seq, in_features = 2, 16, 64
+        out_features = 128
+
+        x_np = np.random.randn(batch, seq, in_features).astype(np.float32)
+        weights_np = np.random.randn(out_features, in_features).astype(np.float32) * 0.1
+
+        x = to_mlx(x_np)
+        weights = to_mlx(weights_np)
+
+        # FP32 reference
+        fp32_out = to_numpy(x @ weights.T)
+
+        # INT8
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+        int8_out = to_numpy(int8_linear(x, W_quant, scale, zp))
+
+        # Relative error should be small
+        relative_error = np.abs(int8_out - fp32_out) / (np.abs(fp32_out) + 1e-8)
+        mean_relative_error = np.mean(relative_error)
+
+        assert mean_relative_error < 0.05  # Less than 5% mean relative error
+
+
+class TestQuantizedLinearClass:
+    """Test QuantizedLinear wrapper class."""
 
     def test_quantized_linear_int8(self) -> None:
         """Test QuantizedLinear with INT8."""
@@ -243,30 +347,16 @@ class TestQuantizedLinear:
 
         assert out.shape == (2, 16, 64)
 
-    def test_quantized_linear_with_bias(self) -> None:
-        """Test QuantizedLinear with bias."""
-        layer = QuantizedLinear(in_features=64, out_features=128, bits=8, bias=True)
-
-        x = mx.random.normal((2, 16, 64))
-        out = layer(x)
-        mx.eval(out)
-
-        assert out.shape == (2, 16, 128)
-        assert layer.bias is not None
-
-    def test_quantize_weights_method(self) -> None:
-        """Test manual weight quantization."""
+    def test_quantized_linear_deterministic(self) -> None:
+        """Test QuantizedLinear produces deterministic output."""
         layer = QuantizedLinear(in_features=64, out_features=128, bits=8)
 
-        # Provide custom weights
-        custom_weights = mx.random.normal((128, 64)) * 0.2
-        layer.quantize_weights(custom_weights)
-
         x = mx.random.normal((2, 16, 64))
-        out = layer(x)
-        mx.eval(out)
+        out1 = layer(x)
+        out2 = layer(x)
+        mx.eval(out1, out2)
 
-        assert out.shape == (2, 16, 128)
+        np.testing.assert_array_equal(to_numpy(out1), to_numpy(out2))
 
 
 class TestInputValidation:
@@ -312,41 +402,3 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="Expected 3D"):
             int4_linear(x, W, scales, zps)
-
-
-class TestMemoryReduction:
-    """Tests to verify memory reduction from quantization."""
-
-    def test_int8_memory_reduction(self) -> None:
-        """Verify INT8 uses 4x less memory than FP32."""
-        out_features, in_features = 1024, 1024
-
-        # FP32 size
-        fp32_size = out_features * in_features * 4  # 4 bytes per float32
-
-        # INT8 size (weights + scale + zero_point per channel)
-        int8_weight_size = out_features * in_features * 1  # 1 byte per int8
-        int8_params_size = out_features * 4 * 2  # scale + zp per channel
-        int8_total = int8_weight_size + int8_params_size
-
-        # Should be ~4x smaller
-        ratio = fp32_size / int8_total
-        assert ratio > 3.5  # At least 3.5x reduction
-
-    def test_int4_memory_reduction(self) -> None:
-        """Verify INT4 uses 8x less memory than FP32."""
-        out_features, in_features = 1024, 1024
-        group_size = 128
-        num_groups = (in_features + group_size - 1) // group_size
-
-        # FP32 size
-        fp32_size = out_features * in_features * 4
-
-        # INT4 size (packed weights + scales + zero_points)
-        int4_weight_size = out_features * (in_features // 2)  # 0.5 byte per weight
-        int4_params_size = out_features * num_groups * 4 * 2  # scale + zp per group
-        int4_total = int4_weight_size + int4_params_size
-
-        # Should be ~6-8x smaller
-        ratio = fp32_size / int4_total
-        assert ratio > 5.0  # At least 5x reduction

@@ -16,6 +16,11 @@ from typing import Literal, Optional
 
 import mlx.core as mx
 
+from mlx_primitives.constants import (
+    GELU_SQRT_2_OVER_PI,
+    GELU_TANH_COEFF,
+)
+
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
@@ -157,7 +162,9 @@ def fused_swiglu(
 
     try:
         return _metal_fused_swiglu(x, W_gate, W_up)
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("fused_swiglu", e)
         return _reference_swiglu(x, W_gate, W_up)
 
 
@@ -236,7 +243,9 @@ def fused_geglu(
 
     try:
         return _metal_fused_geglu(x, W_gate, W_up)
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("fused_geglu", e)
         return _reference_geglu(x, W_gate, W_up)
 
 
@@ -280,8 +289,8 @@ def _reference_geglu(
     """Reference implementation using separate operations."""
     gate = x @ W_gate.T
     up = x @ W_up.T
-    # GELU approximation
-    gelu_gate = 0.5 * gate * (1 + mx.tanh(0.7978845608 * (gate + 0.044715 * gate ** 3)))
+    # GELU approximation using centralized constants
+    gelu_gate = 0.5 * gate * (1 + mx.tanh(GELU_SQRT_2_OVER_PI * (gate + GELU_TANH_COEFF * gate ** 3)))
     return gelu_gate * up
 
 
@@ -310,7 +319,7 @@ def gelu(x: mx.array, approximate: bool = True) -> mx.array:
         Activated tensor.
     """
     if approximate:
-        return 0.5 * x * (1 + mx.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
+        return 0.5 * x * (1 + mx.tanh(GELU_SQRT_2_OVER_PI * (x + GELU_TANH_COEFF * x ** 3)))
     else:
         # Exact GELU using erf
         return 0.5 * x * (1 + mx.erf(x / math.sqrt(2)))

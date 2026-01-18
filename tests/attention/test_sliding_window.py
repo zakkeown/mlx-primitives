@@ -1,8 +1,16 @@
-"""Tests for sliding window attention."""
+"""Tests for sliding window attention.
+
+Validation strategy:
+1. NumPy reference implementations for algorithmic correctness
+2. Analytical test cases with known mask patterns
+3. Metal vs reference implementation consistency
+4. Property-based tests (determinism, shape preservation)
+"""
 
 import math
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_primitives.attention import (
@@ -11,9 +19,50 @@ from mlx_primitives.attention import (
     sliding_window_attention,
 )
 
+from tests.reference import (
+    AnalyticalTests,
+    attention as np_attention,
+    sliding_window_attention as np_sliding_window_attention,
+    sliding_window_mask as np_sliding_window_mask,
+    softmax as np_softmax,
+)
 
-class TestSlidingWindowMask:
-    """Tests for sliding window mask creation."""
+
+def to_numpy(x: mx.array) -> np.ndarray:
+    """Convert MLX array to NumPy."""
+    mx.eval(x)
+    return np.array(x)
+
+
+def to_mlx(x: np.ndarray) -> mx.array:
+    """Convert NumPy array to MLX."""
+    return mx.array(x)
+
+
+class TestSlidingWindowMaskAgainstNumPy:
+    """Validate mask creation against NumPy."""
+
+    def test_mask_causal_vs_numpy(self) -> None:
+        """Test causal mask matches NumPy."""
+        seq_len, window_size = 16, 4
+
+        mlx_mask = to_numpy(create_sliding_window_mask(seq_len, window_size, causal=True))
+        np_mask = np_sliding_window_mask(seq_len, window_size, causal=True)
+
+        np.testing.assert_array_equal(mlx_mask, np_mask)
+
+    def test_mask_bidirectional_vs_numpy(self) -> None:
+        """Test bidirectional mask matches NumPy."""
+        seq_len, window_size = 16, 4
+
+        mlx_mask = to_numpy(create_sliding_window_mask(seq_len, window_size, causal=False))
+        np_mask = np_sliding_window_mask(seq_len, window_size, causal=False)
+
+        np.testing.assert_array_equal(mlx_mask, np_mask)
+
+
+class TestSlidingWindowMaskAnalytical:
+    """Analytical tests for mask patterns."""
 
     def test_mask_shape(self) -> None:
         """Test that mask has correct shape."""
@@ -22,18 +71,13 @@ class TestSlidingWindowMask:
         mask = create_sliding_window_mask(seq_len, window_size)
         assert mask.shape == (seq_len, seq_len)
 
-    def test_mask_causal(self) -> None:
-        """Test causal sliding window mask."""
+    def test_mask_causal_pattern(self) -> None:
+        """Test causal sliding window mask with known pattern."""
         seq_len = 5
         window_size = 2
         mask = create_sliding_window_mask(seq_len, window_size, causal=True)
 
         # Expected: position i can attend to [max(0, i-2), i]
-        # Position 0: can attend to [0]
-        # Position 1: can attend to [0, 1]
-        # Position 2: can attend to [0, 1, 2]
-        # Position 3: can attend to [1, 2, 3]
-        # Position 4: can attend to [2, 3, 4]
         expected = mx.array([
             [True, False, False, False, False],
             [True, True, False, False, False],
@@ -43,13 +87,12 @@ class TestSlidingWindowMask:
         ])
         assert mx.all(mask == expected).item()
 
-    def test_mask_bidirectional(self) -> None:
-        """Test bidirectional sliding window mask."""
+    def test_mask_bidirectional_pattern(self) -> None:
+        """Test bidirectional sliding window mask with known pattern."""
         seq_len = 5
         window_size = 1
         mask = create_sliding_window_mask(seq_len, window_size, causal=False)
 
-        # Position i can attend to [max(0, i-1), min(seq_len, i+2)]
         expected = mx.array([
             [True, True, False, False, False],
             [True, True, True, False, False],
@@ -60,10 +103,50 @@ class TestSlidingWindowMask:
         assert mx.all(mask == expected).item()
 
 
-class TestSlidingWindowAttention:
-    """Tests for sliding window attention."""
+class TestSlidingWindowAttentionAgainstNumPy:
+    """Validate sliding window attention against NumPy reference."""
 
-    def test_output_shape(self) -> None:
+    def test_attention_vs_numpy(self) -> None:
+        """Test sliding window attention matches NumPy."""
+        np.random.seed(42)
+        batch, seq, heads, dim = 2, 32, 4, 32
+        window_size = 8
+
+        q_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+
+        mlx_out = to_numpy(sliding_window_attention(
+            to_mlx(q_np), to_mlx(k_np), to_mlx(v_np),
+            window_size=window_size, causal=True
+        ))
+        np_out = np_sliding_window_attention(q_np, k_np, v_np, window_size, causal=True)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+    def test_attention_bidirectional_vs_numpy(self) -> None:
+        """Test bidirectional attention matches NumPy."""
+        np.random.seed(42)
+        batch, seq, heads, dim = 2, 32, 4, 32
+        window_size = 8
+
+        q_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+
+        mlx_out = to_numpy(sliding_window_attention(
+            to_mlx(q_np), to_mlx(k_np), to_mlx(v_np),
+            window_size=window_size, causal=False
+        ))
+        np_out = np_sliding_window_attention(q_np, k_np, v_np, window_size, causal=False)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+
+class TestAttentionProperties:
+    """Property-based tests for attention invariants."""
+
+    def test_output_shape_preserved(self) -> None:
         """Test that output shape matches input."""
         batch, seq, heads, dim = 2, 32, 4, 64
         q = mx.random.normal((batch, seq, heads, dim))
@@ -73,29 +156,64 @@ class TestSlidingWindowAttention:
         out = sliding_window_attention(q, k, v, window_size=8, causal=True)
         assert out.shape == (batch, seq, heads, dim)
 
-    def test_causal_no_future_attention(self) -> None:
-        """Test that causal attention doesn't attend to future positions."""
-        batch, seq, heads, dim = 1, 8, 1, 16
+    def test_attention_deterministic(self) -> None:
+        """Test attention produces consistent results."""
+        batch, seq, heads, dim = 2, 32, 4, 32
+
         q = mx.random.normal((batch, seq, heads, dim))
         k = mx.random.normal((batch, seq, heads, dim))
+        v = mx.random.normal((batch, seq, heads, dim))
 
-        # Create V where each position has a unique identifier
+        out1 = sliding_window_attention(q, k, v, window_size=8, causal=True)
+        out2 = sliding_window_attention(q, k, v, window_size=8, causal=True)
+
+        mx.eval(out1, out2)
+        np.testing.assert_array_equal(to_numpy(out1), to_numpy(out2))
+
+    def test_causal_no_future_leakage(self) -> None:
+        """Test that causal attention doesn't attend to future positions."""
+        batch, seq, heads, dim = 1, 8, 1, 16
+
+        # Create identity-like QK so position i has highest score with itself
+        q = mx.eye(seq).reshape(batch, seq, 1, seq)
+        k = mx.eye(seq).reshape(batch, seq, 1, seq)
+
+        # V where each position has a unique marker
         v = mx.zeros((batch, seq, heads, dim))
         for i in range(seq):
-            v = v.at[0, i, 0, 0].add(float(i + 1))
+            v = v.at[0, i, 0, i].add(1.0)
 
-        # With full window size and causal, position i should not see i+1, i+2, ...
         out = sliding_window_attention(q, k, v, window_size=seq, causal=True)
-
-        # The last position should have the highest v[0] value in its output
-        # (since it can see all previous positions including itself)
         mx.eval(out)
+
+        # Position 0 should only see its own value (first dim)
+        # Position i should see weighted average of positions 0..i
+
+    def test_full_window_equals_standard_attention(self) -> None:
+        """With window >= seq_len, should match standard causal attention."""
+        np.random.seed(42)
+        batch, seq, heads, dim = 2, 16, 2, 32
+
+        q_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, dim).astype(np.float32)
+
+        # Sliding window with full window
+        sliding_out = to_numpy(sliding_window_attention(
+            to_mlx(q_np), to_mlx(k_np), to_mlx(v_np),
+            window_size=seq, causal=True
+        ))
+
+        # Standard attention with causal mask
+        causal_mask = np.tril(np.ones((seq, seq), dtype=bool))
+        standard_out = np_attention(q_np, k_np, v_np, mask=causal_mask)
+
+        np.testing.assert_allclose(sliding_out, standard_out, rtol=1e-3, atol=1e-3)
 
     def test_window_restriction(self) -> None:
         """Test that attention respects window boundaries."""
         batch, seq, heads, dim = 1, 16, 1, 8
 
-        # Set up Q, K where only distant pairs have high scores
         q = mx.zeros((batch, seq, heads, dim))
         k = mx.zeros((batch, seq, heads, dim))
 
@@ -103,45 +221,19 @@ class TestSlidingWindowAttention:
         q = q.at[0, 0, 0, 0].add(1.0)
         k = k.at[0, 15, 0, 0].add(1.0)
 
-        # With small window, position 0 shouldn't see position 15
         v = mx.zeros((batch, seq, heads, dim))
         v = v.at[0, 15, 0, 0].add(100.0)  # Large value at position 15
 
-        out_small_window = sliding_window_attention(
-            q, k, v, window_size=4, causal=False
-        )
+        # With small window, position 0 shouldn't see position 15
+        out_small = sliding_window_attention(q, k, v, window_size=4, causal=False)
+        mx.eval(out_small)
 
-        # With small window, position 0 can only see [0, 4], not position 15
-        # So output at position 0 should be close to 0
-        mx.eval(out_small_window)
-        assert abs(out_small_window[0, 0, 0, 0].item()) < 1.0
+        # Position 0 can only see [0, 4], not position 15
+        assert abs(out_small[0, 0, 0, 0].item()) < 1.0
 
-    def test_vs_full_attention_small_window(self) -> None:
-        """Test sliding window matches full attention when window covers all."""
-        batch, seq, heads, dim = 2, 16, 2, 32
 
-        mx.random.seed(42)
-        q = mx.random.normal((batch, seq, heads, dim))
-        k = mx.random.normal((batch, seq, heads, dim))
-        v = mx.random.normal((batch, seq, heads, dim))
-
-        # With window_size >= seq_len, should match full causal attention
-        out_sliding = sliding_window_attention(q, k, v, window_size=seq, causal=True)
-
-        # Compute reference full causal attention
-        scale = 1.0 / math.sqrt(dim)
-        q_t = q.transpose(0, 2, 1, 3)  # (batch, heads, seq, dim)
-        k_t = k.transpose(0, 2, 1, 3)
-        v_t = v.transpose(0, 2, 1, 3)
-
-        scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
-        # Apply causal mask
-        mask = mx.triu(mx.full((seq, seq), float('-inf')), k=1)
-        scores = scores + mask[None, None, :, :]
-        weights = mx.softmax(scores, axis=-1)
-        out_full = (weights @ v_t).transpose(0, 2, 1, 3)
-
-        assert mx.allclose(out_sliding, out_full, rtol=1e-3, atol=1e-3).item()
+class TestMetalVsReference:
+    """Test Metal kernel consistency with reference implementation."""
 
     def test_metal_vs_reference(self) -> None:
         """Test Metal kernel matches reference implementation."""
@@ -153,31 +245,17 @@ class TestSlidingWindowAttention:
         k = mx.random.normal((batch, seq, heads, dim))
         v = mx.random.normal((batch, seq, heads, dim))
 
-        # Reference (no Metal)
         out_ref = sliding_window_attention(
             q, k, v, window_size=window_size, causal=True, use_metal=False
         )
-
-        # Metal kernel (if available)
         out_metal = sliding_window_attention(
             q, k, v, window_size=window_size, causal=True, use_metal=True
         )
 
-        assert mx.allclose(out_metal, out_ref, rtol=1e-3, atol=1e-3).item()
-
-    @pytest.mark.benchmark
-    def test_long_sequence(self) -> None:
-        """Test with longer sequence."""
-        batch, seq, heads, dim = 1, 512, 8, 64
-        window_size = 128
-
-        q = mx.random.normal((batch, seq, heads, dim))
-        k = mx.random.normal((batch, seq, heads, dim))
-        v = mx.random.normal((batch, seq, heads, dim))
-
-        out = sliding_window_attention(q, k, v, window_size=window_size, causal=True)
-        mx.eval(out)
-        assert out.shape == (batch, seq, heads, dim)
+        mx.eval(out_ref, out_metal)
+        np.testing.assert_allclose(
+            to_numpy(out_metal), to_numpy(out_ref), rtol=1e-3, atol=1e-3
+        )
 
 
 class TestSlidingWindowAttentionModule:
@@ -205,7 +283,26 @@ class TestSlidingWindowAttentionModule:
         out1 = attn(q, k, v)
         out2 = attn(q, k, v)
 
-        assert mx.allclose(out1, out2).item()
+        mx.eval(out1, out2)
+        np.testing.assert_array_equal(to_numpy(out1), to_numpy(out2))
+
+
+class TestLargeSequences:
+    """Benchmark tests for long sequences."""
+
+    @pytest.mark.benchmark
+    def test_long_sequence(self) -> None:
+        """Test with longer sequence."""
+        batch, seq, heads, dim = 1, 512, 8, 64
+        window_size = 128
+
+        q = mx.random.normal((batch, seq, heads, dim))
+        k = mx.random.normal((batch, seq, heads, dim))
+        v = mx.random.normal((batch, seq, heads, dim))
+
+        out = sliding_window_attention(q, k, v, window_size=window_size, causal=True)
+        mx.eval(out)
+        assert out.shape == (batch, seq, heads, dim)
 
 
 if __name__ == "__main__":

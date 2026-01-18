@@ -156,8 +156,9 @@ def sliding_window_attention(
             return _metal_sliding_window_attention(
                 q, k, v, window_size, scale, causal
             )
-        except Exception:
-            pass  # Fall through to reference implementation
+        except Exception as e:
+            from mlx_primitives.utils.logging import log_fallback
+            log_fallback("sliding_window_attention", e)
 
     # Reference implementation using masked attention
     return _reference_sliding_window_attention(

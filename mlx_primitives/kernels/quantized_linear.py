@@ -216,7 +216,7 @@ def quantize_int8(
 
         # Avoid division by zero
         scale = (w_max - w_min) / 255.0
-        scale = mx.maximum(scale, 1e-8)
+        scale = mx.maximum(scale, 1e-6)  # FP16-safe minimum scale
 
         # Zero point (for asymmetric quantization)
         zero_point = -mx.round(w_min / scale)
@@ -238,7 +238,7 @@ def quantize_int8(
         w_max = mx.max(weights)
 
         scale = (w_max - w_min) / 255.0
-        scale = mx.maximum(scale, mx.array(1e-8))
+        scale = mx.maximum(scale, mx.array(1e-6))  # FP16-safe minimum scale
 
         zero_point = -mx.round(w_min / scale)
         zero_point = mx.clip(zero_point, 0, 255)
@@ -307,7 +307,7 @@ def quantize_int4(
 
     # Scale and zero point for 4-bit (0-15 range)
     scale = (w_max - w_min) / 15.0
-    scale = mx.maximum(scale, 1e-8)
+    scale = mx.maximum(scale, 1e-6)  # FP16-safe minimum scale
 
     zero_point = -mx.round(w_min / scale)
     zero_point = mx.clip(zero_point, 0, 15)
@@ -371,7 +371,9 @@ def int8_linear(
 
     try:
         return _metal_int8_linear(x, W_quant, scale, zero_point, bias, per_channel)
-    except Exception:
+    except Exception as e:
+        from mlx_primitives.utils.logging import log_fallback
+        log_fallback("int8_linear", e)
         return _reference_int8_linear(x, W_quant, scale, zero_point, bias, per_channel)
 
 

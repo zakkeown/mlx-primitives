@@ -1,4 +1,10 @@
-"""Tests for associative scan primitive."""
+"""Tests for associative scan primitive.
+
+Validation strategy:
+1. NumPy reference implementations (cumsum, cumprod, sequential SSM)
+2. Analytical test cases with known outputs
+3. Property-based tests (associativity, identity elements)
+"""
 
 import mlx.core as mx
 import numpy as np
@@ -7,117 +13,191 @@ import pytest
 from mlx_primitives.primitives import associative_scan
 from mlx_primitives.primitives.scan import selective_scan
 
-
-class TestAssociativeScanAdd:
-    """Tests for additive associative scan (cumsum)."""
-
-    def test_simple_1d(self) -> None:
-        """Test simple 1D cumsum."""
-        x = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = associative_scan(x, operator="add")
-        expected = mx.cumsum(x)
-        assert mx.allclose(result, expected).item()
-
-    def test_2d_last_axis(self) -> None:
-        """Test 2D scan along last axis."""
-        x = mx.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-        result = associative_scan(x, operator="add", axis=-1)
-        expected = mx.cumsum(x, axis=-1)
-        assert mx.allclose(result, expected).item()
-
-    def test_batch_scan(self) -> None:
-        """Test batched scan."""
-        batch_size = 4
-        seq_len = 128
-        x = mx.random.normal((batch_size, seq_len))
-        result = associative_scan(x, operator="add", axis=-1)
-        expected = mx.cumsum(x, axis=-1)
-        assert mx.allclose(result, expected, rtol=1e-4, atol=1e-4).item()
-
-    def test_3d_tensor(self) -> None:
-        """Test 3D tensor scan."""
-        x = mx.random.normal((2, 64, 32))
-        result = associative_scan(x, operator="add", axis=1)
-        expected = mx.cumsum(x, axis=1)
-        assert mx.allclose(result, expected, rtol=1e-4, atol=1e-4).item()
-
-    def test_reverse_scan(self) -> None:
-        """Test reverse scan."""
-        x = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = associative_scan(x, operator="add", reverse=True)
-        # Reverse, cumsum, reverse back
-        expected = mx.cumsum(x[::-1])[::-1]
-        assert mx.allclose(result, expected).item()
-
-    @pytest.mark.benchmark
-    def test_large_sequence(self) -> None:
-        """Benchmark large sequence scan."""
-        x = mx.random.normal((1, 512))
-        result = associative_scan(x, operator="add", axis=-1)
-        expected = mx.cumsum(x, axis=-1)
-        mx.eval(result)
-        mx.eval(expected)
-        assert mx.allclose(result, expected, rtol=1e-4, atol=1e-4).item()
+from tests.reference import (
+    AnalyticalTests,
+    cumsum as np_cumsum,
+    cumprod as np_cumprod,
+    ssm_scan_sequential as np_ssm_scan,
+)
 
 
-class TestAssociativeScanMul:
-    """Tests for multiplicative associative scan (cumprod)."""
+def to_numpy(x: mx.array) -> np.ndarray:
+    """Convert MLX array to NumPy."""
+    mx.eval(x)
+    return np.array(x)
 
-    def test_simple_1d(self) -> None:
-        """Test simple 1D cumprod."""
-        x = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+def to_mlx(x: np.ndarray) -> mx.array:
+    """Convert NumPy array to MLX."""
+    return mx.array(x)
+
+
+class TestCumsumAgainstNumPy:
+    """Validate cumulative sum against NumPy."""
+
+    def test_cumsum_1d_vs_numpy(self) -> None:
+        """Test 1D cumsum matches NumPy."""
+        np.random.seed(42)
+        x_np = np.random.randn(100).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-6)
+
+    def test_cumsum_2d_vs_numpy(self) -> None:
+        """Test 2D cumsum along last axis matches NumPy."""
+        np.random.seed(42)
+        x_np = np.random.randn(8, 64).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np_cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-6)
+
+    def test_cumsum_3d_vs_numpy(self) -> None:
+        """Test 3D cumsum along middle axis matches NumPy."""
+        np.random.seed(42)
+        x_np = np.random.randn(2, 64, 32).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=1))
+        np_out = np_cumsum(x_np, axis=1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_cumsum_analytical_values(self) -> None:
+        """Test cumsum with known inputs."""
+        x_np, expected = AnalyticalTests.cumsum_known_values()
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+
+        np.testing.assert_allclose(mlx_out, expected, rtol=1e-6, atol=1e-6)
+
+
+class TestCumprodAgainstNumPy:
+    """Validate cumulative product against NumPy."""
+
+    def test_cumprod_1d_vs_numpy(self) -> None:
+        """Test 1D cumprod matches NumPy."""
+        # Use small positive values to avoid overflow
+        np.random.seed(42)
+        x_np = np.random.uniform(0.5, 1.5, 20).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="mul"))
+        np_out = np_cumprod(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-6)
+
+
+class TestSSMScanAgainstNumPy:
+    """Validate SSM scan against NumPy sequential implementation."""
+
+    def test_ssm_scan_vs_numpy(self) -> None:
+        """Test SSM scan matches NumPy sequential implementation."""
+        np.random.seed(42)
+        batch, seq, state = 4, 64, 32
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+    def test_ssm_analytical_values(self) -> None:
+        """Test SSM scan with known inputs."""
+        A_np, h_np, expected = AnalyticalTests.ssm_scan_known_values()
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+
+        np.testing.assert_allclose(mlx_out, expected, rtol=1e-4, atol=1e-4)
+
+
+class TestScanProperties:
+    """Property-based tests for scan invariants."""
+
+    def test_cumsum_associativity(self) -> None:
+        """Cumsum is associative: scan(a ++ b) relates to scan(a) and scan(b)."""
+        np.random.seed(42)
+        a_np = np.random.randn(10).astype(np.float32)
+        b_np = np.random.randn(10).astype(np.float32)
+        ab_np = np.concatenate([a_np, b_np])
+
+        # Scan of concatenation
+        scan_ab = to_numpy(associative_scan(to_mlx(ab_np), operator="add"))
+
+        # Scan of parts
+        scan_a = to_numpy(associative_scan(to_mlx(a_np), operator="add"))
+        scan_b = to_numpy(associative_scan(to_mlx(b_np), operator="add"))
+
+        # scan(a ++ b) = scan(a) ++ (last(scan(a)) + scan(b))
+        expected = np.concatenate([scan_a, scan_a[-1] + scan_b])
+
+        np.testing.assert_allclose(scan_ab, expected, rtol=1e-5, atol=1e-6)
+
+    def test_cumsum_first_element(self) -> None:
+        """First element of cumsum equals first input element."""
+        np.random.seed(42)
+        x_np = np.random.randn(100).astype(np.float32)
+
+        result = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+
+        assert abs(result[0] - x_np[0]) < 1e-6
+
+    def test_cumprod_identity(self) -> None:
+        """Cumprod of ones is ones."""
+        x = mx.ones(100)
         result = associative_scan(x, operator="mul")
-        expected = mx.cumprod(x)
-        assert mx.allclose(result, expected).item()
+        mx.eval(result)
+
+        expected = np.ones(100)
+        np.testing.assert_allclose(to_numpy(result), expected, rtol=1e-6)
+
+    def test_ssm_zero_decay_equals_input(self) -> None:
+        """With A=0 (no memory), SSM output equals input."""
+        np.random.seed(42)
+        x_np = np.random.randn(2, 16, 8).astype(np.float32)
+        A_np = np.zeros((2, 16, 8), dtype=np.float32)
+
+        result = to_numpy(associative_scan(
+            to_mlx(x_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+
+        np.testing.assert_allclose(result, x_np, rtol=1e-6, atol=1e-6)
+
+    def test_ssm_full_decay_equals_cumsum(self) -> None:
+        """With A=1 (perfect memory), SSM output equals cumsum."""
+        np.random.seed(42)
+        x_np = np.random.randn(2, 16, 8).astype(np.float32)
+        A_np = np.ones((2, 16, 8), dtype=np.float32)
+
+        result = to_numpy(associative_scan(
+            to_mlx(x_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        expected = np.cumsum(x_np, axis=1)
+
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
 
 
-class TestSSMScan:
-    """Tests for SSM scan: h[t] = A[t] * h[t-1] + x[t]."""
+class TestReverseScan:
+    """Tests for reverse scan functionality."""
 
-    def test_simple_recurrence(self) -> None:
-        """Test simple SSM recurrence."""
-        # A = 0.9 (decay), x = 1.0 (constant input)
-        # h[0] = 0.9 * 0 + 1 = 1
-        # h[1] = 0.9 * 1 + 1 = 1.9
-        # h[2] = 0.9 * 1.9 + 1 = 2.71
-        A = mx.full((1, 3, 1), 0.9)
-        x = mx.full((1, 3, 1), 1.0)
-        result = associative_scan(x, operator="ssm", A=A, axis=1)
+    def test_reverse_cumsum_vs_numpy(self) -> None:
+        """Test reverse cumsum matches reversed NumPy cumsum."""
+        np.random.seed(42)
+        x_np = np.random.randn(50).astype(np.float32)
 
-        expected = mx.array([[[1.0], [1.9], [2.71]]])
-        assert mx.allclose(result, expected, rtol=1e-4, atol=1e-4).item()
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", reverse=True))
 
-    def test_batch_ssm(self) -> None:
-        """Test batched SSM scan."""
-        batch_size = 4
-        seq_len = 64
-        d_inner = 32
+        # Reverse, cumsum, reverse back
+        np_out = np.cumsum(x_np[::-1])[::-1]
 
-        A = mx.random.uniform(0.8, 0.99, (batch_size, seq_len, d_inner))
-        x = mx.random.normal((batch_size, seq_len, d_inner))
-
-        result = associative_scan(x, operator="ssm", A=A, axis=1)
-
-        # Verify against sequential implementation
-        h_seq = _sequential_ssm(A, x)
-        assert mx.allclose(result, h_seq, rtol=1e-3, atol=1e-3).item()
-
-    def test_zero_decay(self) -> None:
-        """Test with A=0 (no memory)."""
-        A = mx.zeros((1, 5, 1))
-        x = mx.array([[[1.0], [2.0], [3.0], [4.0], [5.0]]])
-        result = associative_scan(x, operator="ssm", A=A, axis=1)
-        # With A=0, h[t] = x[t]
-        assert mx.allclose(result, x).item()
-
-    def test_identity_decay(self) -> None:
-        """Test with A=1 (perfect memory, cumsum)."""
-        A = mx.ones((1, 5, 1))
-        x = mx.array([[[1.0], [2.0], [3.0], [4.0], [5.0]]])
-        result = associative_scan(x, operator="ssm", A=A, axis=1)
-        # With A=1, h[t] = sum(x[0:t+1])
-        expected = mx.cumsum(x, axis=1)
-        assert mx.allclose(result, expected).item()
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-6)
 
 
 class TestSelectiveScan:
@@ -141,8 +221,8 @@ class TestSelectiveScan:
 
         assert y.shape == (batch_size, seq_len, d_inner)
 
-    def test_selective_scan_correctness(self) -> None:
-        """Test selective scan against reference implementation."""
+    def test_selective_scan_vs_reference(self) -> None:
+        """Test selective scan against sequential reference."""
         batch_size = 1
         seq_len = 8
         d_inner = 4
@@ -156,23 +236,243 @@ class TestSelectiveScan:
         C = mx.random.normal((batch_size, seq_len, d_state))
 
         y = selective_scan(x, delta, A, B, C, use_metal=False)
-
-        # Reference sequential implementation
         y_ref = _reference_selective_scan(x, delta, A, B, C)
 
-        assert mx.allclose(y, y_ref, rtol=1e-3, atol=1e-3).item()
+        mx.eval(y, y_ref)
+        np.testing.assert_allclose(
+            to_numpy(y), to_numpy(y_ref), rtol=1e-3, atol=1e-3
+        )
 
 
-def _sequential_ssm(A: mx.array, x: mx.array) -> mx.array:
-    """Sequential reference for SSM scan."""
-    batch_size, seq_len, d_inner = x.shape
-    h_prev = mx.zeros((batch_size, d_inner))
-    outputs = []
-    for t in range(seq_len):
-        h_t = A[:, t, :] * h_prev + x[:, t, :]
-        outputs.append(h_t)
-        h_prev = h_t
-    return mx.stack(outputs, axis=1)
+class TestLargeSequences:
+    """Benchmark tests for large sequences."""
+
+    @pytest.mark.benchmark
+    def test_large_sequence_cumsum(self) -> None:
+        """Test cumsum on large sequence."""
+        np.random.seed(42)
+        x_np = np.random.randn(1, 512).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.benchmark
+    def test_large_batch_ssm(self) -> None:
+        """Test SSM scan on large batch."""
+        np.random.seed(42)
+        batch, seq, state = 16, 256, 64
+
+        A_np = np.random.uniform(0.9, 0.99, (batch, seq, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq, state).astype(np.float32)
+
+        result = associative_scan(to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1)
+        mx.eval(result)
+
+        assert result.shape == (batch, seq, state)
+
+
+class TestMultiBlockScan:
+    """Tests for multi-block scan (sequences > 1024)."""
+
+    @pytest.mark.parametrize("seq_len", [1025, 2048, 4096])
+    def test_multiblock_cumsum_vs_numpy(self, seq_len: int) -> None:
+        """Test multi-block cumsum matches NumPy for long sequences."""
+        np.random.seed(42)
+        x_np = np.random.randn(seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("seq_len", [1025, 2048])
+    def test_multiblock_batched_cumsum(self, seq_len: int) -> None:
+        """Test multi-block cumsum with batched input."""
+        np.random.seed(42)
+        batch_size = 4
+        x_np = np.random.randn(batch_size, seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_multiblock_3d_tensor(self) -> None:
+        """Test multi-block scan on 3D tensor."""
+        np.random.seed(42)
+        x_np = np.random.randn(2, 2048, 16).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=1))
+        np_out = np.cumsum(x_np, axis=1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+
+class TestBoundaryConditions:
+    """Tests for boundary conditions around block size limits."""
+
+    @pytest.mark.parametrize("seq_len", [1, 32, 33, 1023, 1024, 1025])
+    def test_boundary_cumsum(self, seq_len: int) -> None:
+        """Test cumsum at boundary sequence lengths."""
+        np.random.seed(42)
+        x_np = np.random.randn(seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("seq_len", [32, 64, 128, 256, 512, 1024])
+    def test_power_of_2_cumsum(self, seq_len: int) -> None:
+        """Test cumsum at power-of-2 sequence lengths."""
+        np.random.seed(42)
+        x_np = np.random.randn(seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-5)
+
+    def test_single_element(self) -> None:
+        """Test scan of single element."""
+        x = mx.array([3.14])
+        result = associative_scan(x, operator="add")
+        mx.eval(result)
+
+        np.testing.assert_allclose(to_numpy(result), [3.14], rtol=1e-6)
+
+    def test_two_elements(self) -> None:
+        """Test scan of two elements."""
+        x = mx.array([1.0, 2.0])
+        result = associative_scan(x, operator="add")
+        mx.eval(result)
+
+        np.testing.assert_allclose(to_numpy(result), [1.0, 3.0], rtol=1e-6)
+
+
+class TestSIMDOptimization:
+    """Tests specifically for SIMD-optimized kernels."""
+
+    @pytest.mark.parametrize("seq_len", [32, 64, 128, 256, 512, 1024])
+    def test_simd_cumsum_correctness(self, seq_len: int) -> None:
+        """Test SIMD-optimized cumsum correctness at various sizes."""
+        np.random.seed(42)
+        x_np = np.random.randn(8, seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_simd_warp_boundary(self) -> None:
+        """Test at SIMD warp boundary (32 elements)."""
+        np.random.seed(42)
+        # Exactly 32 elements (one warp)
+        x_np = np.random.randn(32).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-5)
+
+    def test_simd_multiple_warps(self) -> None:
+        """Test with multiple complete warps."""
+        np.random.seed(42)
+        # 128 elements (4 warps)
+        x_np = np.random.randn(128).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add"))
+        np_out = np_cumsum(x_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-5, atol=1e-5)
+
+
+class TestSSMScanOptimization:
+    """Tests for SIMD-optimized SSM scan."""
+
+    @pytest.mark.parametrize("seq_len", [32, 64, 256, 512, 1024])
+    def test_ssm_simd_correctness(self, seq_len: int) -> None:
+        """Test SIMD-optimized SSM scan correctness."""
+        np.random.seed(42)
+        batch, state = 4, 32
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+    def test_ssm_small_state(self) -> None:
+        """Test SSM scan with small state dimension."""
+        np.random.seed(42)
+        batch, seq, state = 2, 256, 4
+
+        A_np = np.random.uniform(0.9, 0.99, (batch, seq, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+    def test_ssm_large_state(self) -> None:
+        """Test SSM scan with large state dimension."""
+        np.random.seed(42)
+        batch, seq, state = 2, 128, 256
+
+        A_np = np.random.uniform(0.9, 0.99, (batch, seq, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
+
+
+class TestVectorizedOptimization:
+    """Tests for vectorized (float4) memory access optimization."""
+
+    @pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024])
+    def test_vectorized_cumsum_correctness(self, seq_len: int) -> None:
+        """Test vectorized cumsum correctness at various sizes."""
+        np.random.seed(42)
+        x_np = np.random.randn(8, seq_len).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_vectorized_non_divisible_by_4(self) -> None:
+        """Test vectorized kernel with seq_len not divisible by 4."""
+        np.random.seed(42)
+        # 65 elements - not divisible by 4
+        x_np = np.random.randn(4, 65).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
+
+    def test_vectorized_large_batch(self) -> None:
+        """Test vectorized kernel with large batch size."""
+        np.random.seed(42)
+        x_np = np.random.randn(64, 256).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", axis=-1))
+        np_out = np.cumsum(x_np, axis=-1)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-4, atol=1e-4)
 
 
 def _reference_selective_scan(
@@ -186,25 +486,21 @@ def _reference_selective_scan(
     batch_size, seq_len, d_inner = x.shape
     d_state = A.shape[1]
 
-    # Initialize hidden state
     h = mx.zeros((batch_size, d_inner, d_state))
 
     outputs = []
     for t in range(seq_len):
-        # Discretization
-        delta_t = delta[:, t, :]  # (batch, d_inner)
-        A_bar = mx.exp(delta_t[:, :, None] * A[None, :, :])  # (batch, d_inner, d_state)
+        delta_t = delta[:, t, :]
+        A_bar = mx.exp(delta_t[:, :, None] * A[None, :, :])
 
-        # SSM step
-        B_t = B[:, t, :]  # (batch, d_state)
-        x_t = x[:, t, :]  # (batch, d_inner)
-        B_x = delta_t[:, :, None] * B_t[:, None, :] * x_t[:, :, None]  # (batch, d_inner, d_state)
+        B_t = B[:, t, :]
+        x_t = x[:, t, :]
+        B_x = delta_t[:, :, None] * B_t[:, None, :] * x_t[:, :, None]
 
-        h = A_bar * h + B_x  # (batch, d_inner, d_state)
+        h = A_bar * h + B_x
 
-        # Output
-        C_t = C[:, t, :]  # (batch, d_state)
-        y_t = mx.sum(C_t[:, None, :] * h, axis=-1)  # (batch, d_inner)
+        C_t = C[:, t, :]
+        y_t = mx.sum(C_t[:, None, :] * h, axis=-1)
         outputs.append(y_t)
 
     return mx.stack(outputs, axis=1)

@@ -45,6 +45,9 @@ class ChipInfo:
         simd_width: SIMD width (typically 32 for Apple Silicon).
         max_threadgroup_memory: Maximum threadgroup memory in bytes (32KB).
         max_threads_per_threadgroup: Maximum threads per threadgroup.
+        ane_tops: Neural Engine throughput in trillion ops/sec.
+        l2_cache_mb: Estimated L2 cache size in MB.
+        memory_bandwidth_gbps: Memory bandwidth in GB/s.
     """
 
     family: ChipFamily
@@ -55,6 +58,9 @@ class ChipInfo:
     simd_width: int = 32
     max_threadgroup_memory: int = 32768  # 32KB for all Apple Silicon
     max_threads_per_threadgroup: int = 1024
+    ane_tops: float = 11.0  # Neural Engine TOPS
+    l2_cache_mb: int = 8  # L2 cache size
+    memory_bandwidth_gbps: float = 100.0  # Memory bandwidth
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,60 @@ _GPU_CORES = {
     (ChipFamily.M4, ChipTier.BASE): 10,
     (ChipFamily.M4, ChipTier.PRO): 20,
     (ChipFamily.M4, ChipTier.MAX): 40,
+}
+
+# ANE (Neural Engine) TOPS for different chip variants
+_ANE_TOPS = {
+    (ChipFamily.M1, ChipTier.BASE): 11.0,
+    (ChipFamily.M1, ChipTier.PRO): 11.0,
+    (ChipFamily.M1, ChipTier.MAX): 11.0,
+    (ChipFamily.M1, ChipTier.ULTRA): 22.0,
+    (ChipFamily.M2, ChipTier.BASE): 15.8,
+    (ChipFamily.M2, ChipTier.PRO): 15.8,
+    (ChipFamily.M2, ChipTier.MAX): 15.8,
+    (ChipFamily.M2, ChipTier.ULTRA): 31.6,
+    (ChipFamily.M3, ChipTier.BASE): 18.0,
+    (ChipFamily.M3, ChipTier.PRO): 18.0,
+    (ChipFamily.M3, ChipTier.MAX): 18.0,
+    (ChipFamily.M4, ChipTier.BASE): 38.0,
+    (ChipFamily.M4, ChipTier.PRO): 38.0,
+    (ChipFamily.M4, ChipTier.MAX): 38.0,
+}
+
+# L2 cache sizes in MB (approximate)
+_L2_CACHE_MB = {
+    (ChipFamily.M1, ChipTier.BASE): 8,
+    (ChipFamily.M1, ChipTier.PRO): 24,
+    (ChipFamily.M1, ChipTier.MAX): 48,
+    (ChipFamily.M1, ChipTier.ULTRA): 96,
+    (ChipFamily.M2, ChipTier.BASE): 8,
+    (ChipFamily.M2, ChipTier.PRO): 24,
+    (ChipFamily.M2, ChipTier.MAX): 48,
+    (ChipFamily.M2, ChipTier.ULTRA): 96,
+    (ChipFamily.M3, ChipTier.BASE): 8,
+    (ChipFamily.M3, ChipTier.PRO): 24,
+    (ChipFamily.M3, ChipTier.MAX): 48,
+    (ChipFamily.M4, ChipTier.BASE): 12,
+    (ChipFamily.M4, ChipTier.PRO): 24,
+    (ChipFamily.M4, ChipTier.MAX): 48,
+}
+
+# Memory bandwidth in GB/s
+_MEMORY_BANDWIDTH = {
+    (ChipFamily.M1, ChipTier.BASE): 68.25,
+    (ChipFamily.M1, ChipTier.PRO): 200.0,
+    (ChipFamily.M1, ChipTier.MAX): 400.0,
+    (ChipFamily.M1, ChipTier.ULTRA): 800.0,
+    (ChipFamily.M2, ChipTier.BASE): 100.0,
+    (ChipFamily.M2, ChipTier.PRO): 200.0,
+    (ChipFamily.M2, ChipTier.MAX): 400.0,
+    (ChipFamily.M2, ChipTier.ULTRA): 800.0,
+    (ChipFamily.M3, ChipTier.BASE): 100.0,
+    (ChipFamily.M3, ChipTier.PRO): 150.0,
+    (ChipFamily.M3, ChipTier.MAX): 400.0,
+    (ChipFamily.M4, ChipTier.BASE): 120.0,
+    (ChipFamily.M4, ChipTier.PRO): 273.0,
+    (ChipFamily.M4, ChipTier.MAX): 546.0,
 }
 
 # Optimal block sizes for attention kernels per chip family
@@ -176,12 +236,24 @@ def get_chip_info() -> ChipInfo:
     # Get GPU core count
     gpu_cores = _GPU_CORES.get((family, tier), 8)
 
+    # Get ANE TOPS
+    ane_tops = _ANE_TOPS.get((family, tier), 11.0)
+
+    # Get L2 cache size
+    l2_cache_mb = _L2_CACHE_MB.get((family, tier), 8)
+
+    # Get memory bandwidth
+    bandwidth = _MEMORY_BANDWIDTH.get((family, tier), 100.0)
+
     return ChipInfo(
         family=family,
         tier=tier,
         device_name=device_name,
         gpu_cores=gpu_cores,
         memory_gb=memory_gb,
+        ane_tops=ane_tops,
+        l2_cache_mb=l2_cache_mb,
+        memory_bandwidth_gbps=bandwidth,
     )
 
 
@@ -318,26 +390,7 @@ def get_memory_bandwidth_gbps() -> float:
         Estimated memory bandwidth based on chip family.
     """
     chip_info = get_chip_info()
-
-    # Approximate bandwidths (GB/s)
-    bandwidths = {
-        (ChipFamily.M1, ChipTier.BASE): 68.25,
-        (ChipFamily.M1, ChipTier.PRO): 200,
-        (ChipFamily.M1, ChipTier.MAX): 400,
-        (ChipFamily.M1, ChipTier.ULTRA): 800,
-        (ChipFamily.M2, ChipTier.BASE): 100,
-        (ChipFamily.M2, ChipTier.PRO): 200,
-        (ChipFamily.M2, ChipTier.MAX): 400,
-        (ChipFamily.M2, ChipTier.ULTRA): 800,
-        (ChipFamily.M3, ChipTier.BASE): 100,
-        (ChipFamily.M3, ChipTier.PRO): 150,
-        (ChipFamily.M3, ChipTier.MAX): 400,
-        (ChipFamily.M4, ChipTier.BASE): 120,
-        (ChipFamily.M4, ChipTier.PRO): 273,
-        (ChipFamily.M4, ChipTier.MAX): 546,
-    }
-
-    return bandwidths.get((chip_info.family, chip_info.tier), 100.0)
+    return chip_info.memory_bandwidth_gbps
 
 
 def estimate_kernel_time_ms(
@@ -375,3 +428,80 @@ def estimate_kernel_time_ms(
         time_s = memory_bytes / (bandwidth_gbps * 1e9)
 
     return time_s * 1000  # Convert to ms
+
+
+def get_optimal_config(
+    operation: "OperationType",
+    problem_shape: tuple,
+    dtype: "mx.Dtype" = None,
+    auto_tune: bool = False,
+) -> "TilingConfig":
+    """Get optimal tiling configuration for an operation.
+
+    This is the primary API for obtaining chip-specific tiling configurations.
+    It queries the tiling database for the best configuration based on:
+    - Current Apple Silicon chip (M1/M2/M3/M4)
+    - Chip tier (BASE/PRO/MAX/ULTRA)
+    - Operation type
+    - Problem size
+    - Data type
+
+    Args:
+        operation: Operation type from OperationType enum.
+        problem_shape: Shape tuple for the problem (varies by operation).
+        dtype: MLX data type. Defaults to float32.
+        auto_tune: If True, run auto-tuning (future feature).
+
+    Returns:
+        TilingConfig with optimal block sizes and parameters.
+
+    Example:
+        >>> from mlx_primitives.hardware import get_optimal_config
+        >>> from mlx_primitives.hardware.tiling import OperationType
+        >>> config = get_optimal_config(
+        ...     OperationType.FLASH_ATTENTION,
+        ...     problem_shape=(1, 1024, 8, 64),  # (batch, seq, heads, dim)
+        ... )
+        >>> print(f"Block sizes: {config.block_m}x{config.block_n}")
+    """
+    from mlx_primitives.hardware.tiling import (
+        DataType,
+        OperationType as OpType,
+        classify_problem_size,
+        dtype_to_enum,
+    )
+    from mlx_primitives.hardware.tiling_database import get_tiling_database
+
+    # Get current chip info
+    chip_info = get_chip_info()
+
+    # Convert dtype to enum
+    if dtype is None:
+        data_type = DataType.FP32
+    else:
+        data_type = dtype_to_enum(dtype)
+
+    # Classify problem size
+    problem_size = classify_problem_size(problem_shape, operation)
+
+    # Get from database
+    db = get_tiling_database()
+    config = db.get_config(
+        operation=operation,
+        chip_family=chip_info.family,
+        chip_tier=chip_info.tier,
+        problem_size=problem_size,
+        dtype=data_type,
+    )
+
+    return config
+
+
+def get_ane_tops() -> float:
+    """Get Neural Engine throughput in TOPS.
+
+    Returns:
+        Neural Engine trillion operations per second.
+    """
+    chip_info = get_chip_info()
+    return chip_info.ane_tops

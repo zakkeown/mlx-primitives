@@ -1,3 +1,5 @@
 """Utility functions for MLX Primitives."""
 
-__all__: list[str] = []
+from mlx_primitives.utils.logging import get_logger, log_fallback
+
+__all__: list[str] = ["get_logger", "log_fallback"]

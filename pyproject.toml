@@ -57,8 +57,11 @@ docs = [
 pytorch = [
     "torch>=2.0.0",
 ]
+ane = [
+    "coremltools>=7.0",
+]
 all = [
-    "mlx-primitives[dev,docs,pytorch]",
+    "mlx-primitives[dev,docs,pytorch,ane]",
 ]
 
 [project.urls]

@@ -15,9 +15,24 @@ from mlx_primitives.primitives import (
     selective_scatter_add,
 )
 
+from mlx_primitives.attention import (
+    ChunkedCrossAttention,
+    FlashAttention,
+    SlidingWindowAttention,
+    chunked_cross_attention,
+    flash_attention,
+    sliding_window_attention,
+)
+
+from mlx_primitives.training import (
+    checkpoint,
+    checkpoint_sequential,
+)
+
 __version__ = "0.2.0"
 
 __all__ = [
+    # Primitives
     "associative_scan",
     "selective_scan",
     "selective_gather",
@@ -26,4 +41,14 @@ __all__ = [
     "ExpertDispatch",
     "SparseMoELayer",
     "compute_load_balancing_loss",
+    # Attention
+    "sliding_window_attention",
+    "SlidingWindowAttention",
+    "flash_attention",
+    "FlashAttention",
+    "chunked_cross_attention",
+    "ChunkedCrossAttention",
+    # Training
+    "checkpoint",
+    "checkpoint_sequential",
 ]
