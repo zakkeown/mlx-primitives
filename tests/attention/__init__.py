@@ -1,1 +1,1 @@
-"""Tests for attention modules."""
+"""Tests for attention mechanisms."""

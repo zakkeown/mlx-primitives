@@ -1,21 +1,18 @@
-"""MLX Primitives: High-performance building blocks for MLX.
+"""Core parallel primitives for MLX.
 
-Custom Metal kernels for missing MLX primitives, fused operations,
-quantization, and memory-efficient implementations.
+This module provides fundamental parallel primitives that are missing from MLX,
+including associative scan (parallel prefix sum) and selective gather/scatter.
 """
 
-from mlx_primitives.primitives import (
+from mlx_primitives.primitives.gather_scatter import (
     ExpertDispatch,
     SparseMoELayer,
-    associative_scan,
     build_expert_dispatch,
     compute_load_balancing_loss,
     selective_gather,
-    selective_scan,
     selective_scatter_add,
 )
-
-__version__ = "0.2.0"
+from mlx_primitives.primitives.scan import associative_scan, selective_scan
 
 __all__ = [
     "associative_scan",

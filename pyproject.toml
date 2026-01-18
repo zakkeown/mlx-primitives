@@ -36,6 +36,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.20.0",
     "numpy>=1.24.0",
+    "scipy>=1.10.0",
 ]
 
 [project.optional-dependencies]
@@ -53,8 +54,11 @@ docs = [
     "mkdocs-material>=9.5.0",
     "mkdocstrings[python]>=0.24.0",
 ]
+pytorch = [
+    "torch>=2.0.0",
+]
 all = [
-    "mlx-primitives[dev,docs]",
+    "mlx-primitives[dev,docs,pytorch]",
 ]
 
 [project.urls]
