@@ -67,7 +67,7 @@ struct OnlineSoftmaxState {
 
     // Normalize output by sum of exponentials
     void normalize(uint head_dim) {
-        float inv_sum = 1.0f / (sum_exp + 1e-9f);
+        float inv_sum = 1.0f / (sum_exp + 1e-6f);
         for (uint d = 0; d < head_dim; d++) {
             output[d] *= inv_sum;
         }
@@ -368,7 +368,7 @@ kernel void flash_attention_block_parallel(
 
     // Normalize and write output
     if (valid_q) {
-        float inv_sum = 1.0f / (sum_exp + 1e-9f);
+        float inv_sum = 1.0f / (sum_exp + 1e-6f);
         uint o_offset = batch_idx * seq_len * qkv_stride + q_pos * qkv_stride + head_idx * head_dim;
         for (uint d = 0; d < head_dim; d++) {
             O[o_offset + d] = acc[d] * inv_sum;

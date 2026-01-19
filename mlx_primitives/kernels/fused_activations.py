@@ -38,24 +38,30 @@ def _get_fused_swiglu_kernel() -> mx.fast.metal_kernel:
         uint seq_idx = thread_position_in_grid.y;
         uint out_idx = thread_position_in_grid.x;
 
-        if (batch_idx >= batch_size || seq_idx >= seq_len || out_idx >= out_features) return;
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _batch_size = batch_size[0];
+        uint _seq_len = seq_len[0];
+        uint _in_features = in_features[0];
+        uint _out_features = out_features[0];
 
-        uint x_offset = batch_idx * seq_len * in_features + seq_idx * in_features;
+        if (batch_idx >= _batch_size || seq_idx >= _seq_len || out_idx >= _out_features) return;
+
+        uint x_offset = batch_idx * _seq_len * _in_features + seq_idx * _in_features;
 
         float gate = 0.0f;
         float up = 0.0f;
 
-        for (uint d = 0; d < in_features; d++) {
+        for (uint d = 0; d < _in_features; d++) {
             float x_d = x[x_offset + d];
-            gate += x_d * W_gate[out_idx * in_features + d];
-            up += x_d * W_up[out_idx * in_features + d];
+            gate += x_d * W_gate[out_idx * _in_features + d];
+            up += x_d * W_up[out_idx * _in_features + d];
         }
 
         // SiLU: x * sigmoid(x)
         float silu_gate = gate / (1.0f + exp(-gate));
         float result = silu_gate * up;
 
-        uint out_offset = batch_idx * seq_len * out_features + seq_idx * out_features + out_idx;
+        uint out_offset = batch_idx * _seq_len * _out_features + seq_idx * _out_features + out_idx;
         output[out_offset] = result;
         """
         _fused_swiglu_kernel = mx.fast.metal_kernel(
@@ -79,17 +85,23 @@ def _get_fused_geglu_kernel() -> mx.fast.metal_kernel:
         uint seq_idx = thread_position_in_grid.y;
         uint out_idx = thread_position_in_grid.x;
 
-        if (batch_idx >= batch_size || seq_idx >= seq_len || out_idx >= out_features) return;
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _batch_size = batch_size[0];
+        uint _seq_len = seq_len[0];
+        uint _in_features = in_features[0];
+        uint _out_features = out_features[0];
 
-        uint x_offset = batch_idx * seq_len * in_features + seq_idx * in_features;
+        if (batch_idx >= _batch_size || seq_idx >= _seq_len || out_idx >= _out_features) return;
+
+        uint x_offset = batch_idx * _seq_len * _in_features + seq_idx * _in_features;
 
         float gate = 0.0f;
         float up = 0.0f;
 
-        for (uint d = 0; d < in_features; d++) {
+        for (uint d = 0; d < _in_features; d++) {
             float x_d = x[x_offset + d];
-            gate += x_d * W_gate[out_idx * in_features + d];
-            up += x_d * W_up[out_idx * in_features + d];
+            gate += x_d * W_gate[out_idx * _in_features + d];
+            up += x_d * W_up[out_idx * _in_features + d];
         }
 
         // GELU (tanh approximation)
@@ -101,7 +113,7 @@ def _get_fused_geglu_kernel() -> mx.fast.metal_kernel:
 
         float result = gelu_gate * up;
 
-        uint out_offset = batch_idx * seq_len * out_features + seq_idx * out_features + out_idx;
+        uint out_offset = batch_idx * _seq_len * _out_features + seq_idx * _out_features + out_idx;
         output[out_offset] = result;
         """
         _fused_geglu_kernel = mx.fast.metal_kernel(
@@ -162,7 +174,8 @@ def fused_swiglu(
 
     try:
         return _metal_fused_swiglu(x, W_gate, W_up)
-    except Exception as e:
+    except RuntimeError as e:
+        # Catch Metal kernel errors, but let programming bugs propagate
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("fused_swiglu", e)
         return _reference_swiglu(x, W_gate, W_up)
@@ -180,9 +193,9 @@ def _metal_fused_swiglu(
     kernel = _get_fused_swiglu_kernel()
 
     # Ensure contiguous float32
-    x = mx.ascontiguousarray(x.astype(mx.float32))
-    W_gate = mx.ascontiguousarray(W_gate.astype(mx.float32))
-    W_up = mx.ascontiguousarray(W_up.astype(mx.float32))
+    x = mx.contiguous(x.astype(mx.float32))
+    W_gate = mx.contiguous(W_gate.astype(mx.float32))
+    W_up = mx.contiguous(W_up.astype(mx.float32))
 
     # Scalar inputs
     batch_arr = mx.array([batch_size], dtype=mx.uint32)
@@ -243,7 +256,8 @@ def fused_geglu(
 
     try:
         return _metal_fused_geglu(x, W_gate, W_up)
-    except Exception as e:
+    except RuntimeError as e:
+        # Catch Metal kernel errors, but let programming bugs propagate
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("fused_geglu", e)
         return _reference_geglu(x, W_gate, W_up)
@@ -260,9 +274,9 @@ def _metal_fused_geglu(
 
     kernel = _get_fused_geglu_kernel()
 
-    x = mx.ascontiguousarray(x.astype(mx.float32))
-    W_gate = mx.ascontiguousarray(W_gate.astype(mx.float32))
-    W_up = mx.ascontiguousarray(W_up.astype(mx.float32))
+    x = mx.contiguous(x.astype(mx.float32))
+    W_gate = mx.contiguous(W_gate.astype(mx.float32))
+    W_up = mx.contiguous(W_up.astype(mx.float32))
 
     batch_arr = mx.array([batch_size], dtype=mx.uint32)
     seq_arr = mx.array([seq_len], dtype=mx.uint32)

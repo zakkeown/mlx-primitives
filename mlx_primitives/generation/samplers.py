@@ -273,6 +273,12 @@ def apply_top_p(logits: mx.array, p: float) -> mx.array:
     )
     sorted_mask = shifted_cumulative < p
 
+    # Ensure at least the top token is always kept to prevent all-inf logits
+    # This handles edge cases like p=0 or numerical precision issues
+    first_token_mask = mx.zeros_like(sorted_mask)
+    first_token_mask = first_token_mask.at[:, 0].add(True)
+    sorted_mask = mx.logical_or(sorted_mask, first_token_mask)
+
     # Set filtered positions to -inf
     sorted_logits = mx.where(sorted_mask, sorted_logits, mx.array(float("-inf")))
 

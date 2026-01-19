@@ -26,12 +26,9 @@ pip install -e ".[dev]"
 
 ### Attention Mechanisms
 
-- **FlashAttention** - Memory-efficient attention with ~8-9x speedup via MLX SDPA
-- **Grouped Query Attention** - Native GQA without K/V head expansion (LLaMA 2/3 style)
-- **Multi-Query Attention** - Single KV head shared across all Q heads
+- **FlashAttention** - Memory-efficient tiled attention with online softmax
 - **Sliding Window Attention** - Fixed window context (Mistral style)
-- **Linear Attention** - O(n) complexity attention variants
-- **Sparse Attention** - Block-sparse, Longformer, BigBird patterns
+- **Chunked Cross Attention** - Memory-efficient cross attention for long KV sequences
 
 ### Position Encodings
 
@@ -47,16 +44,21 @@ pip install -e ".[dev]"
 
 ### Training Utilities
 
-- **Trainer** - Configurable training loop with callbacks
-- **Schedulers** - Cosine, warmup, polynomial decay, one-cycle
-- **Optimization** - EMA, gradient clipping, SWA, SAM
+- **Gradient Checkpointing** - Memory-efficient training via recomputation
 
 ### Advanced Primitives
 
 - **MoE** - Mixture of Experts with Top-K and Expert Choice routing
-- **SSM** - Mamba, S4, H3 state space models
+- **SSM** - Mamba, S4, H3 state space models (experimental)
 - **KV Cache** - Standard, sliding window, paged, compressed variants
-- **Quantization** - INT8/INT4, QLoRA, GPTQ, AWQ
+- **Quantization** - INT8/INT4 basic quantization
+
+### Planned Features (Not Yet Implemented)
+
+- Grouped Query Attention, Multi-Query Attention
+- Linear Attention, Sparse Attention (Longformer, BigBird)
+- Training utilities (Trainer, Schedulers, SWA, SAM)
+- Advanced quantization (QLoRA, GPTQ, AWQ)
 
 ## Quick Example
 

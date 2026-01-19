@@ -2,12 +2,43 @@
 
 This module provides paged attention that works with block-based KV storage,
 enabling efficient memory usage for variable-length sequences.
+
+Supports ALiBi (Attention with Linear Biases) for position encoding.
 """
 
 import math
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
+
+from mlx_primitives.constants import METAL_SOFTMAX_EPSILON
+
+
+def get_alibi_slopes(num_heads: int) -> mx.array:
+    """Compute ALiBi slopes for the given number of heads.
+
+    ALiBi (Attention with Linear Biases) adds a position-dependent bias
+    to attention scores: bias = slope * (kv_pos - q_pos)
+
+    The slopes are computed as powers of 2^(-8/num_heads) following the
+    original ALiBi paper.
+
+    Args:
+        num_heads: Number of attention heads.
+
+    Returns:
+        Slopes array of shape (num_heads,). Each slope is negative,
+        causing attention to prefer nearby tokens.
+
+    Example:
+        >>> slopes = get_alibi_slopes(8)
+        >>> # slopes are [2^-1, 2^-2, 2^-3, ..., 2^-8] = [0.5, 0.25, ...]
+    """
+    # Standard ALiBi: slopes are powers of 2^(-8/n) for n heads
+    # This gives geometric sequence from 2^(-8/n) to 2^(-8)
+    ratio = 2 ** (-8 / num_heads)
+    slopes = mx.array([ratio ** (i + 1) for i in range(num_heads)], dtype=mx.float32)
+    return slopes
 
 
 def paged_attention(
@@ -19,6 +50,8 @@ def paged_attention(
     scale: Optional[float] = None,
     block_size: int = 16,
     causal: bool = True,
+    use_metal: bool = True,
+    alibi_slopes: Optional[mx.array] = None,
 ) -> mx.array:
     """Paged attention with non-contiguous KV cache.
 
@@ -37,6 +70,11 @@ def paged_attention(
         scale: Attention scale. Defaults to 1/sqrt(head_dim).
         block_size: Tokens per block.
         causal: Apply causal masking.
+        use_metal: Use Metal kernel if available. Currently not implemented;
+            parameter accepted for API consistency with other attention functions.
+        alibi_slopes: Optional ALiBi slopes of shape (num_heads,).
+            When provided, adds position-dependent bias: slope * (kv_pos - q_pos).
+            Use get_alibi_slopes(num_heads) to compute standard ALiBi slopes.
 
     Returns:
         Output tensor same shape as q.
@@ -45,6 +83,11 @@ def paged_attention(
         >>> # Decode mode: single new query token
         >>> q = mx.random.normal((batch, 1, heads, dim))
         >>> out = paged_attention(q, k_pool, v_pool, block_tables, context_lens)
+        >>>
+        >>> # With ALiBi position encoding
+        >>> slopes = get_alibi_slopes(num_heads)
+        >>> out = paged_attention(q, k_pool, v_pool, block_tables, context_lens,
+        ...                       alibi_slopes=slopes)
     """
     batch_size, seq_q, num_heads, head_dim = q.shape
 
@@ -54,12 +97,14 @@ def paged_attention(
     if seq_q == 1:
         # Decode mode: optimized single-token attention
         return _paged_attention_decode(
-            q, k_pool, v_pool, block_tables, context_lens, scale, block_size
+            q, k_pool, v_pool, block_tables, context_lens, scale, block_size,
+            alibi_slopes=alibi_slopes
         )
     else:
         # Prefill mode: process query sequence with paged KV
         return _paged_attention_prefill(
-            q, k_pool, v_pool, block_tables, context_lens, scale, block_size, causal
+            q, k_pool, v_pool, block_tables, context_lens, scale, block_size, causal,
+            alibi_slopes=alibi_slopes
         )
 
 
@@ -71,11 +116,16 @@ def _paged_attention_decode(
     context_lens: mx.array,
     scale: float,
     block_size: int,
+    alibi_slopes: Optional[mx.array] = None,
 ) -> mx.array:
     """Optimized paged attention for decode (single query token).
 
     Uses online softmax to process blocks one at a time, maintaining
     numerical stability without materializing the full attention matrix.
+
+    Args:
+        alibi_slopes: Optional ALiBi slopes (num_heads,). When provided,
+            adds bias = slope * (kv_pos - q_pos) to attention scores.
     """
     batch_size, _, num_heads, head_dim = q.shape
     max_blocks = block_tables.shape[1]
@@ -90,6 +140,10 @@ def _paged_attention_decode(
     max_score = mx.full((batch_size, num_heads), float("-inf"))
     sum_exp = mx.zeros((batch_size, num_heads))
     output = mx.zeros((batch_size, num_heads, head_dim))
+
+    # For decode, query position is context_lens (position of the new token)
+    # Shape: (batch,)
+    q_positions = context_lens
 
     # Process each block position
     for block_idx in range(max_blocks):
@@ -136,6 +190,24 @@ def _paged_attention_decode(
 
         # scores: (batch, num_heads, 1, block_size) -> squeeze -> (batch, num_heads, block_size)
         scores = (q_expanded @ k_block_t).squeeze(2) * scale
+
+        # Apply ALiBi bias if provided
+        if alibi_slopes is not None:
+            # KV positions for this block: block_start + [0, 1, ..., block_size-1]
+            kv_positions = mx.arange(block_size) + block_start  # (block_size,)
+
+            # Position difference: kv_pos - q_pos
+            # q_positions: (batch,) -> (batch, 1, 1)
+            # kv_positions: (block_size,) -> (1, 1, block_size)
+            # Result: (batch, 1, block_size)
+            pos_diff = kv_positions[None, None, :] - q_positions[:, None, None]
+
+            # ALiBi bias: slopes[head] * pos_diff
+            # slopes: (num_heads,) -> (1, num_heads, 1)
+            # pos_diff: (batch, 1, block_size)
+            # Result: (batch, num_heads, block_size)
+            alibi_bias = alibi_slopes[None, :, None] * pos_diff.astype(mx.float32)
+            scores = scores + alibi_bias
 
         # Create position mask within block
         positions = mx.arange(block_size)[None, None, :]  # (1, 1, block_size)
@@ -201,7 +273,7 @@ def _paged_attention_decode(
         max_score = new_max
 
     # Normalize by sum_exp
-    output = output / (sum_exp[:, :, None] + 1e-6)  # FP16-safe epsilon
+    output = output / (sum_exp[:, :, None] + METAL_SOFTMAX_EPSILON)
 
     # Reshape to (batch, 1, num_heads, head_dim)
     return output[:, None, :, :]
@@ -216,67 +288,46 @@ def _paged_attention_prefill(
     scale: float,
     block_size: int,
     causal: bool,
+    alibi_slopes: Optional[mx.array] = None,
 ) -> mx.array:
     """Paged attention for prefill (multiple query tokens).
 
     For prefill, we have multiple query positions attending to the cached KV.
     This is typically used when processing the initial prompt.
+
+    Optimized to avoid host/device synchronization (.item() calls) by using
+    vectorized gather operations.
+
+    Args:
+        alibi_slopes: Optional ALiBi slopes (num_heads,). When provided,
+            adds bias = slope * (kv_pos - q_pos) to attention scores.
     """
     batch_size, seq_q, num_heads, head_dim = q.shape
     max_blocks = block_tables.shape[1]
 
-    # For prefill, gather all K, V and use standard attention
-    # This is simpler but uses more memory than block-by-block processing
-    # For very long contexts, should use chunked processing
+    # Compute max_context without .item() - use the full allocated space
+    # max_context = max_blocks * block_size covers all possible tokens
+    max_context = max_blocks * block_size
 
-    # Gather K, V for all sequences
-    all_k = []
-    all_v = []
-    max_context = int(mx.max(context_lens).item())
+    # Vectorized block gathering:
+    # 1. Clamp block_tables to valid indices (replace -1 with 0 for safe gather)
+    # 2. Gather all blocks at once
+    # 3. Reshape to (batch, max_blocks * block_size, heads, dim)
+    # 4. Use masking to handle variable context lengths
 
-    for b in range(batch_size):
-        ctx_len = int(context_lens[b].item())
-        num_blocks_used = (ctx_len + block_size - 1) // block_size
+    # Replace invalid block IDs (-1) with 0 for safe gathering
+    # We'll mask out invalid positions later
+    safe_block_tables = mx.maximum(block_tables, 0)  # (batch, max_blocks)
 
-        k_parts = []
-        v_parts = []
+    # Gather all blocks for all sequences at once
+    # k_pool: (num_blocks, block_size, num_heads, head_dim)
+    # Result: (batch, max_blocks, block_size, num_heads, head_dim)
+    k_gathered = k_pool[safe_block_tables]
+    v_gathered = v_pool[safe_block_tables]
 
-        for block_idx in range(num_blocks_used):
-            block_id = int(block_tables[b, block_idx].item())
-            if block_id < 0:
-                break
-
-            k_block = k_pool[block_id]  # (block_size, num_heads, head_dim)
-            v_block = v_pool[block_id]
-
-            # Handle partial last block
-            if block_idx == num_blocks_used - 1:
-                tokens_remaining = ctx_len - block_idx * block_size
-                k_parts.append(k_block[:tokens_remaining])
-                v_parts.append(v_block[:tokens_remaining])
-            else:
-                k_parts.append(k_block)
-                v_parts.append(v_block)
-
-        if k_parts:
-            k_seq = mx.concatenate(k_parts, axis=0)  # (ctx_len, num_heads, head_dim)
-            v_seq = mx.concatenate(v_parts, axis=0)
-        else:
-            k_seq = mx.zeros((0, num_heads, head_dim), dtype=q.dtype)
-            v_seq = mx.zeros((0, num_heads, head_dim), dtype=q.dtype)
-
-        # Pad to max_context
-        if k_seq.shape[0] < max_context:
-            pad_len = max_context - k_seq.shape[0]
-            k_seq = mx.pad(k_seq, [(0, pad_len), (0, 0), (0, 0)])
-            v_seq = mx.pad(v_seq, [(0, pad_len), (0, 0), (0, 0)])
-
-        all_k.append(k_seq)
-        all_v.append(v_seq)
-
-    # Stack: (batch, max_context, num_heads, head_dim)
-    k = mx.stack(all_k, axis=0)
-    v = mx.stack(all_v, axis=0)
+    # Reshape to (batch, max_context, num_heads, head_dim)
+    k = k_gathered.reshape(batch_size, max_context, num_heads, head_dim)
+    v = v_gathered.reshape(batch_size, max_context, num_heads, head_dim)
 
     # Standard attention computation
     # Transpose for matmul: (batch, num_heads, seq, head_dim)
@@ -287,13 +338,41 @@ def _paged_attention_prefill(
     # Scores: (batch, num_heads, seq_q, max_context)
     scores = (q_t @ mx.transpose(k_t, (0, 1, 3, 2))) * scale
 
-    # Create attention mask
-    # Padding mask: valid positions based on context_lens
+    # Apply ALiBi bias if provided
+    if alibi_slopes is not None:
+        # Query positions: 0 to seq_q-1 (new tokens being processed)
+        # KV positions: 0 to max_context-1 (cached tokens)
+        q_pos = mx.arange(seq_q)[:, None]  # (seq_q, 1)
+        kv_pos = mx.arange(max_context)[None, :]  # (1, max_context)
+
+        # Position difference: kv_pos - q_pos
+        # Result: (seq_q, max_context)
+        pos_diff = (kv_pos - q_pos).astype(mx.float32)
+
+        # ALiBi bias: slopes[head] * pos_diff
+        # slopes: (num_heads,) -> (1, num_heads, 1, 1)
+        # pos_diff: (seq_q, max_context) -> (1, 1, seq_q, max_context)
+        # Result: (1, num_heads, seq_q, max_context)
+        alibi_bias = alibi_slopes[None, :, None, None] * pos_diff[None, None, :, :]
+        scores = scores + alibi_bias
+
+    # Create attention mask combining:
+    # 1. Padding mask: positions < context_lens (valid cached tokens)
+    # 2. Block validity mask: block_tables >= 0 (valid blocks)
     positions = mx.arange(max_context)[None, None, None, :]  # (1, 1, 1, max_context)
     padding_mask = positions < context_lens[:, None, None, None]  # (batch, 1, 1, max_context)
 
-    # Apply padding mask
-    scores = mx.where(padding_mask, scores, mx.array(float("-inf")))
+    # Also mask out positions from invalid blocks
+    # Use 1D indices for take to avoid extra dimensions
+    block_indices_1d = mx.arange(max_context) // block_size  # (max_context,)
+    block_validity = mx.take(block_tables >= 0, block_indices_1d, axis=1)  # (batch, max_context)
+    block_validity = block_validity[:, None, None, :]  # (batch, 1, 1, max_context)
+
+    # Combined mask: position must be valid AND in a valid block
+    combined_mask = padding_mask & block_validity
+
+    # Apply mask
+    scores = mx.where(combined_mask, scores, mx.array(float("-inf")))
 
     if causal:
         # For prefill with cached KV, causal mask allows query to attend
@@ -316,12 +395,17 @@ def paged_attention_with_bias(
     block_tables: mx.array,
     context_lens: mx.array,
     attention_bias: Optional[mx.array] = None,
+    alibi_slopes: Optional[mx.array] = None,
     scale: Optional[float] = None,
     block_size: int = 16,
+    causal: bool = True,
+    use_metal: bool = True,
 ) -> mx.array:
-    """Paged attention with optional attention bias.
+    """Paged attention with optional attention bias or ALiBi position encoding.
 
-    Supports ALiBi-style position biases.
+    Supports ALiBi-style position biases via the alibi_slopes parameter.
+    For general pre-computed attention bias matrices, use the attention_bias
+    parameter (not yet implemented).
 
     Args:
         q: Query tensor (batch, seq_q, num_heads, head_dim).
@@ -329,20 +413,46 @@ def paged_attention_with_bias(
         v_pool: Value block pool (num_blocks, block_size, num_heads, head_dim).
         block_tables: Block indices per sequence (batch, max_blocks).
         context_lens: Number of cached tokens per sequence (batch,).
-        attention_bias: Optional bias to add to attention scores.
+        attention_bias: Optional pre-computed bias to add to attention scores.
+            NOT YET IMPLEMENTED - will raise NotImplementedError if provided.
+            Use alibi_slopes for ALiBi-style position encoding instead.
+        alibi_slopes: Optional ALiBi slopes of shape (num_heads,).
+            When provided, adds position-dependent bias: slope * (kv_pos - q_pos).
+            Use get_alibi_slopes(num_heads) to compute standard ALiBi slopes.
         scale: Attention scale. Defaults to 1/sqrt(head_dim).
         block_size: Tokens per block.
+        causal: Apply causal masking.
+        use_metal: Use Metal kernel if available. Currently not implemented;
+            parameter accepted for API consistency with other attention functions.
 
     Returns:
         Output tensor same shape as q.
-    """
-    # For now, fall back to standard paged attention
-    # Bias support would require modification of the scoring loop
-    output = paged_attention(
-        q, k_pool, v_pool, block_tables, context_lens, scale, block_size
-    )
 
-    return output
+    Raises:
+        NotImplementedError: If attention_bias is not None.
+        ValueError: If both attention_bias and alibi_slopes are provided.
+
+    Example:
+        >>> # Using ALiBi position encoding
+        >>> slopes = get_alibi_slopes(num_heads)
+        >>> out = paged_attention_with_bias(
+        ...     q, k_pool, v_pool, block_tables, context_lens,
+        ...     alibi_slopes=slopes
+        ... )
+    """
+    if attention_bias is not None and alibi_slopes is not None:
+        raise ValueError("Cannot specify both attention_bias and alibi_slopes")
+
+    if attention_bias is not None:
+        raise NotImplementedError(
+            "Pre-computed attention_bias support in paged_attention is not yet implemented. "
+            "Use alibi_slopes parameter for ALiBi-style position encoding instead."
+        )
+
+    return paged_attention(
+        q, k_pool, v_pool, block_tables, context_lens, scale, block_size, causal, use_metal,
+        alibi_slopes=alibi_slopes
+    )
 
 
 def create_block_table_from_lengths(

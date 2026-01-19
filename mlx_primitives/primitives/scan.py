@@ -8,14 +8,37 @@ where f is an associative binary operator.
 
 This is the key missing primitive for efficient SSM (State Space Model)
 implementations like Mamba on MLX.
+
+Performance Notes:
+    - For seq_len > MIN_SEQ_FOR_METAL (default 8): Uses parallel Metal kernel
+      with O(log n) complexity via SIMD warp-level intrinsics.
+    - For seq_len <= MIN_SEQ_FOR_METAL: Uses MLX builtins (cumsum/cumprod) or
+      sequential fallback. Still GPU-accelerated but O(n).
+    - For seq_len > 1024: Falls back to sequential (multi-block not yet implemented).
+
+    Configure threshold via MLX_PRIMITIVES_MIN_SEQ_FOR_METAL environment variable.
 """
 
+import os
 from typing import Literal, Optional
 
 import mlx.core as mx
 
+from mlx_primitives.constants import MIN_SEQ_FOR_METAL
+
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
+
+
+def _get_min_seq_for_metal() -> int:
+    """Get minimum sequence length for Metal dispatch, configurable via env var."""
+    env_val = os.environ.get("MLX_PRIMITIVES_MIN_SEQ_FOR_METAL")
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+    return MIN_SEQ_FOR_METAL
 
 
 def _reverse_along_axis(x: mx.array, axis: int) -> mx.array:
@@ -117,7 +140,8 @@ def _simple_scan(
 
     # For short sequences or when Metal not available, use MLX builtins
     seq_len = x.shape[axis]
-    if not use_metal or not _HAS_METAL or seq_len <= 32:
+    threshold = _get_min_seq_for_metal()
+    if not use_metal or not _HAS_METAL or seq_len <= threshold:
         if operator == "add":
             return mx.cumsum(x, axis=axis)
         else:
@@ -149,6 +173,21 @@ def _ssm_scan(
     """SSM scan: h[t] = A[t] * h[t-1] + x[t].
 
     This is the key operation for Mamba and other SSMs.
+
+    Note:
+        Currently requires 3D input (batch, seq, d_inner). For 4D+ tensors,
+        reshape before calling:
+
+        >>> # (batch, seq, heads, state) -> (batch*heads, seq, state)
+        >>> x_3d = x.reshape(batch * heads, seq, state)
+        >>> A_3d = A.reshape(batch * heads, seq, state)
+        >>> result_3d = associative_scan(x_3d, operator="ssm", A=A_3d, axis=1)
+        >>> result = result_3d.reshape(batch, heads, seq, state)
+
+    Performance:
+        - seq_len > threshold: Parallel Metal kernel O(log n)
+        - seq_len <= threshold: Sequential fallback O(n)
+        - seq_len > 1024: Sequential fallback (multi-block not implemented)
     """
     # Normalize axis
     if axis < 0:
@@ -175,7 +214,8 @@ def _ssm_scan(
     batch_size, seq_len, d_inner = x.shape
 
     # For short sequences, use sequential implementation
-    if not use_metal or not _HAS_METAL or seq_len <= 32:
+    threshold = _get_min_seq_for_metal()
+    if not use_metal or not _HAS_METAL or seq_len <= threshold:
         return _sequential_ssm_scan(A, x)
 
     # Try Metal kernel

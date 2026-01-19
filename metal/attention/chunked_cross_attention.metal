@@ -93,7 +93,7 @@ kernel void chunked_cross_attention_simple(
 
     // Normalize and write output
     uint o_offset = batch_idx * seq_q * q_stride + q_pos * q_stride + head_idx * head_dim;
-    float inv_sum = 1.0f / (sum_exp + 1e-9f);
+    float inv_sum = 1.0f / (sum_exp + 1e-6f);
     for (uint d = 0; d < head_dim; d++) {
         O[o_offset + d] = acc[d] * inv_sum;
     }
@@ -238,7 +238,7 @@ kernel void chunked_cross_attention_tiled(
     // Normalize and write output
     if (valid_q) {
         uint o_offset = batch_idx * seq_q * q_stride + q_pos * q_stride + head_idx * head_dim;
-        float inv_sum = 1.0f / (sum_exp + 1e-9f);
+        float inv_sum = 1.0f / (sum_exp + 1e-6f);
         for (uint d = 0; d < head_dim; d++) {
             O[o_offset + d] = acc[d] * inv_sum;
         }

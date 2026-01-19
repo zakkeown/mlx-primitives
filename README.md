@@ -20,84 +20,88 @@ pip install -e ".[dev]"
 
 ### Attention Mechanisms
 
-- **SDPAAttention** - Convenience wrapper around `mx.fast.scaled_dot_product_attention`
-- **GroupedQueryAttention** - GQA with configurable head groups
-- **MultiQueryAttention** - Single KV head shared across Q heads
-- **SlidingWindowAttention** - Fixed window context (Mistral-style)
-- **FusedRoPEFlashAttention** - Fused RoPE + attention (genuine optimization, ~1.3-2x speedup)
-- **RoPE** - Rotary position embeddings
-- **ALiBi** - Attention with Linear Biases
+- **FlashAttention** - Custom Flash Attention with O(n) memory via tiled online softmax
+- **SlidingWindowAttention** - Fixed window context attention (Mistral-style)
+- **ChunkedCrossAttention** - Memory-efficient cross-attention for long KV sequences
 
-> **Note**: `FlashAttention` is an alias for `SDPAAttention`. It wraps MLX's built-in
-> SDPA and is NOT a custom flash attention implementation. Calling
-> `mx.fast.scaled_dot_product_attention` directly gives equivalent performance.
+> **Note**: `FlashAttention` is a custom implementation of the Flash Attention algorithm
+> (Dao et al., 2022) with O(n) memory complexity. It uses tiled online softmax and has
+> both a Python fallback and an optimized Metal kernel. This is NOT a wrapper around
+> `mx.fast.scaled_dot_product_attention`.
 
-### Custom Layers
+### Core Primitives
 
-- **Normalization**: RMSNorm, GroupNorm, InstanceNorm, AdaLayerNorm, QKNorm
-- **Activations**: SwiGLU, GeGLU, ReGLU, Mish, GELUTanh, SquaredReLU, QuickGELU
-- **Pooling**: AdaptiveAvgPool1d/2d, AdaptiveMaxPool1d/2d, GeM, GlobalAttentionPooling
-- **Embeddings**: SinusoidalEmbedding, LearnedPositionalEmbedding, RotaryEmbedding
+- **Parallel Scan**: `associative_scan`, `selective_scan` for SSM-style recurrences
+- **MoE**: `SparseMoELayer`, `ExpertDispatch`, `build_expert_dispatch`, `compute_load_balancing_loss`
+- **Gather/Scatter**: `selective_gather`, `selective_scatter_add`
 
 ### Training Utilities
 
-- **Trainer**: Training loop with callbacks (EarlyStopping, ModelCheckpoint, WandB)
-- **Schedulers**: CosineAnnealing, WarmupCosine, OneCycle, PolynomialDecay
-- **Optimization**: EMA, gradient clipping, gradient accumulation
+- **Gradient Checkpointing**: `checkpoint`, `checkpoint_sequential` for memory-efficient training
 
-### Data Pipeline
+### Additional Submodules
 
-- **DataLoader**: Data loading with prefetching
-- **Vision Transforms**: RandomCrop, ColorJitter, MixUp, CutMix
-- **Text Transforms**: Padding, masking, sequence packing
+These are available via direct import from submodules:
 
-### Advanced Primitives
+| Submodule | Contents |
+|-----------|----------|
+| `mlx_primitives.cache` | Paged attention, KV cache management, eviction policies |
+| `mlx_primitives.generation` | Batched generation engine, samplers, schedulers |
+| `mlx_primitives.kernels` | Fused ops (SwiGLU, GeGLU, RMSNorm, INT8/INT4 quantization) |
+| `mlx_primitives.dsl` | Metal-Triton DSL for writing Metal kernels in Python |
+| `mlx_primitives.hardware` | Chip detection, auto-tuning |
+| `mlx_primitives.memory` | Unified memory primitives, streaming |
+| `mlx_primitives.ane` | Neural Engine offload (requires coremltools) |
 
-- **MoE**: TopKRouter, ExpertChoiceRouter, MoELayer, SwitchMoE
-- **KV Cache**: Standard, Sliding Window, Paged, Rotating, Compressed, Quantized
-- **Quantization**: INT8/INT4, QLoRA, GPTQ, AWQ quantization schemes
+## SSM Performance Notes
 
-### Experimental (Not Production-Ready)
+The `associative_scan` with `operator="ssm"` implements parallel prefix scan for SSM recurrences:
 
-- **SSM**: Mamba, S4, H3 state space models
+- **seq_len > 8**: Uses parallel Metal kernel with O(log n) complexity
+- **seq_len <= 8**: Uses vectorized MLX fallback (still GPU-accelerated)
+- **seq_len > 1024**: Currently falls back to sequential (multi-block kernel not yet implemented)
 
-  ⚠️ **Warning**: SSM implementations use sequential Python loops and are NOT
-  efficient for long sequences (>512 tokens). They defeat the core value
-  proposition of SSMs. Use attention-based models for production workloads.
-
-## Honest Value Assessment
-
-**What you get from this library:**
-- Unified API for common MLX patterns
-- Convenience wrappers with sensible defaults
-- Fused RoPE+attention kernel (~1.3-2x speedup over separate ops)
-- Auto-precision selection utilities
-- Reference SSM implementations (for learning, not production)
-
-**What you should NOT expect:**
-- Novel performance improvements over MLX built-ins (most ops just wrap MLX)
-- Efficient long-sequence SSM (the implementations are too slow)
-- Published benchmarks (not yet integrated)
+For typical autoregressive inference (seq_len=1 per step), the vectorized fallback is used.
+Configure threshold via `MLX_PRIMITIVES_MIN_SEQ_FOR_METAL` environment variable.
 
 ## Quick Start
 
 ```python
 import mlx.core as mx
-from mlx_primitives.attention import SDPAAttention, RoPE
+from mlx_primitives import FlashAttention, flash_attention
 
-# Create attention layer (wraps MLX's SDPA)
-attn = SDPAAttention(
-    dims=768,
-    num_heads=12,
-    causal=True,
-)
+# Create flash attention layer
+attn = FlashAttention(num_heads=12, head_dim=64, causal=True)
 
-# Apply rotary embeddings
-rope = RoPE(dims=64, max_seq_len=8192)
-q, k = rope(q, k)
+q = mx.random.normal((2, 1024, 12, 64))
+k = mx.random.normal((2, 1024, 12, 64))
+v = mx.random.normal((2, 1024, 12, 64))
 
-# Forward pass
+# Forward pass - O(n) memory
 output = attn(q, k, v)
+
+# Or use functional API
+output = flash_attention(q, k, v, causal=True)
+```
+
+### Using Submodules
+
+```python
+# Fused kernels
+from mlx_primitives.kernels import SwiGLU, quantize_int8
+
+# KV Cache
+from mlx_primitives.cache import KVCache, paged_attention
+
+# Gradient checkpointing
+from mlx_primitives import checkpoint, checkpoint_sequential
+
+def transformer_block(x):
+    # ... your block implementation
+    return x
+
+# Memory-efficient forward pass
+output = checkpoint(transformer_block, x)
 ```
 
 ## Benchmarks

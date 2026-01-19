@@ -31,6 +31,7 @@ from mlx_primitives.attention._online_softmax import (
     compute_chunk_attention,
     online_softmax_merge,
 )
+from mlx_primitives.constants import ATTENTION_MASK_VALUE, METAL_SOFTMAX_EPSILON
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
@@ -47,6 +48,8 @@ def chunked_cross_attention(
     scale: Optional[float] = None,
     causal: bool = False,
     use_metal: bool = True,
+    dropout_p: float = 0.0,
+    training: bool = True,
 ) -> mx.array:
     """Cross-attention with chunked KV processing.
 
@@ -65,6 +68,9 @@ def chunked_cross_attention(
         causal: If True, apply causal masking. For cross-attention between
             different sequences, this is often False.
         use_metal: Use Metal kernel if available.
+        dropout_p: Dropout probability on attention weights. Default 0.0 (no dropout).
+            When dropout_p > 0, falls back to reference implementation.
+        training: If False, dropout is not applied. Default True.
 
     Returns:
         Output tensor of shape (batch, seq_q, num_heads, head_dim).
@@ -87,6 +93,8 @@ def chunked_cross_attention(
         - This limits attention MEMORY while preserving full attention span
         - For very long sequences, Flash Attention may be more efficient if
           Q and KV have the same length
+        - When dropout_p > 0 and training=True, falls back to reference
+          implementation since dropout requires materializing attention weights.
     """
     if q.ndim != 4:
         raise ValueError(f"Expected 4D tensors (batch, seq, heads, dim), got {q.ndim}D")
@@ -97,6 +105,10 @@ def chunked_cross_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
+    # Fall back to reference implementation when dropout is enabled
+    if dropout_p > 0.0 and training:
+        return _reference_cross_attention_with_dropout(q, k, v, scale, causal, dropout_p)
+
     # For short KV sequences, just use standard attention
     if seq_kv <= chunk_size:
         return _reference_cross_attention(q, k, v, scale, causal)
@@ -105,7 +117,8 @@ def chunked_cross_attention(
     if use_metal and _HAS_METAL and seq_kv >= 2048:
         try:
             return _metal_chunked_cross_attention(q, k, v, chunk_size, scale, causal)
-        except Exception as e:
+        except RuntimeError as e:
+            # Catch Metal kernel errors, but let programming bugs propagate
             from mlx_primitives.utils.logging import log_fallback
             log_fallback("chunked_cross_attention", e)
 
@@ -128,7 +141,7 @@ def _chunked_cross_attention_impl(
     # Initialize accumulators for online softmax
     # output_acc stores unnormalized weighted values
     output_acc = mx.zeros((batch_size, seq_q, num_heads, head_dim))
-    max_scores = mx.full((batch_size, seq_q, num_heads), -1e9)
+    max_scores = mx.full((batch_size, seq_q, num_heads), ATTENTION_MASK_VALUE)
     sum_exp = mx.zeros((batch_size, seq_q, num_heads))
 
     # Process KV in chunks
@@ -152,8 +165,8 @@ def _chunked_cross_attention_impl(
             chunk_output, chunk_max, chunk_sum,
         )
 
-    # Output is already normalized by online_softmax_merge
-    return output_acc
+    # Normalize at the end
+    return output_acc / (sum_exp[..., None] + METAL_SOFTMAX_EPSILON)
 
 
 def _reference_cross_attention(
@@ -181,10 +194,62 @@ def _reference_cross_attention(
         q_pos = mx.arange(seq_q)[:, None]
         kv_pos = mx.arange(seq_kv)[None, :]
         mask = kv_pos <= q_pos
-        scores = mx.where(mask[None, None, :, :], scores, -1e9)
+        scores = mx.where(mask[None, None, :, :], scores, ATTENTION_MASK_VALUE)
 
     # Softmax and output
     weights = mx.softmax(scores, axis=-1)
+    output = weights @ v_t
+
+    return output.transpose(0, 2, 1, 3)
+
+
+def _reference_cross_attention_with_dropout(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    causal: bool,
+    dropout_p: float,
+) -> mx.array:
+    """Reference cross-attention with dropout support.
+
+    Args:
+        q: Query tensor (batch, seq_q, heads, dim).
+        k: Key tensor (batch, seq_kv, heads, dim).
+        v: Value tensor (batch, seq_kv, heads, dim).
+        scale: Attention scale factor.
+        causal: Whether to apply causal masking.
+        dropout_p: Dropout probability (0.0 to 1.0).
+
+    Returns:
+        Output tensor (batch, seq_q, heads, dim).
+    """
+    batch_size, seq_q, num_heads, head_dim = q.shape
+    _, seq_kv, _, _ = k.shape
+
+    # Transpose for matmul: (batch, heads, seq, dim)
+    q_t = q.transpose(0, 2, 1, 3)
+    k_t = k.transpose(0, 2, 1, 3)
+    v_t = v.transpose(0, 2, 1, 3)
+
+    # Attention scores: (batch, heads, seq_q, seq_kv)
+    scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
+
+    # Apply causal mask if needed
+    if causal:
+        q_pos = mx.arange(seq_q)[:, None]
+        kv_pos = mx.arange(seq_kv)[None, :]
+        mask = kv_pos <= q_pos
+        scores = mx.where(mask[None, None, :, :], scores, ATTENTION_MASK_VALUE)
+
+    # Softmax
+    weights = mx.softmax(scores, axis=-1)
+
+    # Apply dropout to attention weights
+    if dropout_p > 0.0:
+        dropout_mask = mx.random.bernoulli(1.0 - dropout_p, weights.shape)
+        weights = weights * dropout_mask / (1.0 - dropout_p)
+
     output = weights @ v_t
 
     return output.transpose(0, 2, 1, 3)
@@ -194,114 +259,95 @@ def _get_chunked_attention_kernel() -> mx.fast.metal_kernel:
     """Get or create the chunked cross-attention Metal kernel."""
     global _chunked_attention_kernel
     if _chunked_attention_kernel is None:
+        # Note: MLX metal_kernel only supports 1 thread per threadgroup effectively
+        # (threads_per_threadgroup.x always returns 1), so we use one threadgroup
+        # per query position and stream K/V from global memory.
         source = """
         // Chunked Cross-Attention Metal Kernel
-        // Each thread handles one query position
-        // Q stays in registers, KV streams through shared memory
+        // Each threadgroup handles one query position
+        // Q stays in registers, KV streams through global memory
 
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _batch_size = batch_size[0];
+        uint _seq_q = seq_q[0];
+        uint _seq_kv = seq_kv[0];
+        uint _num_heads = num_heads[0];
+        uint _head_dim = head_dim[0];
+        uint _causal = causal[0];
+        float _scale = scale[0];
+
+        // Grid layout: (seq_q, num_heads, batch_size)
         uint batch_idx = threadgroup_position_in_grid.z;
         uint head_idx = threadgroup_position_in_grid.y;
-        uint q_pos = thread_position_in_grid.x;
-        uint local_tid = thread_position_in_threadgroup.x;
+        uint q_pos = threadgroup_position_in_grid.x;
 
-        if (batch_idx >= batch_size || head_idx >= num_heads || q_pos >= seq_q) return;
-
-        // Padded dimension for bank-conflict-free access
-        uint head_dim_pad = head_dim + 4;
+        if (batch_idx >= _batch_size || head_idx >= _num_heads || q_pos >= _seq_q) return;
 
         // Compute base offsets
-        uint q_stride = num_heads * head_dim;
-        uint kv_stride = num_heads * head_dim;
+        uint qkv_stride = _num_heads * _head_dim;
 
-        uint q_offset = batch_idx * seq_q * q_stride + q_pos * q_stride + head_idx * head_dim;
-        uint kv_base = batch_idx * seq_kv * kv_stride + head_idx * head_dim;
+        uint q_offset = batch_idx * _seq_q * qkv_stride + q_pos * qkv_stride + head_idx * _head_dim;
+        uint kv_base = batch_idx * _seq_kv * qkv_stride + head_idx * _head_dim;
 
         // Initialize online softmax state
         float max_val = -1e38f;
         float sum_exp = 0.0f;
         float acc[132];  // Support up to head_dim=128 + padding
-        for (uint d = 0; d < head_dim; d++) {
+        for (uint d = 0; d < _head_dim; d++) {
             acc[d] = 0.0f;
         }
 
         // Load Q into registers
         float q_reg[132];
-        for (uint d = 0; d < head_dim; d++) {
+        for (uint d = 0; d < _head_dim; d++) {
             q_reg[d] = Q[q_offset + d];
         }
 
-        // Process KV in chunks
-        for (uint kv_start = 0; kv_start < seq_kv; kv_start += chunk_size) {
-            uint kv_end = kv_start + chunk_size;
-            if (kv_end > seq_kv) kv_end = seq_kv;
-            uint tile_size = kv_end - kv_start;
+        // Determine KV range based on causal masking
+        uint kv_end_pos = _causal ? (q_pos + 1) : _seq_kv;
 
-            // Cooperative load K tile
-            for (uint i = local_tid; i < tile_size * head_dim; i += threads_per_threadgroup.x) {
-                uint kv_local = i / head_dim;
-                uint d = i % head_dim;
-                uint kv_global = kv_start + kv_local;
-                K_shared[kv_local * head_dim_pad + d] = K[kv_base + kv_global * kv_stride + d];
+        // Process all KV positions
+        for (uint kv_pos = 0; kv_pos < kv_end_pos; kv_pos++) {
+            uint kv_offset = kv_base + kv_pos * qkv_stride;
+
+            // Compute score: Q @ K^T
+            float score = 0.0f;
+            for (uint d = 0; d < _head_dim; d++) {
+                score += q_reg[d] * K[kv_offset + d];
             }
+            score *= _scale;
 
-            // Cooperative load V tile
-            for (uint i = local_tid; i < tile_size * head_dim; i += threads_per_threadgroup.x) {
-                uint kv_local = i / head_dim;
-                uint d = i % head_dim;
-                uint kv_global = kv_start + kv_local;
-                V_shared[kv_local * head_dim_pad + d] = V[kv_base + kv_global * kv_stride + d];
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Process this tile
-            for (uint kv_local = 0; kv_local < tile_size; kv_local++) {
-                uint kv_global = kv_start + kv_local;
-
-                // Causal mask check
-                if (causal && kv_global > q_pos) continue;
-
-                // Compute score
-                float score = 0.0f;
-                for (uint d = 0; d < head_dim; d++) {
-                    score += q_reg[d] * K_shared[kv_local * head_dim_pad + d];
+            // Online softmax update
+            if (score > max_val) {
+                float ratio = exp(max_val - score);
+                sum_exp = sum_exp * ratio + 1.0f;
+                for (uint d = 0; d < _head_dim; d++) {
+                    acc[d] = acc[d] * ratio + V[kv_offset + d];
                 }
-                score *= scale;
-
-                // Online softmax update
-                if (score > max_val) {
-                    float ratio = exp(max_val - score);
-                    sum_exp = sum_exp * ratio + 1.0f;
-                    for (uint d = 0; d < head_dim; d++) {
-                        acc[d] = acc[d] * ratio + V_shared[kv_local * head_dim_pad + d];
-                    }
-                    max_val = score;
-                } else {
-                    float weight = exp(score - max_val);
-                    sum_exp += weight;
-                    for (uint d = 0; d < head_dim; d++) {
-                        acc[d] += weight * V_shared[kv_local * head_dim_pad + d];
-                    }
+                max_val = score;
+            } else {
+                float weight = exp(score - max_val);
+                sum_exp += weight;
+                for (uint d = 0; d < _head_dim; d++) {
+                    acc[d] += weight * V[kv_offset + d];
                 }
             }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         // Normalize and write output
-        uint o_offset = batch_idx * seq_q * q_stride + q_pos * q_stride + head_idx * head_dim;
-        float inv_sum = 1.0f / sum_exp;
-        for (uint d = 0; d < head_dim; d++) {
+        uint o_offset = batch_idx * _seq_q * qkv_stride + q_pos * qkv_stride + head_idx * _head_dim;
+        float inv_sum = 1.0f / (sum_exp + SOFTMAX_EPSf);
+        for (uint d = 0; d < _head_dim; d++) {
             O[o_offset + d] = acc[d] * inv_sum;
         }
-        """
+        """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
 
         _chunked_attention_kernel = mx.fast.metal_kernel(
             name="chunked_cross_attention",
             input_names=[
                 "Q", "K", "V",
                 "batch_size", "seq_q", "seq_kv", "num_heads", "head_dim",
-                "chunk_size", "causal", "scale"
+                "causal", "scale"
             ],
             output_names=["O"],
             source=source,
@@ -317,16 +363,22 @@ def _metal_chunked_cross_attention(
     scale: float,
     causal: bool,
 ) -> mx.array:
-    """Metal kernel implementation of chunked cross-attention."""
+    """Metal kernel implementation of chunked cross-attention.
+
+    Note: chunk_size parameter is kept for API compatibility but is not used
+    by the current kernel implementation. The kernel processes all KV positions
+    in a single pass due to MLX metal_kernel limitations (no shared memory).
+    The Python fallback (_chunked_cross_attention_impl) does true chunking.
+    """
     batch_size, seq_q, num_heads, head_dim = q.shape
     _, seq_kv, _, _ = k.shape
 
     kernel = _get_chunked_attention_kernel()
 
     # Ensure contiguous float32 tensors
-    q = mx.ascontiguousarray(q.astype(mx.float32))
-    k = mx.ascontiguousarray(k.astype(mx.float32))
-    v = mx.ascontiguousarray(v.astype(mx.float32))
+    q = mx.contiguous(q.astype(mx.float32))
+    k = mx.contiguous(k.astype(mx.float32))
+    v = mx.contiguous(v.astype(mx.float32))
 
     # Prepare scalar inputs
     batch_arr = mx.array([batch_size], dtype=mx.uint32)
@@ -334,19 +386,19 @@ def _metal_chunked_cross_attention(
     seq_kv_arr = mx.array([seq_kv], dtype=mx.uint32)
     heads_arr = mx.array([num_heads], dtype=mx.uint32)
     dim_arr = mx.array([head_dim], dtype=mx.uint32)
-    chunk_arr = mx.array([chunk_size], dtype=mx.uint32)
     causal_arr = mx.array([1 if causal else 0], dtype=mx.uint32)
     scale_arr = mx.array([scale], dtype=mx.float32)
 
-    # Grid: (seq_q, num_heads, batch_size)
+    # Grid: (seq_q, num_heads, batch_size) - one threadgroup per query position
+    # Threadgroup: (1, 1, 1) - MLX metal_kernel only supports 1 thread per threadgroup
     outputs = kernel(
         inputs=[
             q, k, v,
             batch_arr, seq_q_arr, seq_kv_arr, heads_arr, dim_arr,
-            chunk_arr, causal_arr, scale_arr
+            causal_arr, scale_arr
         ],
         grid=(seq_q, num_heads, batch_size),
-        threadgroup=(min(seq_q, 64), 1, 1),
+        threadgroup=(1, 1, 1),
         output_shapes=[(batch_size, seq_q, num_heads, head_dim)],
         output_dtypes=[mx.float32],
         stream=mx.default_stream(mx.default_device()),

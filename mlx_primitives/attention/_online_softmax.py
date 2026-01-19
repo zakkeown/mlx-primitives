@@ -12,12 +12,16 @@ Key insight: softmax can be computed in a single pass by maintaining:
 When processing a new chunk, we can merge with the running statistics:
 - m_new = max(m_old, m_chunk)
 - l_new = l_old * exp(m_old - m_new) + l_chunk * exp(m_chunk - m_new)
-- o_new = (o_old * l_old * exp(m_old - m_new) + o_chunk * exp(m_chunk - m_new)) / l_new
+- o_new = o_old * exp(m_old - m_new) + o_chunk * exp(m_chunk - m_new)
+
+Note: o is kept unnormalized during accumulation. Final output is o / l.
 """
 
 from typing import Tuple
 
 import mlx.core as mx
+
+from mlx_primitives.constants import ATTENTION_MASK_VALUE, METAL_SOFTMAX_EPSILON
 
 
 def online_softmax_merge(
@@ -76,11 +80,13 @@ def online_softmax_merge(
     new_total_sum = acc_sum * acc_correction + new_sum * new_correction
 
     # Update output accumulator
-    # Note: outputs are stored as sum(exp(s - local_max) * v), need to rescale
+    # Note: outputs are stored as sum(exp(s - local_max) * v).
+    # During merge, we rescale both accumulators to the new global max
+    # and sum them. Normalization is deferred to the final step.
     merged_output = (
-        acc_output * (acc_correction * acc_sum)[..., None]
+        acc_output * acc_correction[..., None]
         + new_output * new_correction[..., None]
-    ) / (new_total_sum[..., None] + 1e-6)  # FP16-safe epsilon
+    )
 
     return merged_output, global_max, new_total_sum
 
@@ -132,11 +138,11 @@ def compute_chunk_attention(
         # Shape: (seq_q, chunk_size)
         causal_mask = kv_pos[None, :] <= q_pos[:, None]
 
-        # Apply mask: set future positions to -inf
+        # Apply mask: set future positions to large negative
         scores = mx.where(
             causal_mask[None, :, None, :],  # (1, seq_q, 1, chunk_size)
             scores,
-            mx.array(-1e9),
+            mx.array(ATTENTION_MASK_VALUE),  # Match Metal kernel behavior
         )
 
     # Compute local max for numerical stability

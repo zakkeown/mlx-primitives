@@ -19,6 +19,7 @@ _scan_add_batched_kernel: Optional[mx.fast.metal_kernel] = None
 _scan_add_simd_kernel: Optional[mx.fast.metal_kernel] = None
 _scan_add_batched_simd_kernel: Optional[mx.fast.metal_kernel] = None
 _scan_add_vectorized_kernel: Optional[mx.fast.metal_kernel] = None
+_scan_add_strided_kernel: Optional[mx.fast.metal_kernel] = None
 _ssm_scan_kernel: Optional[mx.fast.metal_kernel] = None
 _ssm_scan_simd_kernel: Optional[mx.fast.metal_kernel] = None
 _scan_mul_kernel: Optional[mx.fast.metal_kernel] = None
@@ -257,6 +258,85 @@ def _get_scan_add_vectorized_kernel() -> mx.fast.metal_kernel:
             source=source,
         )
     return _scan_add_vectorized_kernel
+
+
+def _get_scan_add_strided_kernel() -> mx.fast.metal_kernel:
+    """Get or create the strided additive scan kernel for arbitrary axis support.
+
+    This kernel handles scan along any axis without transposing by using strided
+    memory access. Parameters:
+    - outer_size: Product of dimensions before scan axis
+    - axis_size: Size of the scan dimension
+    - inner_size: Product of dimensions after scan axis
+    - axis_stride: Stride to move along scan axis (equals inner_size)
+
+    Grid: (outer_size, inner_size, 1) - one threadgroup per (outer, inner) slice
+    Each threadgroup scans along the axis dimension for one (outer, inner) position.
+    """
+    global _scan_add_strided_kernel
+    if _scan_add_strided_kernel is None:
+        source = """
+        // Threadgroup memory for warp totals (max 32 warps)
+        threadgroup float shared[32];
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint outer_idx = threadgroup_position_in_grid.x;
+        uint inner_idx = threadgroup_position_in_grid.y;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint block_size = threads_per_threadgroup.x;
+
+        // Load parameters
+        uint _outer_size = outer_size[0];
+        uint _axis_size = axis_size[0];
+        uint _inner_size = inner_size[0];
+        uint _axis_stride = axis_stride[0];
+
+        // Early exit for out-of-bounds threadgroups
+        if (outer_idx >= _outer_size || inner_idx >= _inner_size) return;
+
+        // Compute base offset for this (outer, inner) slice
+        // offset = outer_idx * (axis_size * axis_stride) + inner_idx
+        uint base_offset = outer_idx * (_axis_size * _axis_stride) + inner_idx;
+
+        // Load input value with strided access
+        // Element at axis position tid is at: base_offset + tid * axis_stride
+        float val = (tid < _axis_size) ? input[base_offset + tid * _axis_stride] : 0.0f;
+
+        // Phase 1: Intra-warp inclusive scan using SIMD intrinsics
+        float warp_scan = simd_prefix_inclusive_sum(val);
+
+        // Phase 2: Store warp totals
+        uint num_warps = (block_size + 31) / 32;
+        if (simd_lane == 31) {
+            shared[simd_group] = warp_scan;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 3: Scan warp totals (first warp only)
+        if (simd_group == 0 && simd_lane < num_warps) {
+            float warp_total = shared[simd_lane];
+            float scanned_total = simd_prefix_exclusive_sum(warp_total);
+            shared[simd_lane] = scanned_total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 4: Add warp prefix
+        float warp_prefix = (simd_group > 0) ? shared[simd_group] : 0.0f;
+        float result = warp_scan + warp_prefix;
+
+        // Write output with strided access
+        if (tid < _axis_size) {
+            output[base_offset + tid * _axis_stride] = result;
+        }
+        """
+        _scan_add_strided_kernel = mx.fast.metal_kernel(
+            name="associative_scan_add_strided",
+            input_names=["input", "outer_size", "axis_size", "inner_size", "axis_stride"],
+            output_names=["output"],
+            source=source,
+        )
+    return _scan_add_strided_kernel
 
 
 def _get_scan_add_kernel() -> mx.fast.metal_kernel:
@@ -728,10 +808,13 @@ def metal_associative_scan(
 ) -> mx.array:
     """Parallel associative scan using Metal kernel.
 
+    Supports scan along any axis using strided memory access - no transposing
+    required for non-last-axis scans.
+
     Args:
         x: Input tensor.
         operator: Scan operator - "add" (cumsum) or "mul" (cumprod).
-        axis: Axis along which to scan. Must be the last axis for now.
+        axis: Axis along which to scan. Supports any valid axis.
         inclusive: If True, include current element in scan result.
 
     Returns:
@@ -741,17 +824,18 @@ def metal_associative_scan(
     if axis < 0:
         axis = x.ndim + axis
 
-    # For now, only support scan along last axis
-    if axis != x.ndim - 1:
-        # Transpose to move scan axis to last position
-        perm = list(range(x.ndim))
-        perm[axis], perm[-1] = perm[-1], perm[axis]
-        x = mx.transpose(x, perm)
-        result = metal_associative_scan(x, operator, -1, inclusive)
-        return mx.transpose(result, perm)
+    if axis < 0 or axis >= x.ndim:
+        raise ValueError(f"Invalid axis {axis} for tensor with {x.ndim} dimensions")
 
     original_shape = x.shape
-    seq_len = x.shape[-1]
+    axis_size = x.shape[axis]
+
+    # For non-last-axis scans, use strided kernel (no transpose needed)
+    if axis != x.ndim - 1:
+        return _metal_associative_scan_strided(x, operator, axis, inclusive)
+
+    # Last-axis scan: use optimized batched kernels
+    seq_len = axis_size
 
     # Flatten to (batch, seq_len)
     if x.ndim == 1:
@@ -806,6 +890,87 @@ def metal_associative_scan(
 
     # Reshape back to original shape
     return result.reshape(original_shape)
+
+
+def _metal_associative_scan_strided(
+    x: mx.array,
+    operator: Literal["add", "mul"],
+    axis: int,
+    inclusive: bool = True,
+) -> mx.array:
+    """Strided scan for arbitrary axis without transposing.
+
+    For a tensor of shape (d0, d1, ..., dk, ..., dn) with scan along axis k:
+    - outer_size = d0 * d1 * ... * d(k-1) (product of dims before axis)
+    - axis_size = dk (the scan dimension)
+    - inner_size = d(k+1) * ... * dn (product of dims after axis)
+    - axis_stride = inner_size (stride to move along scan axis)
+
+    Args:
+        x: Input tensor.
+        operator: Scan operator.
+        axis: Axis along which to scan (must be normalized, not -1).
+        inclusive: If True, include current element in scan result.
+
+    Returns:
+        Scanned tensor of same shape as input.
+    """
+    if operator != "add":
+        # Fall back to transpose method for non-add operators
+        perm = list(range(x.ndim))
+        perm[axis], perm[-1] = perm[-1], perm[axis]
+        x_t = mx.transpose(x, perm)
+        result = metal_associative_scan(x_t, operator, -1, inclusive)
+        return mx.transpose(result, perm)
+
+    original_shape = x.shape
+    axis_size = x.shape[axis]
+
+    # Handle multi-block case for long axis
+    if axis_size > MAX_SINGLE_BLOCK_SEQ:
+        # Fall back to transpose method for long sequences
+        perm = list(range(x.ndim))
+        perm[axis], perm[-1] = perm[-1], perm[axis]
+        x_t = mx.transpose(x, perm)
+        result = metal_associative_scan(x_t, operator, -1, inclusive)
+        return mx.transpose(result, perm)
+
+    # Compute strided parameters
+    outer_size = 1
+    for i in range(axis):
+        outer_size *= x.shape[i]
+
+    inner_size = 1
+    for i in range(axis + 1, x.ndim):
+        inner_size *= x.shape[i]
+
+    axis_stride = inner_size  # Stride to move along scan axis
+
+    # Prepare inputs
+    x_flat = mx.contiguous(x.astype(mx.float32))
+    outer_size_arr = mx.array([outer_size], dtype=mx.uint32)
+    axis_size_arr = mx.array([axis_size], dtype=mx.uint32)
+    inner_size_arr = mx.array([inner_size], dtype=mx.uint32)
+    axis_stride_arr = mx.array([axis_stride], dtype=mx.uint32)
+
+    # Block size for axis dimension
+    block_size = _next_power_of_2(axis_size)
+    block_size = min(block_size, MAX_SINGLE_BLOCK_SEQ)
+
+    kernel = _get_scan_add_strided_kernel()
+
+    # Execute kernel
+    # Grid: (outer_size, inner_size, 1) - one threadgroup per (outer, inner) slice
+    outputs = kernel(
+        inputs=[x_flat, outer_size_arr, axis_size_arr, inner_size_arr, axis_stride_arr],
+        grid=(block_size * outer_size, inner_size, 1),
+        threadgroup=(block_size, 1, 1),
+        output_shapes=[original_shape],
+        output_dtypes=[mx.float32],
+        stream=mx.default_stream(mx.default_device()),
+    )
+
+    return outputs[0]
 
 
 def _metal_associative_scan_multiblock(

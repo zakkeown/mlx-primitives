@@ -48,7 +48,19 @@ ROPE_BASE_FREQUENCY = 10000.0
 # =============================================================================
 
 # Mask value for causal attention (large negative to become ~0 after softmax)
-ATTENTION_MASK_VALUE = -1e9
+# Using -1e38 to align with Metal kernels which use -1e38f for consistency
+# between Python and Metal code paths
+ATTENTION_MASK_VALUE = -1e38
+
+# Maximum head dimension supported by Metal attention kernels
+# Kernels use fixed-size arrays: float acc[132] supports head_dim <= 128
+METAL_ATTENTION_MAX_HEAD_DIM = 128
+
+# Epsilon for softmax normalization in Metal kernels
+# Prevents division by zero when all attention scores are masked
+# Using 1e-6 as minimum safe value for FP32; FP16 would need 1e-4
+# Industry standard (PyTorch, JAX) uses 1e-6 minimum
+METAL_SOFTMAX_EPSILON = 1e-6
 
 
 # =============================================================================
@@ -70,9 +82,13 @@ QUANT_INT4_RANGE = 15
 # HARDWARE
 # =============================================================================
 
-# Default L2 cache size assumption (MB) for M3 Pro
-# Used for optimal block size calculations
-DEFAULT_L2_CACHE_MB = 24.0
+# Default L2 cache size assumption (MB) - conservative default for base chips
+# M1/M2/M3 base: 8MB, Pro: 24MB, Max: 48MB, Ultra: 96MB
+# Hardware detection in hardware/detection.py provides accurate values;
+# this is only used as fallback. Override via MLX_PRIMITIVES_L2_CACHE_MB env var.
+DEFAULT_L2_CACHE_MB = 8.0
 
 # Minimum sequence length for Metal kernel dispatch
-MIN_SEQ_FOR_METAL = 32
+# Lowered from 32 to 8 to use Metal for more SSM workloads
+# Override via MLX_PRIMITIVES_MIN_SEQ_FOR_METAL env var
+MIN_SEQ_FOR_METAL = 8

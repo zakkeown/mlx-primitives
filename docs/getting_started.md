@@ -21,226 +21,212 @@ The most common use case is memory-efficient attention:
 
 ```python
 import mlx.core as mx
-from mlx_primitives.attention import FlashAttention
+from mlx_primitives import FlashAttention, flash_attention
 
 # Create attention layer
 attn = FlashAttention(
-    dims=768,        # Model dimension
     num_heads=12,    # Number of attention heads
+    head_dim=64,     # Dimension per head
     causal=True,     # Use causal (autoregressive) masking
 )
 
-# Forward pass
-x = mx.random.normal((2, 128, 768))  # (batch, seq, dims)
-output = attn(x)
-print(output.shape)  # (2, 128, 768)
+# Input tensors: (batch, seq, heads, head_dim)
+q = mx.random.normal((2, 128, 12, 64))
+k = mx.random.normal((2, 128, 12, 64))
+v = mx.random.normal((2, 128, 12, 64))
+
+# Forward pass - O(n) memory complexity
+output = attn(q, k, v)
+print(output.shape)  # (2, 128, 12, 64)
+
+# Or use functional API
+output = flash_attention(q, k, v, causal=True)
 ```
 
-### Grouped Query Attention (GQA)
+### Sliding Window Attention
 
-For LLaMA-style attention with fewer KV heads:
+For fixed context window attention (Mistral-style):
 
 ```python
-from mlx_primitives.attention import GroupedQueryAttention
+from mlx_primitives import SlidingWindowAttention
 
-# 12 query heads, 4 KV heads (3 Q heads share each KV head)
-gqa = GroupedQueryAttention(
-    dims=768,
+# 512-token sliding window
+attn = SlidingWindowAttention(
     num_heads=12,
-    num_kv_heads=4,
+    head_dim=64,
+    window_size=512,
     causal=True,
 )
 
-x = mx.random.normal((2, 128, 768))
-output, cache = gqa(x)  # Returns (output, kv_cache)
+q = mx.random.normal((2, 2048, 12, 64))
+k = mx.random.normal((2, 2048, 12, 64))
+v = mx.random.normal((2, 2048, 12, 64))
+
+output = attn(q, k, v)
 ```
 
-### Rotary Position Embeddings (RoPE)
+### Chunked Cross-Attention
 
-Apply rotary embeddings to query and key tensors:
+Memory-efficient cross-attention for long KV sequences:
 
 ```python
-from mlx_primitives.attention import RoPE
+from mlx_primitives import ChunkedCrossAttention
 
-rope = RoPE(
-    dims=64,           # Head dimension
-    max_seq_len=2048,  # Maximum sequence length
+attn = ChunkedCrossAttention(
+    num_heads=12,
+    head_dim=64,
+    chunk_size=256,  # Process KV in chunks
 )
 
-# Apply to Q and K
-q = mx.random.normal((2, 128, 12, 64))  # (batch, seq, heads, head_dim)
-k = mx.random.normal((2, 128, 12, 64))
-q_rot, k_rot = rope(q, k)
+# Query sequence (shorter)
+q = mx.random.normal((2, 128, 12, 64))
+# Key/Value sequence (longer)
+k = mx.random.normal((2, 4096, 12, 64))
+v = mx.random.normal((2, 4096, 12, 64))
+
+output = attn(q, k, v)
 ```
 
-## Layers
+## Fused Kernels
 
-### Normalization
-
-```python
-from mlx_primitives.layers import RMSNorm, GroupNorm
-
-# RMSNorm (used in LLaMA, Mistral)
-norm = RMSNorm(dims=768)
-x = mx.random.normal((2, 128, 768))
-y = norm(x)
-
-# GroupNorm
-gnorm = GroupNorm(num_groups=8, num_channels=256)
-x = mx.random.normal((2, 32, 32, 256))  # NHWC format
-y = gnorm(x)
-```
-
-### Activations
+### SwiGLU / GeGLU Activations
 
 ```python
-from mlx_primitives.layers import SwiGLU, GeGLU, Mish
+from mlx_primitives.kernels import SwiGLU, GeGLU
 
 # SwiGLU (used in LLaMA, Mistral)
 swiglu = SwiGLU(in_features=768, hidden_features=2048)
 x = mx.random.normal((2, 128, 768))
 y = swiglu(x)  # (2, 128, 768)
 
-# Mish activation
-mish = Mish()
-y = mish(x)
+# GeGLU
+geglu = GeGLU(in_features=768, hidden_features=2048)
+y = geglu(x)
 ```
 
-## Training
-
-### Basic Training Loop
+### INT8/INT4 Quantization
 
 ```python
-from mlx_primitives.training import (
-    Trainer,
-    TrainingConfig,
-    CosineAnnealingLR,
-    EarlyStopping,
-    ModelCheckpoint,
-)
+from mlx_primitives.kernels import quantize_int8, quantize_int4, dequantize_int8
 
-# Create config
-config = TrainingConfig(
-    learning_rate=1e-4,
-    batch_size=32,
-    num_epochs=10,
-)
+# Quantize weights
+weights = mx.random.normal((1024, 768))
+q_weights, scales = quantize_int8(weights)
 
-# Create trainer with callbacks
-trainer = Trainer(
-    model=my_model,
-    config=config,
-    scheduler=CosineAnnealingLR(lr=1e-4, T_max=1000),
-    callbacks=[
-        EarlyStopping(patience=3),
-        ModelCheckpoint(save_dir="checkpoints"),
-    ],
-)
-
-# Train
-trainer.fit(train_loader, val_loader)
+# Use in forward pass (dequantize on the fly)
+x = mx.random.normal((2, 128, 768))
+output = dequantize_int8(q_weights, scales) @ x.T
 ```
 
-### EMA (Exponential Moving Average)
+## Training Utilities
+
+### Gradient Checkpointing
+
+Reduce memory usage during training by recomputing activations:
 
 ```python
-from mlx_primitives.training import EMA
+from mlx_primitives import checkpoint, checkpoint_sequential
 
-ema = EMA(model, decay=0.999)
+def transformer_block(x):
+    # Your transformer block implementation
+    return x
 
-# During training
-for batch in loader:
-    loss = train_step(batch)
-    ema.update()
+# Checkpoint a single function
+x = mx.random.normal((2, 128, 768))
+output = checkpoint(transformer_block, x)
 
-# For evaluation, use EMA weights
-with ema.apply_to_model():
-    eval_loss = eval_step(val_batch)
+# Checkpoint a sequence of layers
+layers = [layer1, layer2, layer3, layer4]
+output = checkpoint_sequential(layers, x, segments=2)
 ```
 
-## Advanced Features
+## Core Primitives
+
+### Parallel Scan (for SSMs)
+
+```python
+from mlx_primitives import associative_scan, selective_scan
+
+# Simple cumulative sum
+x = mx.random.normal((2, 128, 64))
+cumsum = associative_scan(x, operator="add", axis=1)
+
+# SSM-style scan: h[t] = A[t] * h[t-1] + x[t]
+A = mx.random.uniform(shape=(2, 128, 64))  # Decay factors
+x = mx.random.normal((2, 128, 64))
+hidden_states = associative_scan(x, operator="ssm", A=A, axis=1)
+```
 
 ### Mixture of Experts (MoE)
 
 ```python
-from mlx_primitives.advanced import MoELayer, TopKRouter, Expert
-
-# Create experts
-experts = [Expert(dims=768, hidden_dims=2048) for _ in range(8)]
-
-# Create router (top-2 routing)
-router = TopKRouter(dims=768, num_experts=8, top_k=2)
+from mlx_primitives import SparseMoELayer, build_expert_dispatch
 
 # Create MoE layer
-moe = MoELayer(router=router, experts=experts)
+moe = SparseMoELayer(
+    dims=768,
+    num_experts=8,
+    top_k=2,
+    hidden_dims=2048,
+)
 
 x = mx.random.normal((2, 128, 768))
 output, aux_loss = moe(x)  # aux_loss for load balancing
 ```
 
-### State Space Models (Mamba)
+## KV Cache (Submodule)
 
 ```python
-from mlx_primitives.advanced import MambaBlock, Mamba
+from mlx_primitives.cache import KVCache
 
-# Single Mamba block
-block = MambaBlock(dims=768, d_state=16)
-x = mx.random.normal((2, 128, 768))
-y = block(x)
-
-# Full Mamba model
-mamba = Mamba(
-    dims=768,
-    depth=12,
-    d_state=16,
-)
-```
-
-### KV Cache for Inference
-
-```python
-from mlx_primitives.advanced import SlidingWindowCache
-
-# Create sliding window cache
-cache = SlidingWindowCache(
-    max_seq_len=4096,
-    window_size=512,
+# Create cache
+cache = KVCache(
     batch_size=1,
+    max_seq_len=2048,
     num_heads=12,
     head_dim=64,
 )
 
-# Use with attention
-for token in tokens:
-    # ... compute q, k, v
-    k, v = cache.update(k, v)
-    # ... compute attention
+# Use during generation
+for step in range(max_tokens):
+    # ... compute q, k, v for current token
+    k_cached, v_cached = cache.update(k, v)
+    # ... compute attention with cached KV
 ```
 
-## Configuration
-
-### Precision Control
-
-Control numerical precision for performance vs accuracy:
+## Generation Engine (Submodule)
 
 ```python
-from mlx_primitives.config import (
-    PrecisionMode,
-    set_precision_mode,
-    precision_context,
+from mlx_primitives.generation import GenerationEngine
+
+# Create generation engine
+engine = GenerationEngine(
+    model=my_model,
+    tokenizer=my_tokenizer,
 )
 
-# Force float16 for maximum performance
-set_precision_mode(PrecisionMode.FLOAT16)
+# Generate text
+output = engine.generate(
+    prompt="Hello, world!",
+    max_tokens=100,
+    temperature=0.7,
+)
+```
 
-# Or use context manager for temporary override
-with precision_context(mode=PrecisionMode.FLOAT32):
-    # This will use float32
-    output = attention(q, k, v)
+## Hardware Detection (Submodule)
+
+```python
+from mlx_primitives.hardware import get_chip_info
+
+# Get current chip information
+info = get_chip_info()
+print(f"Chip: {info.name}")
+print(f"GPU Cores: {info.gpu_cores}")
+print(f"L2 Cache: {info.l2_cache_mb} MB")
 ```
 
 ## Next Steps
 
 - Check out the [examples](../examples/) for complete working code
-- Read the [API reference](api/attention.md) for detailed documentation
-- See the [precision guide](guides/precision.md) for performance tuning
+- Read the API source code for detailed documentation
+- Run benchmarks with `python -m benchmarks.runner`

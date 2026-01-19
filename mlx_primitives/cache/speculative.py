@@ -589,8 +589,8 @@ class TreeSpeculation:
             target_logits = target_model(input_ids)
             mx.eval(target_logits)
 
-            # Convert logits to log probs
-            target_log_probs = mx.log(mx.softmax(target_logits, axis=-1) + 1e-6)
+            # Convert logits to log probs (using numerically stable log_softmax)
+            target_log_probs = mx.log_softmax(target_logits, axis=-1)
 
             # Verify using rejection sampling
             num_accepted, correction = speculative_verify(

@@ -9,6 +9,8 @@ from typing import List, Optional, Set, Tuple
 
 import mlx.core as mx
 
+from mlx_primitives.constants import DEFAULT_L2_CACHE_MB
+
 
 @dataclass(frozen=True)
 class BlockConfig:
@@ -345,7 +347,7 @@ def get_optimal_block_size(
     num_heads: int,
     dtype: mx.Dtype = mx.float16,
     target_l2_fraction: float = 0.5,
-    l2_cache_mb: float = 24.0,
+    l2_cache_mb: Optional[float] = None,
 ) -> int:
     """Select optimal block size for current hardware.
 
@@ -356,11 +358,22 @@ def get_optimal_block_size(
         num_heads: Number of attention heads.
         dtype: Data type for storage.
         target_l2_fraction: Fraction of L2 to target (default 50%).
-        l2_cache_mb: L2 cache size in MB (default 24MB for M3 Pro).
+        l2_cache_mb: L2 cache size in MB. If None, auto-detects from hardware.
 
     Returns:
         Optimal block size (power of 2, between 8 and 64).
     """
+    # Auto-detect L2 cache size from hardware if not specified
+    if l2_cache_mb is None:
+        try:
+            from mlx_primitives.hardware import get_chip_info
+
+            chip_info = get_chip_info()
+            l2_cache_mb = float(chip_info.l2_cache_mb)
+        except Exception:
+            # Fallback to default if hardware detection fails
+            l2_cache_mb = DEFAULT_L2_CACHE_MB
+
     dtype_size = 2 if dtype in (mx.float16, mx.bfloat16) else 4
     kv_per_token = 2 * num_heads * head_dim * dtype_size
 

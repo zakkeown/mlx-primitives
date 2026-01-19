@@ -14,86 +14,106 @@ This is useful for:
 """
 
 import math
+import threading
 from typing import Optional
 
 import mlx.core as mx
 
+from mlx_primitives.constants import (
+    ATTENTION_MASK_VALUE,
+    METAL_ATTENTION_MAX_HEAD_DIM,
+    METAL_SOFTMAX_EPSILON,
+)
 from mlx_primitives.hardware import get_chip_info, get_optimal_attention_config
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
-# Kernel cache
+# Kernel cache with thread safety
 _sliding_window_kernel: Optional[mx.fast.metal_kernel] = None
+_sliding_window_lock = threading.Lock()
 
 
 def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
-    """Get or create the sliding window attention kernel."""
+    """Get or create the sliding window attention kernel (thread-safe)."""
     global _sliding_window_kernel
     if _sliding_window_kernel is None:
-        # Simple version - each thread handles one (batch, head, q_pos)
-        source = """
+        with _sliding_window_lock:
+            # Double-check after acquiring lock
+            if _sliding_window_kernel is not None:
+                return _sliding_window_kernel
+            # Simple version - each thread handles one (batch, head, q_pos)
+            source = """
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _batch_size = batch_size[0];
+        uint _seq_len = seq_len[0];
+        uint _num_heads = num_heads[0];
+        uint _head_dim = head_dim[0];
+        uint _window_size = window_size[0];
+        uint _causal = causal[0];
+        float _scale = scale[0];
+
         uint batch_idx = thread_position_in_grid.z;
         uint head_idx = thread_position_in_grid.y;
         uint q_pos = thread_position_in_grid.x;
 
-        if (batch_idx >= batch_size || head_idx >= num_heads || q_pos >= seq_len) return;
+        if (batch_idx >= _batch_size || head_idx >= _num_heads || q_pos >= _seq_len) return;
 
         // Compute valid KV range
-        uint kv_start = (q_pos >= window_size) ? (q_pos - window_size) : 0;
+        uint kv_start = (q_pos >= _window_size) ? (q_pos - _window_size) : 0;
         uint kv_end;
-        if (causal) {
+        if (_causal) {
             kv_end = q_pos + 1;
         } else {
-            kv_end = (q_pos + window_size + 1 < seq_len) ? (q_pos + window_size + 1) : seq_len;
+            kv_end = (q_pos + _window_size + 1 < _seq_len) ? (q_pos + _window_size + 1) : _seq_len;
         }
 
         // Compute offsets
-        uint qkv_stride = num_heads * head_dim;
-        uint q_offset = batch_idx * seq_len * qkv_stride + q_pos * qkv_stride + head_idx * head_dim;
-        uint kv_base = batch_idx * seq_len * qkv_stride + head_idx * head_dim;
+        uint qkv_stride = _num_heads * _head_dim;
+        uint q_offset = batch_idx * _seq_len * qkv_stride + q_pos * qkv_stride + head_idx * _head_dim;
+        uint kv_base = batch_idx * _seq_len * qkv_stride + head_idx * _head_dim;
 
         // First pass: find max score
         float max_score = -1e38f;
         for (uint kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
             uint k_offset = kv_base + kv_pos * qkv_stride;
             float score = 0.0f;
-            for (uint d = 0; d < head_dim; d++) {
+            for (uint d = 0; d < _head_dim; d++) {
                 score += Q[q_offset + d] * K[k_offset + d];
             }
-            score *= scale;
+            score *= _scale;
             max_score = (score > max_score) ? score : max_score;
         }
 
         // Second pass: compute softmax and accumulate
         float sum_exp = 0.0f;
         float acc[128];
-        for (uint d = 0; d < head_dim; d++) acc[d] = 0.0f;
+        for (uint d = 0; d < _head_dim; d++) acc[d] = 0.0f;
 
         for (uint kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
             uint k_offset = kv_base + kv_pos * qkv_stride;
             uint v_offset = kv_base + kv_pos * qkv_stride;
 
             float score = 0.0f;
-            for (uint d = 0; d < head_dim; d++) {
+            for (uint d = 0; d < _head_dim; d++) {
                 score += Q[q_offset + d] * K[k_offset + d];
             }
-            score *= scale;
+            score *= _scale;
 
             float weight = exp(score - max_score);
             sum_exp += weight;
 
-            for (uint d = 0; d < head_dim; d++) {
+            for (uint d = 0; d < _head_dim; d++) {
                 acc[d] += weight * V[v_offset + d];
             }
         }
 
         // Write normalized output
-        float inv_sum = 1.0f / sum_exp;
-        for (uint d = 0; d < head_dim; d++) {
+        float inv_sum = 1.0f / (sum_exp + SOFTMAX_EPSf);
+        for (uint d = 0; d < _head_dim; d++) {
             O[q_offset + d] = acc[d] * inv_sum;
         }
-        """
+        """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
         _sliding_window_kernel = mx.fast.metal_kernel(
             name="sliding_window_attention",
             input_names=[
@@ -115,6 +135,8 @@ def sliding_window_attention(
     scale: Optional[float] = None,
     causal: bool = True,
     use_metal: bool = True,
+    dropout_p: float = 0.0,
+    training: bool = True,
 ) -> mx.array:
     """Fused sliding window attention.
 
@@ -131,6 +153,9 @@ def sliding_window_attention(
         scale: Attention scale factor. Defaults to 1/sqrt(head_dim).
         causal: If True, queries can only attend to earlier positions.
         use_metal: Use Metal kernel if available.
+        dropout_p: Dropout probability on attention weights. Default 0.0 (no dropout).
+            When dropout_p > 0, falls back to reference implementation.
+        training: If False, dropout is not applied. Default True.
 
     Returns:
         Output tensor of shape (batch, seq_len, num_heads, head_dim).
@@ -141,6 +166,10 @@ def sliding_window_attention(
         >>> v = mx.random.normal((1, 1024, 8, 64))
         >>> out = sliding_window_attention(q, k, v, window_size=128)
         >>> # Each position attends to at most 128 previous positions
+
+    Note:
+        When dropout_p > 0 and training=True, falls back to reference
+        implementation since dropout requires materializing attention weights.
     """
     if q.ndim != 4:
         raise ValueError(f"Expected 4D tensors (batch, seq, heads, dim), got {q.ndim}D")
@@ -150,13 +179,20 @@ def sliding_window_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
+    # Fall back to reference implementation when dropout is enabled
+    if dropout_p > 0.0 and training:
+        return _reference_sliding_window_attention_with_dropout(
+            q, k, v, window_size, scale, causal, dropout_p
+        )
+
     # For short sequences or small windows, use Metal kernel
     if use_metal and _HAS_METAL and seq_len >= 32:
         try:
             return _metal_sliding_window_attention(
                 q, k, v, window_size, scale, causal
             )
-        except Exception as e:
+        except RuntimeError as e:
+            # Catch Metal kernel errors, but let programming bugs propagate
             from mlx_primitives.utils.logging import log_fallback
             log_fallback("sliding_window_attention", e)
 
@@ -177,12 +213,19 @@ def _metal_sliding_window_attention(
     """Metal kernel implementation of sliding window attention."""
     batch_size, seq_len, num_heads, head_dim = q.shape
 
+    # Validate head_dim against Metal kernel limits
+    if head_dim > METAL_ATTENTION_MAX_HEAD_DIM:
+        raise ValueError(
+            f"head_dim={head_dim} exceeds Metal kernel limit of "
+            f"{METAL_ATTENTION_MAX_HEAD_DIM}. Use use_metal=False for Python fallback."
+        )
+
     kernel = _get_sliding_window_kernel()
 
     # Ensure contiguous float32 tensors
-    q = mx.ascontiguousarray(q.astype(mx.float32))
-    k = mx.ascontiguousarray(k.astype(mx.float32))
-    v = mx.ascontiguousarray(v.astype(mx.float32))
+    q = mx.contiguous(q.astype(mx.float32))
+    k = mx.contiguous(k.astype(mx.float32))
+    v = mx.contiguous(v.astype(mx.float32))
 
     # Prepare scalar inputs
     batch_arr = mx.array([batch_size], dtype=mx.uint32)
@@ -233,7 +276,7 @@ def _reference_sliding_window_attention(
         mask = mask & causal_mask
 
     # Convert to attention mask (0 for valid, -inf for masked)
-    attn_mask = mx.where(mask, 0.0, -1e9)
+    attn_mask = mx.where(mask, 0.0, ATTENTION_MASK_VALUE)
 
     # Reshape for batched matmul: (batch, heads, seq, dim)
     q = q.transpose(0, 2, 1, 3)
@@ -253,6 +296,70 @@ def _reference_sliding_window_attention(
     out = weights @ v  # (batch, heads, seq, dim)
 
     # Reshape back: (batch, seq, heads, dim)
+    return out.transpose(0, 2, 1, 3)
+
+
+def _reference_sliding_window_attention_with_dropout(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    window_size: int,
+    scale: float,
+    causal: bool,
+    dropout_p: float,
+) -> mx.array:
+    """Reference sliding window attention with dropout support.
+
+    Args:
+        q: Query tensor (batch, seq, heads, dim).
+        k: Key tensor (batch, seq, heads, dim).
+        v: Value tensor (batch, seq, heads, dim).
+        window_size: One-sided window size.
+        scale: Attention scale factor.
+        causal: Whether to apply causal masking.
+        dropout_p: Dropout probability (0.0 to 1.0).
+
+    Returns:
+        Output tensor (batch, seq, heads, dim).
+    """
+    batch_size, seq_len, num_heads, head_dim = q.shape
+
+    # Create sliding window mask
+    positions = mx.arange(seq_len)
+    row_positions = positions[:, None]
+    col_positions = positions[None, :]
+
+    # Window mask: |i - j| <= window_size
+    distance = mx.abs(row_positions - col_positions)
+    mask = distance <= window_size
+
+    if causal:
+        causal_mask = col_positions <= row_positions
+        mask = mask & causal_mask
+
+    # Convert to attention mask
+    attn_mask = mx.where(mask, 0.0, ATTENTION_MASK_VALUE)
+
+    # Reshape for batched matmul
+    q = q.transpose(0, 2, 1, 3)
+    k = k.transpose(0, 2, 1, 3)
+    v = v.transpose(0, 2, 1, 3)
+
+    # Compute attention scores
+    scores = (q @ k.transpose(0, 1, 3, 2)) * scale
+    scores = scores + attn_mask[None, None, :, :]
+
+    # Softmax
+    weights = mx.softmax(scores, axis=-1)
+
+    # Apply dropout to attention weights
+    if dropout_p > 0.0:
+        dropout_mask = mx.random.bernoulli(1.0 - dropout_p, weights.shape)
+        weights = weights * dropout_mask / (1.0 - dropout_p)
+
+    # Weighted sum of values
+    out = weights @ v
+
     return out.transpose(0, 2, 1, 3)
 
 

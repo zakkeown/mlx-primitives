@@ -30,10 +30,14 @@ def _get_gather_kernel() -> mx.fast.metal_kernel:
         uint idx = thread_position_in_grid.x;
         uint d = thread_position_in_grid.y;
 
-        if (idx >= capacity || d >= dim) return;
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _capacity = capacity[0];
+        uint _dim = dim[0];
+
+        if (idx >= _capacity || d >= _dim) return;
 
         uint src_idx = indices[idx];
-        output[idx * dim + d] = input[src_idx * dim + d];
+        output[idx * _dim + d] = input[src_idx * _dim + d];
         """
         _gather_kernel = mx.fast.metal_kernel(
             name="selective_gather",
@@ -52,22 +56,37 @@ def _get_scatter_add_kernel() -> mx.fast.metal_kernel:
         uint idx = thread_position_in_grid.x;
         uint d = thread_position_in_grid.y;
 
-        if (idx >= capacity || d >= dim) return;
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _capacity = capacity[0];
+        uint _dim = dim[0];
+        uint _n_tokens = n_tokens[0];
+
+        if (idx >= _capacity || d >= _dim) return;
 
         uint dst_idx = indices[idx];
         float weight = weights[idx];
-        float value = values[idx * dim + d] * weight;
+        float value = values[idx * _dim + d] * weight;
+
+        // Copy base value to output first (for proper initialization)
+        // Each thread copies its target position
+        if (idx == 0) {
+            // First thread for each d initializes the entire output column
+            for (uint t = 0; t < _n_tokens; t++) {
+                output[t * _dim + d] = accumulator[t * _dim + d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
 
         // Atomic add for thread-safe accumulation
         atomic_fetch_add_explicit(
-            (device atomic_float*)&output[dst_idx * dim + d],
+            (device atomic_float*)&output[dst_idx * _dim + d],
             value,
             memory_order_relaxed
         );
         """
         _scatter_add_kernel = mx.fast.metal_kernel(
             name="selective_scatter_add",
-            input_names=["output", "values", "indices", "weights", "capacity", "dim"],
+            input_names=["accumulator", "values", "indices", "weights", "capacity", "dim", "n_tokens"],
             output_names=["output"],
             source=source,
         )
@@ -118,8 +137,8 @@ def selective_gather(
     try:
         kernel = _get_gather_kernel()
 
-        x = mx.ascontiguousarray(x.astype(mx.float32))
-        indices = mx.ascontiguousarray(indices.astype(mx.uint32))
+        x = mx.contiguous(x.astype(mx.float32))
+        indices = mx.contiguous(indices.astype(mx.uint32))
         capacity_arr = mx.array([capacity], dtype=mx.uint32)
         dim_arr = mx.array([dim], dtype=mx.uint32)
 
@@ -200,15 +219,16 @@ def selective_scatter_add(
     try:
         kernel = _get_scatter_add_kernel()
 
-        output = mx.ascontiguousarray(output.astype(mx.float32))
-        values = mx.ascontiguousarray(values.astype(mx.float32))
-        indices = mx.ascontiguousarray(indices.astype(mx.uint32))
-        weights = mx.ascontiguousarray(weights.astype(mx.float32))
+        accumulator = mx.contiguous(output.astype(mx.float32))
+        values = mx.contiguous(values.astype(mx.float32))
+        indices = mx.contiguous(indices.astype(mx.uint32))
+        weights = mx.contiguous(weights.astype(mx.float32))
         capacity_arr = mx.array([capacity], dtype=mx.uint32)
         dim_arr = mx.array([dim], dtype=mx.uint32)
+        n_tokens_arr = mx.array([n_tokens], dtype=mx.uint32)
 
         outputs = kernel(
-            inputs=[output, values, indices, weights, capacity_arr, dim_arr],
+            inputs=[accumulator, values, indices, weights, capacity_arr, dim_arr, n_tokens_arr],
             grid=(capacity, dim, 1),
             threadgroup=(min(capacity, 32), min(dim, 32), 1),
             output_shapes=[(n_tokens, dim)],

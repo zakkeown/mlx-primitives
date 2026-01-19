@@ -127,7 +127,7 @@ kernel void sliding_window_attention_simple(
                     q_pos * num_heads * head_dim +
                     head_idx * head_dim;
 
-    float inv_sum = 1.0f / sum_exp;
+    float inv_sum = 1.0f / (sum_exp + 1e-6f);
     for (uint d = 0; d < head_dim; d++) {
         O[o_offset + d] = acc[d] * inv_sum;
     }
@@ -281,7 +281,7 @@ kernel void sliding_window_attention_tiled(
                         q_pos * num_heads * head_dim +
                         head_idx * head_dim;
 
-        float inv_sum = 1.0f / sum_exp;
+        float inv_sum = 1.0f / (sum_exp + 1e-6f);
         for (uint d = 0; d < head_dim; d++) {
             O[o_offset + d] = acc[d] * inv_sum;
         }
@@ -401,7 +401,7 @@ kernel void sliding_window_attention_rope(
                     q_pos * num_heads * head_dim +
                     head_idx * head_dim;
 
-    float inv_sum = 1.0f / sum_exp;
+    float inv_sum = 1.0f / (sum_exp + 1e-6f);
     for (uint d = 0; d < head_dim; d++) {
         O[o_offset + d] = acc[d] * inv_sum;
     }

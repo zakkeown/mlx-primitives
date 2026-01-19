@@ -21,6 +21,7 @@ Example:
 """
 
 import math
+import threading
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -29,12 +30,21 @@ from mlx_primitives.attention._online_softmax import (
     compute_chunk_attention,
     online_softmax_merge,
 )
+from mlx_primitives.constants import (
+    ATTENTION_MASK_VALUE,
+    METAL_ATTENTION_MAX_HEAD_DIM,
+    METAL_SOFTMAX_EPSILON,
+)
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
-# Kernel cache
+# Check if MLX's optimized SDPA is available (preferred over custom kernels)
+_HAS_SDPA = hasattr(mx.fast, "scaled_dot_product_attention")
+
+# Kernel cache with thread safety
 _flash_attention_kernel: Optional[mx.fast.metal_kernel] = None
+_flash_kernel_lock = threading.Lock()
 
 
 def flash_attention(
@@ -46,6 +56,8 @@ def flash_attention(
     block_q: int = 32,
     block_kv: int = 32,
     use_metal: bool = True,
+    dropout_p: float = 0.0,
+    training: bool = True,
 ) -> mx.array:
     """Flash Attention - O(n) memory attention via tiled online softmax.
 
@@ -63,6 +75,9 @@ def flash_attention(
         block_q: Query block size for tiling. Larger = faster but more memory.
         block_kv: KV block size for tiling. Larger = faster but more memory.
         use_metal: Use Metal kernel if available.
+        dropout_p: Dropout probability on attention weights. Default 0.0 (no dropout).
+            When dropout_p > 0, falls back to reference implementation.
+        training: If False, dropout is not applied. Default True.
 
     Returns:
         Output tensor of shape (batch, seq_len, num_heads, head_dim).
@@ -73,6 +88,9 @@ def flash_attention(
         >>> k = mx.random.normal((2, 1024, 8, 64))
         >>> v = mx.random.normal((2, 1024, 8, 64))
         >>> out = flash_attention(q, k, v, causal=True)
+        >>>
+        >>> # With dropout (training)
+        >>> out = flash_attention(q, k, v, causal=True, dropout_p=0.1)
         >>>
         >>> # Equivalent to (but more memory efficient than):
         >>> scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(64)
@@ -88,6 +106,9 @@ def flash_attention(
 
         Default block_q=32, block_kv=32 is reasonable for most configurations.
         For head_dim=128, consider reducing to block_q=16, block_kv=16.
+
+        When dropout_p > 0 and training=True, falls back to the reference
+        implementation since dropout requires materializing attention weights.
     """
     if q.ndim != 4:
         raise ValueError(f"Expected 4D tensors (batch, seq, heads, dim), got {q.ndim}D")
@@ -97,17 +118,51 @@ def flash_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
-    # Try Metal kernel for longer sequences
+    # Fall back to reference implementation when dropout is enabled
+    # (dropout requires materializing the full attention matrix)
+    if dropout_p > 0.0 and training:
+        return _reference_flash_attention_with_dropout(
+            q, k, v, scale, causal, dropout_p
+        )
+
+    # Priority 1: Use MLX's built-in SDPA when available
+    # This is the most optimized path, using MLX's native implementation
+    # which has proper multi-threading and shared memory support
+    if _HAS_SDPA and use_metal:
+        try:
+            # MLX SDPA expects (batch, heads, seq, dim) but our input is (batch, seq, heads, dim)
+            # Transpose to match SDPA's expected format
+            q_sdpa = mx.transpose(q, (0, 2, 1, 3))  # (batch, heads, seq, dim)
+            k_sdpa = mx.transpose(k, (0, 2, 1, 3))
+            v_sdpa = mx.transpose(v, (0, 2, 1, 3))
+
+            out_sdpa = mx.fast.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                scale=scale,
+                mask="causal" if causal else None,
+            )
+
+            # Transpose back to (batch, seq, heads, dim)
+            return mx.transpose(out_sdpa, (0, 2, 1, 3))
+        except (RuntimeError, TypeError) as e:
+            # Fall through to custom implementation if SDPA fails
+            # (e.g., unsupported configuration)
+            from mlx_primitives.utils.logging import log_fallback
+            log_fallback("flash_attention (SDPA)", e)
+
+    # Priority 2: Custom Metal kernel (1 thread per threadgroup limitation)
+    # This is a workaround implementation - SDPA is preferred when available
     if use_metal and _HAS_METAL and seq_len >= 64:
         try:
             return _metal_flash_attention(
                 q, k, v, scale, causal, block_q, block_kv
             )
-        except Exception as e:
+        except RuntimeError as e:
+            # Catch Metal kernel errors, but let programming bugs propagate
             from mlx_primitives.utils.logging import log_fallback
             log_fallback("flash_attention", e)
 
-    # Python implementation with tiled computation
+    # Priority 3: Python implementation with tiled computation
     return _tiled_flash_attention(q, k, v, scale, causal, block_q, block_kv)
 
 
@@ -123,8 +178,8 @@ def _tiled_flash_attention(
     """Python implementation of Flash Attention using tiled computation."""
     batch_size, seq_len, num_heads, head_dim = q.shape
 
-    # Output buffer
-    output = mx.zeros_like(q)
+    # Collect output blocks for single concatenation at the end (O(n) instead of O(n^2))
+    output_blocks = []
 
     # Process query blocks
     for q_start in range(0, seq_len, block_q):
@@ -134,7 +189,7 @@ def _tiled_flash_attention(
 
         # Initialize running statistics for this query block
         # Shape: (batch, block_q, heads)
-        m_i = mx.full((batch_size, block_q_actual, num_heads), -1e9)
+        m_i = mx.full((batch_size, block_q_actual, num_heads), ATTENTION_MASK_VALUE)
         l_i = mx.zeros((batch_size, block_q_actual, num_heads))
         o_i = mx.zeros((batch_size, block_q_actual, num_heads, head_dim))
 
@@ -165,175 +220,114 @@ def _tiled_flash_attention(
                 chunk_output, chunk_max, chunk_sum,
             )
 
-        # Write output block (already normalized by online_softmax_merge)
-        output = _update_output_block(output, o_i, q_start, q_end)
+        # Normalize at the end of each query block
+        o_i_normalized = o_i / (l_i[..., None] + METAL_SOFTMAX_EPSILON)
+        output_blocks.append(o_i_normalized)
 
-    return output
-
-
-def _update_output_block(
-    output: mx.array,
-    block_output: mx.array,
-    start: int,
-    end: int,
-) -> mx.array:
-    """Update a slice of the output tensor.
-
-    MLX doesn't support in-place assignment, so we use scatter or rebuild.
-    """
-    # Use index update
-    indices = mx.arange(start, end)
-    # Expand indices for proper broadcasting
-    batch_size, _, num_heads, head_dim = output.shape
-
-    # Create full output by concatenating slices
-    if start == 0:
-        before = mx.zeros((batch_size, 0, num_heads, head_dim))
-    else:
-        before = output[:, :start]
-
-    if end >= output.shape[1]:
-        after = mx.zeros((batch_size, 0, num_heads, head_dim))
-    else:
-        after = output[:, end:]
-
-    return mx.concatenate([before, block_output, after], axis=1)
+    # Single concatenation at the end (O(n) instead of O(n^2))
+    return mx.concatenate(output_blocks, axis=1)
 
 
 def _get_flash_attention_kernel() -> mx.fast.metal_kernel:
-    """Get or create the Flash Attention Metal kernel."""
+    """Get or create the Flash Attention Metal kernel (thread-safe)."""
     global _flash_attention_kernel
     if _flash_attention_kernel is None:
-        source = """
-        // Flash Attention Metal Kernel
-        // Processes one (batch, head, q_block) per threadgroup
+        with _flash_kernel_lock:
+            # Double-check after acquiring lock
+            if _flash_attention_kernel is not None:
+                return _flash_attention_kernel
+            # Flash Attention kernel - simple per-element online softmax
+            # Each threadgroup handles one query position (1 thread per threadgroup)
+            # This is a workaround for MLX metal_kernel not supporting multiple threads
+            # Single-pass online softmax - computes scores once and accumulates V in same loop
+            # This is ~2x faster than the two-pass approach
+            source = """
+        // Flash Attention Metal Kernel - Single Pass Online Softmax
+        // One threadgroup (1 thread) per query position
+        // Optimized: computes scores once, accumulates V in same loop
 
+        // Dereference scalar parameters (passed as single-element arrays)
+        uint _batch_size = batch_size[0];
+        uint _seq_len = seq_len[0];
+        uint _num_heads = num_heads[0];
+        uint _head_dim = head_dim[0];
+        uint _causal = causal[0];
+        float _scale = scale[0];
+
+        // Grid layout: (seq_len, num_heads, batch_size)
         uint batch_idx = threadgroup_position_in_grid.z;
         uint head_idx = threadgroup_position_in_grid.y;
-        uint q_block_idx = threadgroup_position_in_grid.x;
-        uint local_tid = thread_position_in_threadgroup.x;
+        uint q_idx = threadgroup_position_in_grid.x;
 
-        if (batch_idx >= batch_size || head_idx >= num_heads) return;
+        if (batch_idx >= _batch_size || head_idx >= _num_heads || q_idx >= _seq_len) return;
 
-        uint q_block_start = q_block_idx * block_q;
-        uint q_pos = q_block_start + local_tid;
-        bool valid_q = q_pos < seq_len;
+        uint qkv_stride = _num_heads * _head_dim;
+        uint q_offset = batch_idx * _seq_len * qkv_stride + q_idx * qkv_stride + head_idx * _head_dim;
+        uint kv_base = batch_idx * _seq_len * qkv_stride + head_idx * _head_dim;
 
-        // Padded dimension for bank-conflict-free access
-        uint head_dim_pad = head_dim + 4;
-
-        // Initialize per-thread state (online softmax)
+        // Initialize online softmax state
         float max_val = -1e38f;
         float sum_exp = 0.0f;
-        float acc[132];  // Support up to head_dim=128 + padding
-        for (uint d = 0; d < head_dim; d++) {
+
+        // Accumulator for weighted V (max head_dim = 128)
+        float acc[128];
+        for (uint d = 0; d < _head_dim; d++) {
             acc[d] = 0.0f;
         }
 
-        // Load Q into registers
-        float q_reg[132];
-        uint qkv_stride = num_heads * head_dim;
-        uint q_offset = batch_idx * seq_len * qkv_stride +
-                        q_pos * qkv_stride +
-                        head_idx * head_dim;
-
-        if (valid_q) {
-            for (uint d = 0; d < head_dim; d++) {
-                q_reg[d] = Q[q_offset + d];
-            }
+        // Load Q into registers for reuse
+        float q_reg[128];
+        for (uint d = 0; d < _head_dim; d++) {
+            q_reg[d] = Q[q_offset + d];
         }
 
-        // KV limit for causal masking
-        uint kv_limit = causal ? (q_block_start + block_q) : seq_len;
-        if (kv_limit > seq_len) kv_limit = seq_len;
+        // KV limit for causal
+        uint kv_limit = _causal ? (q_idx + 1) : _seq_len;
 
-        // Base offset for K/V
-        uint kv_base = batch_idx * seq_len * qkv_stride + head_idx * head_dim;
+        // Single-pass: compute score, update running max/sum, and accumulate weighted V
+        for (uint kv_idx = 0; kv_idx < kv_limit; kv_idx++) {
+            uint kv_offset = kv_base + kv_idx * qkv_stride;
 
-        // Process KV in blocks (streaming through memory)
-        for (uint kv_start = 0; kv_start < kv_limit; kv_start += block_kv) {
-            uint kv_end = kv_start + block_kv;
-            if (kv_end > kv_limit) kv_end = kv_limit;
-            uint kv_count = kv_end - kv_start;
-
-            // Cooperative load K tile into shared memory
-            for (uint i = local_tid; i < kv_count * head_dim; i += threads_per_threadgroup.x) {
-                uint kv_local = i / head_dim;
-                uint d = i % head_dim;
-                uint kv_global = kv_start + kv_local;
-                K_shared[kv_local * head_dim_pad + d] = K[kv_base + kv_global * qkv_stride + d];
+            // Compute Q @ K score
+            float score = 0.0f;
+            for (uint d = 0; d < _head_dim; d++) {
+                score += q_reg[d] * K[kv_offset + d];
             }
+            score *= _scale;
 
-            // Cooperative load V tile
-            for (uint i = local_tid; i < kv_count * head_dim; i += threads_per_threadgroup.x) {
-                uint kv_local = i / head_dim;
-                uint d = i % head_dim;
-                uint kv_global = kv_start + kv_local;
-                V_shared[kv_local * head_dim_pad + d] = V[kv_base + kv_global * qkv_stride + d];
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Process this KV tile
-            if (valid_q) {
-                for (uint kv_local = 0; kv_local < kv_count; kv_local++) {
-                    uint kv_global = kv_start + kv_local;
-
-                    // Causal mask check
-                    if (causal && kv_global > q_pos) continue;
-
-                    // Compute score: Q[q_pos] @ K[kv_pos]
-                    float score = 0.0f;
-                    for (uint d = 0; d < head_dim; d++) {
-                        score += q_reg[d] * K_shared[kv_local * head_dim_pad + d];
-                    }
-                    score *= scale;
-
-                    // Online softmax update
-                    if (score > max_val) {
-                        float ratio = exp(max_val - score);
-                        sum_exp = sum_exp * ratio + 1.0f;
-                        for (uint d = 0; d < head_dim; d++) {
-                            acc[d] *= ratio;
-                        }
-                        max_val = score;
-
-                        // Add V contribution with weight 1
-                        for (uint d = 0; d < head_dim; d++) {
-                            acc[d] += V_shared[kv_local * head_dim_pad + d];
-                        }
-                    } else {
-                        float weight = exp(score - max_val);
-                        sum_exp += weight;
-                        for (uint d = 0; d < head_dim; d++) {
-                            acc[d] += weight * V_shared[kv_local * head_dim_pad + d];
-                        }
-                    }
+            // Online softmax update with V accumulation
+            if (score > max_val) {
+                // New max found - rescale previous accumulator
+                float ratio = exp(max_val - score);
+                sum_exp = sum_exp * ratio + 1.0f;
+                for (uint d = 0; d < _head_dim; d++) {
+                    acc[d] = acc[d] * ratio + V[kv_offset + d];
+                }
+                max_val = score;
+            } else {
+                // Accumulate with current weight
+                float weight = exp(score - max_val);
+                sum_exp += weight;
+                for (uint d = 0; d < _head_dim; d++) {
+                    acc[d] += weight * V[kv_offset + d];
                 }
             }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         // Normalize and write output
-        if (valid_q) {
-            uint o_offset = batch_idx * seq_len * qkv_stride +
-                            q_pos * qkv_stride +
-                            head_idx * head_dim;
-
-            float inv_sum = 1.0f / sum_exp;
-            for (uint d = 0; d < head_dim; d++) {
-                O[o_offset + d] = acc[d] * inv_sum;
-            }
+        uint o_offset = batch_idx * _seq_len * qkv_stride + q_idx * qkv_stride + head_idx * _head_dim;
+        float inv_sum = 1.0f / (sum_exp + SOFTMAX_EPSf);
+        for (uint d = 0; d < _head_dim; d++) {
+            O[o_offset + d] = acc[d] * inv_sum;
         }
-        """
+        """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
 
         _flash_attention_kernel = mx.fast.metal_kernel(
             name="flash_attention",
             input_names=[
                 "Q", "K", "V",
                 "batch_size", "seq_len", "num_heads", "head_dim",
-                "block_q", "block_kv", "causal", "scale"
+                "causal", "scale"
             ],
             output_names=["O"],
             source=source,
@@ -350,43 +344,46 @@ def _metal_flash_attention(
     block_q: int,
     block_kv: int,
 ) -> mx.array:
-    """Metal kernel implementation of Flash Attention."""
+    """Metal kernel implementation of Flash Attention.
+
+    Note: block_q and block_kv parameters are kept for API compatibility but
+    are not used by the current kernel implementation. The kernel processes
+    one query position per threadgroup due to MLX metal_kernel limitations.
+    """
     batch_size, seq_len, num_heads, head_dim = q.shape
 
-    # Adjust block sizes for large head dimensions
-    if head_dim > 64:
-        block_q = min(block_q, 16)
-        block_kv = min(block_kv, 16)
+    # Validate head_dim against Metal kernel limits
+    if head_dim > METAL_ATTENTION_MAX_HEAD_DIM:
+        raise ValueError(
+            f"head_dim={head_dim} exceeds Metal kernel limit of "
+            f"{METAL_ATTENTION_MAX_HEAD_DIM}. Use use_metal=False for Python fallback."
+        )
 
     kernel = _get_flash_attention_kernel()
 
     # Ensure contiguous float32 tensors
-    q = mx.ascontiguousarray(q.astype(mx.float32))
-    k = mx.ascontiguousarray(k.astype(mx.float32))
-    v = mx.ascontiguousarray(v.astype(mx.float32))
+    q = mx.contiguous(q.astype(mx.float32))
+    k = mx.contiguous(k.astype(mx.float32))
+    v = mx.contiguous(v.astype(mx.float32))
 
     # Prepare scalar inputs
     batch_arr = mx.array([batch_size], dtype=mx.uint32)
     seq_arr = mx.array([seq_len], dtype=mx.uint32)
     heads_arr = mx.array([num_heads], dtype=mx.uint32)
     dim_arr = mx.array([head_dim], dtype=mx.uint32)
-    block_q_arr = mx.array([block_q], dtype=mx.uint32)
-    block_kv_arr = mx.array([block_kv], dtype=mx.uint32)
     causal_arr = mx.array([1 if causal else 0], dtype=mx.uint32)
     scale_arr = mx.array([scale], dtype=mx.float32)
 
-    # Calculate grid dimensions
-    num_q_blocks = (seq_len + block_q - 1) // block_q
-
-    # Grid: (num_q_blocks, num_heads, batch_size)
+    # Grid: (seq_len, num_heads, batch_size) - one threadgroup per query position
+    # Threadgroup: (1, 1, 1) - MLX metal_kernel only supports 1 thread per threadgroup
     outputs = kernel(
         inputs=[
             q, k, v,
             batch_arr, seq_arr, heads_arr, dim_arr,
-            block_q_arr, block_kv_arr, causal_arr, scale_arr
+            causal_arr, scale_arr
         ],
-        grid=(num_q_blocks, num_heads, batch_size),
-        threadgroup=(block_q, 1, 1),
+        grid=(seq_len, num_heads, batch_size),
+        threadgroup=(1, 1, 1),
         output_shapes=[(batch_size, seq_len, num_heads, head_dim)],
         output_dtypes=[mx.float32],
         stream=mx.default_stream(mx.default_device()),
@@ -421,9 +418,61 @@ def _reference_flash_attention(
 
     if causal:
         mask = mx.tril(mx.ones((seq, seq)))
-        scores = mx.where(mask[None, None, :, :] == 1, scores, -1e9)
+        scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
 
     weights = mx.softmax(scores, axis=-1)
+    output = weights @ v_t
+
+    return output.transpose(0, 2, 1, 3)
+
+
+def _reference_flash_attention_with_dropout(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    causal: bool,
+    dropout_p: float,
+) -> mx.array:
+    """Reference implementation with dropout support.
+
+    Uses standard O(n²) attention since dropout requires materializing
+    the full attention weight matrix to apply the dropout mask.
+
+    Args:
+        q: Query tensor (batch, seq, heads, dim).
+        k: Key tensor (batch, seq, heads, dim).
+        v: Value tensor (batch, seq, heads, dim).
+        scale: Attention scale factor.
+        causal: Whether to apply causal masking.
+        dropout_p: Dropout probability (0.0 to 1.0).
+
+    Returns:
+        Output tensor (batch, seq, heads, dim).
+    """
+    batch, seq, heads, dim = q.shape
+
+    # Transpose for matmul: (batch, heads, seq, dim)
+    q_t = q.transpose(0, 2, 1, 3)
+    k_t = k.transpose(0, 2, 1, 3)
+    v_t = v.transpose(0, 2, 1, 3)
+
+    # Full attention matrix
+    scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
+
+    if causal:
+        mask = mx.tril(mx.ones((seq, seq)))
+        scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
+
+    weights = mx.softmax(scores, axis=-1)
+
+    # Apply dropout to attention weights
+    if dropout_p > 0.0:
+        # Generate dropout mask: keep with probability (1 - dropout_p)
+        dropout_mask = mx.random.bernoulli(1.0 - dropout_p, weights.shape)
+        # Scale by 1/(1-p) to maintain expected value (inverted dropout)
+        weights = weights * dropout_mask / (1.0 - dropout_p)
+
     output = weights @ v_t
 
     return output.transpose(0, 2, 1, 3)

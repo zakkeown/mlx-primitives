@@ -455,6 +455,59 @@ class IRSharedMemoryRef(IRNode):
 
 
 @dataclass
+class IRArrayDecl(IRNode):
+    """Local (register) array declaration.
+
+    Generates Metal array declarations for stack-allocated arrays.
+    Used for accumulators and working arrays that live in thread-local registers.
+
+    Example output:
+        float acc[128] = {};           // Zero-initialized
+        float acc[head_dim] = {};      // Constexpr size
+        float m_i[N];                  // With init loop for special values
+        for (uint _i = 0; _i < N; _i++) { m_i[_i] = -INFINITY; }
+    """
+    name: str
+    dtype: DType
+    size_expr: str  # Size expression: "128" or "head_dim" (constexpr)
+    init_value: Optional[float] = None  # None = zero-init with {}, else fill value
+    type_info: Optional[TypeInfo] = None
+
+    def emit(self, indent: int = 0) -> str:
+        ind = self._indent(indent)
+        type_name = self.dtype.metal_name
+
+        if self.init_value is None:
+            # Zero initialization using aggregate initialization
+            return f"{ind}{type_name} {self.name}[{self.size_expr}] = {{}};"
+        elif self.init_value == float('-inf'):
+            # Need explicit loop for -INFINITY
+            return (f"{ind}{type_name} {self.name}[{self.size_expr}];\n"
+                    f"{ind}for (uint _i = 0; _i < {self.size_expr}; _i++) {{ {self.name}[_i] = -INFINITY; }}")
+        elif self.init_value == float('inf'):
+            return (f"{ind}{type_name} {self.name}[{self.size_expr}];\n"
+                    f"{ind}for (uint _i = 0; _i < {self.size_expr}; _i++) {{ {self.name}[_i] = INFINITY; }}")
+        else:
+            # Explicit fill value - need loop
+            return (f"{ind}{type_name} {self.name}[{self.size_expr}];\n"
+                    f"{ind}for (uint _i = 0; _i < {self.size_expr}; _i++) {{ {self.name}[_i] = {self.init_value}f; }}")
+
+
+@dataclass
+class IRArrayRef(IRNode):
+    """Reference to a local array variable.
+
+    When used directly, emits just the array name.
+    Array indexing is handled by IRSubscript.
+    """
+    name: str
+    type_info: Optional[TypeInfo] = None
+
+    def emit(self, indent: int = 0) -> str:
+        return self.name
+
+
+@dataclass
 class IRComment(IRNode):
     """Code comment for debugging."""
     text: str
@@ -940,6 +993,75 @@ class IRDebugPrint(IRNode):
             return f'{ind}printf("{self.fmt}\\n", {args_str});'
         else:
             return f'{ind}printf("{self.fmt}\\n");'
+
+
+@dataclass
+class IRCooperativeLoad(IRNode):
+    """Cooperative load from device memory into shared memory.
+
+    All threads in the threadgroup participate in loading data.
+    Generates a loop where each thread loads multiple elements.
+    """
+    shared_name: str  # Target shared memory name
+    src_ptr: IRNode  # Source pointer expression
+    count: IRNode  # Number of elements to load
+    stride: Optional[IRNode] = None  # Element stride (default: 1)
+    dtype: DType = field(default_factory=lambda: float32)
+
+    def emit(self, indent: int = 0) -> str:
+        ind = self._indent(indent)
+        ind2 = self._indent(indent + 1)
+        ind3 = self._indent(indent + 2)
+
+        lines = []
+        lines.append(f"{ind}// Cooperative load into {self.shared_name}")
+        lines.append(f"{ind}{{")
+        lines.append(f"{ind2}uint _tid = thread_position_in_threadgroup.x;")
+        lines.append(f"{ind2}uint _count = {self.count.emit()};")
+        lines.append(f"{ind2}uint _threads = threads_per_threadgroup.x;")
+
+        stride_expr = self.stride.emit() if self.stride else "1"
+
+        lines.append(f"{ind2}for (uint _i = _tid; _i < _count; _i += _threads) {{")
+        lines.append(f"{ind3}{self.shared_name}[_i] = ({self.src_ptr.emit()})[_i * {stride_expr}];")
+        lines.append(f"{ind2}}}")
+        lines.append(f"{ind}}}")
+
+        return "\n".join(lines)
+
+
+@dataclass
+class IRCooperativeStore(IRNode):
+    """Cooperative store from shared memory to device memory.
+
+    All threads in the threadgroup participate in storing data.
+    """
+    dst_ptr: IRNode  # Destination pointer expression
+    shared_name: str  # Source shared memory name
+    count: IRNode  # Number of elements to store
+    stride: Optional[IRNode] = None  # Element stride (default: 1)
+    dtype: DType = field(default_factory=lambda: float32)
+
+    def emit(self, indent: int = 0) -> str:
+        ind = self._indent(indent)
+        ind2 = self._indent(indent + 1)
+        ind3 = self._indent(indent + 2)
+
+        lines = []
+        lines.append(f"{ind}// Cooperative store from {self.shared_name}")
+        lines.append(f"{ind}{{")
+        lines.append(f"{ind2}uint _tid = thread_position_in_threadgroup.x;")
+        lines.append(f"{ind2}uint _count = {self.count.emit()};")
+        lines.append(f"{ind2}uint _threads = threads_per_threadgroup.x;")
+
+        stride_expr = self.stride.emit() if self.stride else "1"
+
+        lines.append(f"{ind2}for (uint _i = _tid; _i < _count; _i += _threads) {{")
+        lines.append(f"{ind3}({self.dst_ptr.emit()})[_i * {stride_expr}] = {self.shared_name}[_i];")
+        lines.append(f"{ind2}}}")
+        lines.append(f"{ind}}}")
+
+        return "\n".join(lines)
 
 
 @dataclass

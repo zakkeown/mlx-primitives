@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-primitives"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance building blocks for MLX"
 readme = "README.md"
 license = "MIT"

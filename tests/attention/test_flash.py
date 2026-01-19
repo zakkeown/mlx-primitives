@@ -12,6 +12,10 @@ from mlx_primitives.attention.flash import (
     _reference_flash_attention,
     get_optimal_flash_config,
 )
+from mlx_primitives.attention._online_softmax import (
+    online_softmax_merge,
+    compute_chunk_attention,
+)
 
 
 def numpy_attention(q, k, v, scale, causal):
@@ -380,3 +384,177 @@ class TestFlashAttentionBenchmarks:
         mx.eval(out)
 
         assert out.shape == q.shape
+
+
+class TestOnlineSoftmaxMerge:
+    """Test the online softmax merge operation directly.
+
+    These tests validate that chunked attention with merging produces
+    the same results as computing attention over the full sequence.
+    """
+
+    def test_two_chunk_merge_correctness(self) -> None:
+        """Verify merging two chunks produces correct output."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 2, 8, 4, 32
+        chunk_size = 16
+        scale = 1.0 / math.sqrt(dim)
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k = mx.random.normal((batch, chunk_size * 2, heads, dim))
+        v = mx.random.normal((batch, chunk_size * 2, heads, dim))
+
+        # Compute reference: full attention over all KV
+        ref_out = numpy_attention(
+            q,
+            k,
+            v,
+            scale,
+            causal=False
+        )
+
+        # Compute in two chunks and merge
+        k_chunk1 = k[:, :chunk_size, :, :]
+        v_chunk1 = v[:, :chunk_size, :, :]
+        k_chunk2 = k[:, chunk_size:, :, :]
+        v_chunk2 = v[:, chunk_size:, :, :]
+
+        # Process first chunk
+        out1, max1, sum1 = compute_chunk_attention(
+            q, k_chunk1, v_chunk1, scale, causal=False
+        )
+
+        # Process second chunk
+        out2, max2, sum2 = compute_chunk_attention(
+            q, k_chunk2, v_chunk2, scale, causal=False, kv_offset=chunk_size
+        )
+
+        # Merge the two chunks
+        merged_out, _, merged_sum = online_softmax_merge(
+            out1, max1, sum1,
+            out2, max2, sum2
+        )
+
+        # Normalize at the end (as per the online softmax algorithm)
+        final_out = merged_out / (merged_sum[..., None] + 1e-6)
+
+        np.testing.assert_allclose(
+            np.array(final_out), ref_out, rtol=1e-4, atol=1e-5,
+            err_msg="Two-chunk merge doesn't match full attention"
+        )
+
+    def test_many_chunk_merge_accumulation(self) -> None:
+        """Verify correctness with many small chunks (tests error accumulation)."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 2, 4, 2, 32
+        num_chunks = 8
+        chunk_size = 4
+        scale = 1.0 / math.sqrt(dim)
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k = mx.random.normal((batch, num_chunks * chunk_size, heads, dim))
+        v = mx.random.normal((batch, num_chunks * chunk_size, heads, dim))
+
+        # Compute reference
+        ref_out = numpy_attention(q, k, v, scale, causal=False)
+
+        # Process chunk by chunk with merging
+        acc_out, acc_max, acc_sum = compute_chunk_attention(
+            q, k[:, :chunk_size, :, :], v[:, :chunk_size, :, :], scale, causal=False
+        )
+
+        for i in range(1, num_chunks):
+            kv_offset = i * chunk_size
+            new_out, new_max, new_sum = compute_chunk_attention(
+                q,
+                k[:, kv_offset:kv_offset + chunk_size, :, :],
+                v[:, kv_offset:kv_offset + chunk_size, :, :],
+                scale,
+                causal=False,
+                kv_offset=kv_offset
+            )
+            acc_out, acc_max, acc_sum = online_softmax_merge(
+                acc_out, acc_max, acc_sum,
+                new_out, new_max, new_sum
+            )
+
+        # Normalize at the end
+        final_out = acc_out / (acc_sum[..., None] + 1e-6)
+
+        np.testing.assert_allclose(
+            np.array(final_out), ref_out, rtol=1e-3, atol=1e-4,
+            err_msg="Multi-chunk merge doesn't match full attention"
+        )
+
+    def test_merge_with_identical_max_values(self) -> None:
+        """Edge case: both chunks have same max score."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 1, 4, 2, 16
+
+        # Use same k for both chunks to get similar max scores
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_base = mx.random.normal((batch, 8, heads, dim))
+        v = mx.random.normal((batch, 16, heads, dim))
+
+        # Duplicate K to ensure similar scores
+        k = mx.concatenate([k_base, k_base], axis=1)
+        scale = 1.0 / math.sqrt(dim)
+
+        # Reference
+        ref_out = numpy_attention(q, k, v, scale, causal=False)
+
+        # Chunked
+        out1, max1, sum1 = compute_chunk_attention(
+            q, k[:, :8, :, :], v[:, :8, :, :], scale, causal=False
+        )
+        out2, max2, sum2 = compute_chunk_attention(
+            q, k[:, 8:, :, :], v[:, 8:, :, :], scale, causal=False, kv_offset=8
+        )
+        merged_out, _, merged_sum = online_softmax_merge(out1, max1, sum1, out2, max2, sum2)
+
+        # Normalize at the end
+        final_out = merged_out / (merged_sum[..., None] + 1e-6)
+
+        np.testing.assert_allclose(
+            np.array(final_out), ref_out, rtol=1e-4, atol=1e-5,
+            err_msg="Merge with identical max values failed"
+        )
+
+    def test_merge_with_large_score_difference(self) -> None:
+        """Edge case: one chunk has much larger scores than the other."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 1, 4, 2, 16
+        scale = 1.0 / math.sqrt(dim)
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+
+        # First chunk with large K values (high scores)
+        k_large = mx.random.normal((batch, 8, heads, dim)) * 5
+        v1 = mx.random.normal((batch, 8, heads, dim))
+
+        # Second chunk with small K values (low scores)
+        k_small = mx.random.normal((batch, 8, heads, dim)) * 0.1
+        v2 = mx.random.normal((batch, 8, heads, dim))
+
+        k = mx.concatenate([k_large, k_small], axis=1)
+        v = mx.concatenate([v1, v2], axis=1)
+
+        # Reference
+        ref_out = numpy_attention(q, k, v, scale, causal=False)
+
+        # Chunked
+        out1, max1, sum1 = compute_chunk_attention(
+            q, k[:, :8, :, :], v[:, :8, :, :], scale, causal=False
+        )
+        out2, max2, sum2 = compute_chunk_attention(
+            q, k[:, 8:, :, :], v[:, 8:, :, :], scale, causal=False, kv_offset=8
+        )
+        merged_out, _, merged_sum = online_softmax_merge(out1, max1, sum1, out2, max2, sum2)
+
+        # Normalize at the end
+        final_out = merged_out / (merged_sum[..., None] + 1e-6)
+
+        np.testing.assert_allclose(
+            np.array(final_out), ref_out, rtol=1e-4, atol=1e-5,
+            err_msg="Merge with large score difference failed"
+        )

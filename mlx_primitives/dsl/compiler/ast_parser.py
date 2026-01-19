@@ -19,9 +19,11 @@ from mlx_primitives.dsl.compiler.metal_ir import (
     IRBinaryOp, IRUnaryOp, IRCall, IRLoad, IRStore, IRAssign, IRSubscript, IRSubscriptAssign,
     IRIf, IRFor, IRWhile, IRReturn, IRContinue, IRBreak, IRBarrier, IRComment,
     IRSharedMemoryDecl, IRSharedMemoryRef,
+    IRArrayDecl, IRArrayRef,
     IRBlockPtrDecl, IRBlockPtrRef, IRBlockPtrAdvance, IRBlockLoad, IRBlockStore,
     IRBlockLoadWithRef, IRBlockLoadAssign, IRExprStatement,
     IRCast, IRLoadVec, IRStoreVec, IRStaticFor,
+    IRCooperativeLoad, IRCooperativeStore,
     TypeInfo, IRType,
 )
 
@@ -102,6 +104,7 @@ class ASTParser(ast.NodeVisitor):
         self.ir_parameters: list[IRParameter] = []
         self.shared_memory_decls: list[IRSharedMemoryDecl] = []
         self._shared_memory_counter = 0
+        self._array_counter = 0
 
         # Block pointer tracking
         self.block_ptr_decls: list[IRBlockPtrDecl] = []
@@ -685,8 +688,14 @@ class ASTParser(ast.NodeVisitor):
         if name == "threadgroup_barrier":
             return IRBarrier()
 
-        if name in ("zeros", "full", "arange"):
-            # These create local arrays - handled specially
+        if name == "zeros":
+            return self._handle_zeros(node)
+
+        if name == "full":
+            return self._handle_full(node)
+
+        if name == "arange":
+            # For now, fall back to IRCall - more complex to handle
             return IRCall(name, args)
 
         # Type casting
@@ -802,15 +811,195 @@ class ASTParser(ast.NodeVisitor):
         # Return reference
         return IRSharedMemoryRef(shared_name)
 
+    def _handle_zeros(self, node: ast.Call) -> IRArrayDecl:
+        """Handle mt.zeros(size, dtype) -> local array declaration.
+
+        Examples:
+            acc = mt.zeros(head_dim, mt.float32)  # constexpr size
+            acc = mt.zeros(128, mt.float32)       # literal size
+            acc = mt.zeros((M, N), mt.float32)    # 2D flattened
+        """
+        size_expr = self._parse_array_size(node.args[0] if node.args else None)
+
+        # Parse dtype from second arg or kwargs
+        dtype = float32  # default
+        if len(node.args) > 1:
+            dtype = self._parse_dtype_arg(node.args[1])
+        for kw in node.keywords:
+            if kw.arg == "dtype":
+                dtype = self._parse_dtype_arg(kw.value)
+
+        # Generate temporary name (replaced by actual target in visit_Assign)
+        name = f"_arr_{self._array_counter}"
+        self._array_counter += 1
+
+        type_info = TypeInfo(
+            ir_type=IRType.ARRAY,
+            dtype=dtype,
+            shape=(size_expr,)
+        )
+
+        return IRArrayDecl(
+            name=name,
+            dtype=dtype,
+            size_expr=size_expr,
+            init_value=None,  # Zero initialization
+            type_info=type_info,
+        )
+
+    def _handle_full(self, node: ast.Call) -> IRArrayDecl:
+        """Handle mt.full(size, fill_value, dtype) -> local array with fill value.
+
+        Examples:
+            m_i = mt.full(head_dim, float('-inf'), mt.float32)
+            vals = mt.full(128, 1.0, mt.float32)
+        """
+        size_expr = self._parse_array_size(node.args[0] if node.args else None)
+
+        # Parse fill value from second arg
+        fill_value = 0.0
+        if len(node.args) > 1:
+            fill_node = node.args[1]
+            # Handle float('-inf'), float('inf'), or literal
+            if isinstance(fill_node, ast.Call):
+                if isinstance(fill_node.func, ast.Name) and fill_node.func.id == "float":
+                    if fill_node.args and isinstance(fill_node.args[0], ast.Constant):
+                        try:
+                            fill_value = float(fill_node.args[0].value)
+                        except (ValueError, TypeError):
+                            fill_value = 0.0
+            elif isinstance(fill_node, ast.Constant):
+                fill_value = float(fill_node.value)
+            elif isinstance(fill_node, ast.UnaryOp) and isinstance(fill_node.op, ast.USub):
+                if isinstance(fill_node.operand, ast.Constant):
+                    fill_value = -float(fill_node.operand.value)
+
+        # Parse dtype from third arg or kwargs
+        dtype = float32
+        if len(node.args) > 2:
+            dtype = self._parse_dtype_arg(node.args[2])
+        for kw in node.keywords:
+            if kw.arg == "dtype":
+                dtype = self._parse_dtype_arg(kw.value)
+
+        name = f"_arr_{self._array_counter}"
+        self._array_counter += 1
+
+        type_info = TypeInfo(
+            ir_type=IRType.ARRAY,
+            dtype=dtype,
+            shape=(size_expr,)
+        )
+
+        return IRArrayDecl(
+            name=name,
+            dtype=dtype,
+            size_expr=size_expr,
+            init_value=fill_value,
+            type_info=type_info,
+        )
+
+    def _parse_array_size(self, node: Optional[ast.expr]) -> str:
+        """Parse array size expression from AST node.
+
+        Handles:
+            - Literal integers: 128
+            - Variable names (constexpr): head_dim
+            - Tuples (flattened): (M, N) -> M * N
+            - Complex expressions
+        """
+        if node is None:
+            return "1"
+
+        if isinstance(node, ast.Constant):
+            return str(node.value)
+        elif isinstance(node, ast.Name):
+            # Constexpr parameter name
+            return node.id
+        elif isinstance(node, ast.Tuple):
+            # Flatten tuple: (M, N) -> M * N
+            parts = [self._parse_array_size(elt) for elt in node.elts]
+            return " * ".join(f"({p})" for p in parts)
+        else:
+            # Complex expression - emit it
+            ir_node = self.visit(node)
+            return ir_node.emit()
+
     def _handle_load_shared(self, args: list[IRNode], kwargs: dict) -> IRNode:
-        """Generate cooperative load into shared memory."""
-        # This generates a loop where all threads participate
-        # For now, return a placeholder that will be expanded
-        return IRCall("__load_shared", args)
+        """Generate cooperative load into shared memory.
+
+        Args pattern: load_shared(shared, src_ptr, count, stride=1)
+        - shared: shared memory reference (IRSharedMemoryRef)
+        - src_ptr: source pointer in device memory
+        - count: number of elements to load
+        - stride: optional element stride (default: 1)
+        """
+        if len(args) < 3:
+            raise CompilationError(
+                "load_shared requires at least 3 arguments: shared, src_ptr, count"
+            )
+
+        shared = args[0]
+        src_ptr = args[1]
+        count = args[2]
+
+        # Get stride from kwargs or args
+        stride = kwargs.get("stride", None)
+        if stride is None and len(args) > 3:
+            stride = args[3]
+
+        # Extract shared memory name
+        if isinstance(shared, IRSharedMemoryRef):
+            shared_name = shared.name
+        elif isinstance(shared, IRVariable):
+            shared_name = shared.name
+        else:
+            shared_name = shared.emit() if hasattr(shared, 'emit') else str(shared)
+
+        return IRCooperativeLoad(
+            shared_name=shared_name,
+            src_ptr=src_ptr,
+            count=count,
+            stride=stride,
+        )
 
     def _handle_store_shared(self, args: list[IRNode], kwargs: dict) -> IRNode:
-        """Generate cooperative store from shared memory."""
-        return IRCall("__store_shared", args)
+        """Generate cooperative store from shared memory to device memory.
+
+        Args pattern: store_shared(dst_ptr, shared, count, stride=1)
+        - dst_ptr: destination pointer in device memory
+        - shared: shared memory reference (IRSharedMemoryRef)
+        - count: number of elements to store
+        - stride: optional element stride (default: 1)
+        """
+        if len(args) < 3:
+            raise CompilationError(
+                "store_shared requires at least 3 arguments: dst_ptr, shared, count"
+            )
+
+        dst_ptr = args[0]
+        shared = args[1]
+        count = args[2]
+
+        # Get stride from kwargs or args
+        stride = kwargs.get("stride", None)
+        if stride is None and len(args) > 3:
+            stride = args[3]
+
+        # Extract shared memory name
+        if isinstance(shared, IRSharedMemoryRef):
+            shared_name = shared.name
+        elif isinstance(shared, IRVariable):
+            shared_name = shared.name
+        else:
+            shared_name = shared.emit() if hasattr(shared, 'emit') else str(shared)
+
+        return IRCooperativeStore(
+            dst_ptr=dst_ptr,
+            shared_name=shared_name,
+            count=count,
+            stride=stride,
+        )
 
     def _handle_subscript_assign(self, target: ast.Subscript, value_node: ast.expr) -> IRNode:
         """Handle subscript assignment: arr[idx] = value."""
