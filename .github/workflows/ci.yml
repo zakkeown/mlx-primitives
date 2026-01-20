@@ -51,10 +51,10 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short -m "not benchmark and not slow"
 
       - name: Run tests with coverage
-        run: pytest tests/ --cov=mlx_primitives --cov-report=xml
+        run: pytest tests/ --cov=mlx_primitives --cov-report=xml -m "not benchmark and not slow"
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -77,15 +77,112 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          pip install scipy numpy
+
+      - name: Download baseline results
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ci.yml
+          branch: main
+          name: benchmark-baseline
+          path: baseline/
+        continue-on-error: true
 
       - name: Run benchmarks
-        run: pytest tests/ -m benchmark --benchmark-json=benchmark.json || true
+        run: |
+          python -m benchmarks.runner --suite all \
+            --adaptive-iterations \
+            --warmup 5 \
+            --output current_results.json
 
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
+      - name: Check for regressions
+        id: regression_check
+        run: |
+          python -m benchmarks.reports.regression_detector \
+            --current current_results.json \
+            --baseline baseline/benchmark_results.json \
+            --threshold 10 \
+            --confidence 0.95 \
+            --output regression_report.md
+        continue-on-error: true
+
+      - name: Comment regression report on PR
+        if: always()
+        uses: actions/github-script@v7
         with:
-          tool: pytest
-          output-file-path: benchmark.json
-          fail-on-alert: false
-          comment-on-alert: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let report = '## Benchmark Results\n\n';
+
+            // Try to read the regression report
+            try {
+              report = fs.readFileSync('regression_report.md', 'utf8');
+            } catch (e) {
+              report += 'Benchmark completed. No baseline available for comparison.\n';
+            }
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Benchmark')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report
+              });
+            }
+
+      - name: Fail on significant regression
+        if: steps.regression_check.outcome == 'failure'
+        run: |
+          echo "Performance regression detected! See regression_report.md for details."
+          exit 1
+
+  # Update baseline on main branch
+  update-baseline:
+    runs-on: macos-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install scipy numpy
+
+      - name: Run benchmarks for baseline
+        run: |
+          python -m benchmarks.runner --suite all \
+            --adaptive-iterations \
+            --warmup 5 \
+            --output benchmark_results.json
+
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: benchmark_results.json
+          retention-days: 90

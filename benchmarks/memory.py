@@ -49,6 +49,8 @@ class MemoryProfiler:
         self._tracking = False
         self._start_allocated = 0.0
 
+    _warned_no_metal: bool = False
+
     def _get_memory_info(self) -> Dict[str, float]:
         """Get current memory usage.
 
@@ -58,20 +60,46 @@ class MemoryProfiler:
         # Force synchronization to ensure accurate measurement
         mx.synchronize()
 
-        # Try to get Metal memory stats
+        # Try various MLX metal memory APIs
         try:
-            # MLX provides memory stats through mx.metal
-            if hasattr(mx, "metal") and hasattr(mx.metal, "get_memory_info"):
-                info = mx.metal.get_memory_info()
-                return {
-                    "allocated_mb": info.get("allocated", 0) / (1024 ** 2),
-                    "peak_mb": info.get("peak", 0) / (1024 ** 2),
-                }
+            # MLX >= 0.20 provides metal.get_active_memory() and metal.get_peak_memory()
+            if hasattr(mx, "metal"):
+                metal = mx.metal
+                allocated = 0.0
+                peak = 0.0
+
+                if hasattr(metal, "get_active_memory"):
+                    allocated = metal.get_active_memory() / (1024 ** 2)
+                if hasattr(metal, "get_peak_memory"):
+                    peak = metal.get_peak_memory() / (1024 ** 2)
+
+                if allocated > 0 or peak > 0:
+                    return {
+                        "allocated_mb": allocated,
+                        "peak_mb": peak,
+                    }
+
+                # Try older API format
+                if hasattr(metal, "get_memory_info"):
+                    info = metal.get_memory_info()
+                    return {
+                        "allocated_mb": info.get("allocated", 0) / (1024 ** 2),
+                        "peak_mb": info.get("peak", 0) / (1024 ** 2),
+                    }
         except Exception:
             pass
 
-        # Fallback: estimate from array allocations
-        # This is less accurate but works as a fallback
+        # Warn once if metal memory tracking is unavailable
+        if not MemoryProfiler._warned_no_metal:
+            import warnings
+            warnings.warn(
+                "MLX metal memory tracking unavailable. Memory values will be 0. "
+                "Use estimate_tensor_memory_mb() for theoretical estimates.",
+                RuntimeWarning,
+            )
+            MemoryProfiler._warned_no_metal = True
+
+        # Fallback: return zeros (caller should use estimate functions)
         return {
             "allocated_mb": 0.0,
             "peak_mb": 0.0,
@@ -101,10 +129,19 @@ class MemoryProfiler:
 
         return snapshot
 
+    def _reset_peak_memory(self) -> None:
+        """Reset peak memory counter if available."""
+        try:
+            if hasattr(mx, "metal") and hasattr(mx.metal, "reset_peak_memory"):
+                mx.metal.reset_peak_memory()
+        except Exception:
+            pass
+
     def start_tracking(self):
         """Start tracking memory snapshots."""
         self._tracking = True
         self.snapshots = []
+        self._reset_peak_memory()  # Reset peak for accurate measurement
         self._start_allocated = self._get_memory_info()["allocated_mb"]
         self.snapshot("start")
 

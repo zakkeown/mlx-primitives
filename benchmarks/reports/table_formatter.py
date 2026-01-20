@@ -74,17 +74,31 @@ def print_comparison_table(
         print("Missing results for comparison.")
         return
 
-    # Build lookup by name (strip prefixes for matching)
-    def extract_key(name: str) -> str:
-        """Extract comparable key from benchmark name."""
-        # Remove common prefixes like "impl_", "ref_", "baseline_"
-        for prefix in ["impl_", "ref_", "baseline_", "mlx_", "torch_"]:
+    # Build lookup by extracting the config suffix (e.g., "b2_s512" from "naive_attn_b2_s512")
+    def extract_config_key(name: str) -> str:
+        """Extract the configuration part of benchmark name for matching.
+
+        Examples:
+            naive_attn_b2_s512 -> attn_b2_s512
+            flash_attn_b2_s512 -> attn_b2_s512
+            native_cumsum_s128_d32 -> cumsum_s128_d32
+            assoc_scan_s128_d32 -> scan_s128_d32
+            naive_ln_b1_s512_h768 -> ln_b1_s512_h768
+            fused_ln_b1_s512_h768 -> ln_b1_s512_h768
+        """
+        # Remove common prefixes that indicate implementation type
+        prefixes_to_strip = [
+            "naive_", "flash_", "fused_", "native_", "assoc_",
+            "impl_", "ref_", "baseline_", "mlx_", "torch_", "optimized_"
+        ]
+        for prefix in prefixes_to_strip:
             if name.startswith(prefix):
                 name = name[len(prefix):]
+                break
         return name
 
-    impl_by_key = {extract_key(r.name): r for r in implementation_results}
-    baseline_by_key = {extract_key(r.name): r for r in baseline_results}
+    impl_by_key = {extract_config_key(r.name): r for r in implementation_results}
+    baseline_by_key = {extract_config_key(r.name): r for r in baseline_results}
 
     # Find matching benchmarks
     common_keys = set(impl_by_key.keys()) & set(baseline_by_key.keys())

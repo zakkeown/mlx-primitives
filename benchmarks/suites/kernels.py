@@ -5,7 +5,7 @@ from typing import Optional
 import mlx.core as mx
 
 from benchmarks.config import BenchmarkConfig, MatmulSizes
-from benchmarks.utils import BenchmarkResult, warmup, benchmark_fn
+from benchmarks.utils import BenchmarkResult, benchmark_fn
 from benchmarks.baselines.mlx_native import (
     naive_layer_norm,
     naive_rms_norm,
@@ -48,6 +48,12 @@ class KernelBenchmarks:
 
         # Run fused operation benchmarks
         results.extend(self.run_fused_benchmarks())
+
+        # Run fused RoPE + attention benchmarks
+        results.extend(self.run_fused_rope_benchmarks())
+
+        # Run fused add + norm benchmarks
+        results.extend(self.run_fused_add_norm_benchmarks())
 
         return results
 
@@ -107,27 +113,22 @@ class KernelBenchmarks:
         bias = mx.random.normal((hidden_dim,))
 
         def fn():
-            result = naive_layer_norm(x, weight, bias)
-            mx.eval(result)
-            return result
+            return naive_layer_norm(x, weight, bias)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"naive_ln_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "baseline",
-            },
+        name = f"naive_ln_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "baseline",
+        }
+        return result
 
     def _benchmark_naive_rms_norm(
         self,
@@ -142,27 +143,22 @@ class KernelBenchmarks:
         weight = mx.random.normal((hidden_dim,))
 
         def fn():
-            result = naive_rms_norm(x, weight)
-            mx.eval(result)
-            return result
+            return naive_rms_norm(x, weight)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"naive_rms_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "baseline",
-            },
+        name = f"naive_rms_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "baseline",
+        }
+        return result
 
     def _benchmark_fused_layer_norm(
         self,
@@ -172,38 +168,34 @@ class KernelBenchmarks:
     ) -> Optional[BenchmarkResult]:
         """Benchmark fused layer normalization."""
         try:
-            from mlx_primitives.dsl.examples.normalization import layer_norm as fused_layer_norm
+            from mlx_primitives.kernels.layernorm import fast_layernorm
         except ImportError:
+            print(f"  Warning: fast_layernorm not available, skipping optimized benchmark")
             return None
 
         mx.random.seed(self.config.seed)
 
         x = mx.random.normal((batch_size, seq_len, hidden_dim))
-        weight = mx.random.normal((hidden_dim,))
-        bias = mx.random.normal((hidden_dim,))
+        gamma = mx.random.normal((hidden_dim,))
+        beta = mx.random.normal((hidden_dim,))
 
         def fn():
-            result = fused_layer_norm(x, weight, bias)
-            mx.eval(result)
-            return result
+            return fast_layernorm(x, gamma, beta)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"fused_ln_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "optimized",
-            },
+        name = f"fused_ln_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "optimized",
+        }
+        return result
 
     def _benchmark_fused_rms_norm(
         self,
@@ -213,8 +205,9 @@ class KernelBenchmarks:
     ) -> Optional[BenchmarkResult]:
         """Benchmark fused RMS normalization."""
         try:
-            from mlx_primitives.dsl.examples.normalization import rms_norm as fused_rms_norm
+            from mlx_primitives.kernels.rmsnorm import fast_rmsnorm
         except ImportError:
+            print(f"  Warning: fast_rmsnorm not available, skipping optimized benchmark")
             return None
 
         mx.random.seed(self.config.seed)
@@ -223,27 +216,22 @@ class KernelBenchmarks:
         weight = mx.random.normal((hidden_dim,))
 
         def fn():
-            result = fused_rms_norm(x, weight)
-            mx.eval(result)
-            return result
+            return fast_rmsnorm(x, weight)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"fused_rms_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "optimized",
-            },
+        name = f"fused_rms_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "optimized",
+        }
+        return result
 
     def run_activation_benchmarks(
         self,
@@ -295,28 +283,23 @@ class KernelBenchmarks:
         act_fn = naive_silu if activation == "silu" else naive_gelu
 
         def fn():
-            result = act_fn(x)
-            mx.eval(result)
-            return result
+            return act_fn(x)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"naive_{activation}_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "activation": activation,
-                "type": "baseline",
-            },
+        name = f"naive_{activation}_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "activation": activation,
+            "type": "baseline",
+        }
+        return result
 
     def _benchmark_fused_activation(
         self,
@@ -328,10 +311,11 @@ class KernelBenchmarks:
         """Benchmark fused activation function."""
         try:
             if activation == "silu":
-                from mlx_primitives.dsl.examples.activations import silu as fused_act
+                from mlx_primitives.kernels.fused_activations import silu as fused_act
             else:
-                from mlx_primitives.dsl.examples.activations import gelu as fused_act
+                from mlx_primitives.kernels.fused_activations import gelu as fused_act
         except ImportError:
+            print(f"  Warning: fused {activation} not available, skipping optimized benchmark")
             return None
 
         mx.random.seed(self.config.seed)
@@ -339,28 +323,23 @@ class KernelBenchmarks:
         x = mx.random.normal((batch_size, seq_len, hidden_dim))
 
         def fn():
-            result = fused_act(x)
-            mx.eval(result)
-            return result
+            return fused_act(x)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"fused_{activation}_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "activation": activation,
-                "type": "optimized",
-            },
+        name = f"fused_{activation}_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "activation": activation,
+            "type": "optimized",
+        }
+        return result
 
     def run_fused_benchmarks(
         self,
@@ -403,27 +382,22 @@ class KernelBenchmarks:
         gate = mx.random.normal((batch_size, seq_len, hidden_dim))
 
         def fn():
-            result = naive_swiglu(x, gate)
-            mx.eval(result)
-            return result
+            return naive_swiglu(x, gate)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"naive_swiglu_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "baseline",
-            },
+        name = f"naive_swiglu_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "baseline",
+        }
+        return result
 
     def _benchmark_fused_swiglu(
         self,
@@ -433,34 +407,159 @@ class KernelBenchmarks:
     ) -> Optional[BenchmarkResult]:
         """Benchmark fused SwiGLU activation."""
         try:
-            from mlx_primitives.dsl.examples.activations import fused_silu_mul
+            from mlx_primitives.kernels.swiglu import fast_swiglu
+        except ImportError:
+            print(f"  Warning: fast_swiglu not available, skipping optimized benchmark")
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        gate = mx.random.normal((batch_size, seq_len, hidden_dim))
+        up = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return fast_swiglu(gate, up)
+
+        name = f"fused_swiglu_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "optimized",
+        }
+        return result
+
+    def run_fused_rope_benchmarks(self) -> list[BenchmarkResult]:
+        """Run fused RoPE + attention benchmarks."""
+        results = []
+
+        sizes = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (4, 2048, 8, 64),
+        ]
+
+        for batch, seq, heads, dim in sizes:
+            result = self._benchmark_fused_rope_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_fused_rope_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark fused RoPE + attention kernel."""
+        try:
+            from mlx_primitives.kernels.fused_rope_attention import fused_rope_attention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        q = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
+        k = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
+        v = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
+
+        def fn():
+            return fused_rope_attention(q, k, v, causal=True)
+
+        name = f"fused_rope_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "fused_rope_attention",
+        }
+        return result
+
+    def run_fused_add_norm_benchmarks(self) -> list[BenchmarkResult]:
+        """Run fused add + normalization benchmarks."""
+        results = []
+
+        sizes = [
+            (4, 512, 1024),
+            (4, 1024, 2048),
+            (8, 2048, 4096),
+        ]
+
+        for batch, seq, hidden in sizes:
+            # Fused add + layer norm
+            result = self._benchmark_fused_add_layernorm(batch, seq, hidden)
+            if result:
+                results.append(result)
+
+            # Fused add + RMS norm
+            result = self._benchmark_fused_add_rmsnorm(batch, seq, hidden)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_fused_add_layernorm(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark fused add + layer norm.
+
+        Note: Currently not available as a fused kernel.
+        """
+        # No fused add + layernorm kernel available yet
+        return None
+
+    def _benchmark_fused_add_rmsnorm(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark fused add + RMS norm."""
+        try:
+            from mlx_primitives.kernels.rmsnorm import fast_rmsnorm_residual
         except ImportError:
             return None
 
         mx.random.seed(self.config.seed)
 
         x = mx.random.normal((batch_size, seq_len, hidden_dim))
-        gate = mx.random.normal((batch_size, seq_len, hidden_dim))
+        residual = mx.random.normal((batch_size, seq_len, hidden_dim))
+        weight = mx.ones((hidden_dim,))
 
         def fn():
-            result = fused_silu_mul(gate, x)
-            mx.eval(result)
-            return result
+            return fast_rmsnorm_residual(x, residual, weight)
 
-        warmup(fn, self.config.warmup_iterations)
-        result = benchmark_fn(fn, self.config.benchmark_iterations)
-
-        return BenchmarkResult(
-            name=f"fused_swiglu_b{batch_size}_s{seq_len}_h{hidden_dim}",
-            mean_time=result.mean_time,
-            std_time=result.std_time,
-            min_time=result.min_time,
-            max_time=result.max_time,
-            iterations=result.iterations,
-            metadata={
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "hidden_dim": hidden_dim,
-                "type": "optimized",
-            },
+        name = f"fused_add_rms_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
         )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "optimized",
+            "operation": "fused_add_rmsnorm",
+        }
+        return result
