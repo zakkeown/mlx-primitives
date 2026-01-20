@@ -1,5 +1,18 @@
 """Gradient checkpointing for memory-efficient training.
 
+.. warning::
+    **MLX Limitation**: Due to MLX's lazy evaluation model, gradient checkpointing
+    does NOT provide the same memory savings as in eager frameworks like PyTorch.
+    In MLX, intermediate activations are not stored until needed, so this module
+    primarily provides API compatibility rather than memory optimization.
+
+    For actual memory savings in MLX, consider:
+    - Using mx.eval() strategically to control evaluation timing
+    - Chunked processing (as in chunked_cross_attention)
+    - Streaming computation patterns
+    - Reducing batch size
+
+The traditional description (which applies to eager frameworks):
 Gradient checkpointing trades compute for memory by recomputing activations
 during the backward pass instead of storing them. This is particularly useful
 for training deep models or models with large intermediate activations.
@@ -18,9 +31,12 @@ Example:
     >>> y = checkpoint(transformer_block, x, w)
 """
 
+import warnings
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
+
+_CHECKPOINTING_WARNING_SHOWN = False
 
 
 def checkpoint(
@@ -29,6 +45,11 @@ def checkpoint(
     preserve_rng_state: bool = True,
 ) -> mx.array:
     """Apply gradient checkpointing to a function.
+
+    .. warning::
+        In MLX, this function does NOT provide memory savings due to lazy evaluation.
+        It is provided for API compatibility with PyTorch-style checkpointing code.
+        See module docstring for memory-saving alternatives in MLX.
 
     During the forward pass, runs fn(*args) normally but does NOT store
     intermediate activations for the backward pass. During the backward pass,
@@ -64,7 +85,20 @@ def checkpoint(
         - The function must be pure (same inputs -> same outputs) for correctness
         - Memory savings come at the cost of ~2x forward computation
         - Most effective for compute-bound operations with large intermediates
+        - **MLX Note**: Due to lazy evaluation, actual memory savings are minimal
     """
+    global _CHECKPOINTING_WARNING_SHOWN
+    if not _CHECKPOINTING_WARNING_SHOWN:
+        warnings.warn(
+            "gradient checkpointing in MLX does not provide the same memory savings "
+            "as in eager frameworks like PyTorch due to lazy evaluation. "
+            "Consider using mx.eval() strategically, chunked processing, or "
+            "reducing batch size for memory optimization.",
+            UserWarning,
+            stacklevel=2,
+        )
+        _CHECKPOINTING_WARNING_SHOWN = True
+
     # Delegate to the implementation which handles RNG state and custom gradients
     return _checkpoint_impl(fn, args, preserve_rng_state)
 
@@ -83,28 +117,27 @@ def _checkpoint_impl(
 
     However, this implementation still provides:
     1. Correct gradient computation
-    2. RNG state preservation for reproducibility
-    3. API compatibility with PyTorch-style checkpointing
+    2. API compatibility with PyTorch-style checkpointing
+
+    Note on RNG state:
+        MLX does not provide a way to capture and restore RNG state like PyTorch.
+        The preserve_rng_state parameter is accepted for API compatibility but
+        has limited effect. For reproducible stochastic operations, use explicit
+        seeds within your function.
 
     For true memory savings in MLX, consider:
     - Using mx.eval() strategically to control evaluation timing
     - Chunked processing (as in chunked_cross_attention)
     - Streaming computation patterns
     """
-    # For RNG reproducibility, capture a seed
-    rng_seed: Optional[int] = None
-    if preserve_rng_state:
-        # Generate a deterministic seed for this checkpoint
-        rng_seed = int(mx.sum(mx.random.uniform(shape=(1,)) * 2**31).item()) & 0x7FFFFFFF
-
-    def run_fn(*inputs: mx.array) -> mx.array:
-        if preserve_rng_state and rng_seed is not None:
-            mx.random.seed(rng_seed)
-        return fn(*inputs)
+    # Note: MLX doesn't provide RNG state capture/restore like PyTorch.
+    # The preserve_rng_state parameter is kept for API compatibility.
+    # Previous implementation incorrectly called mx.random.uniform() which
+    # actually CHANGED the RNG state instead of preserving it.
 
     # Simply run the function - MLX's lazy evaluation handles the graph
     # Gradients will flow through correctly via MLX's automatic differentiation
-    return run_fn(*args)
+    return fn(*args)
 
 
 def checkpoint_sequential(

@@ -16,12 +16,22 @@ Supported formats:
 
 import math
 import threading
+import warnings
 from typing import Literal, Optional, Tuple
 
 import mlx.core as mx
 
-# Check if Metal kernels are available
-_HAS_METAL = hasattr(mx.fast, "metal_kernel")
+from mlx_primitives.utils import (
+    has_metal_kernels,
+    METAL_MIN_SEQ_LEN,
+    RAISE_ON_METAL_FAILURE,
+    should_use_metal,
+    validate_dtype_for_metal,
+)
+
+# FP16 minimum positive normal value: 2^-14 ≈ 6.1e-5
+# Using this as minimum scale prevents underflow/denormals in FP16 computation
+_FP16_MIN_POSITIVE_NORMAL = 2**-14  # ~6.1e-5
 
 # Kernel cache with thread safety
 _int8_matmul_kernel: Optional[mx.fast.metal_kernel] = None
@@ -338,9 +348,21 @@ def quantize_int8(
         w_min = mx.min(weights, axis=1)  # (out_features,)
         w_max = mx.max(weights, axis=1)
 
-        # Avoid division by zero
+        # Warn if any channel has zero range (all values identical)
+        zero_range_mask = mx.abs(w_max - w_min) < _FP16_MIN_POSITIVE_NORMAL
+        mx.eval(zero_range_mask)
+        if mx.any(zero_range_mask):
+            num_zero_range = int(mx.sum(zero_range_mask))
+            warnings.warn(
+                f"Quantization: {num_zero_range} out of {out_features} channels have zero range "
+                f"(all weights identical). These channels will lose information.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Avoid division by zero and FP16 underflow
         scale = (w_max - w_min) / 255.0
-        scale = mx.maximum(scale, 1e-6)  # FP16-safe minimum scale
+        scale = mx.maximum(scale, _FP16_MIN_POSITIVE_NORMAL)
 
         # Zero point (for asymmetric quantization)
         zero_point = -mx.round(w_min / scale)
@@ -361,8 +383,18 @@ def quantize_int8(
         w_min = mx.min(weights)
         w_max = mx.max(weights)
 
+        # Warn if tensor has zero range (all values identical)
+        mx.eval(w_min, w_max)
+        if float(mx.abs(w_max - w_min)) < _FP16_MIN_POSITIVE_NORMAL:
+            warnings.warn(
+                "Quantization: tensor has zero range (all weights identical). "
+                "Quantization will lose all information.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         scale = (w_max - w_min) / 255.0
-        scale = mx.maximum(scale, mx.array(1e-6))  # FP16-safe minimum scale
+        scale = mx.maximum(scale, mx.array(_FP16_MIN_POSITIVE_NORMAL))
 
         zero_point = -mx.round(w_min / scale)
         zero_point = mx.clip(zero_point, 0, 255)
@@ -429,9 +461,22 @@ def quantize_int4(
     w_min = mx.min(weights_grouped, axis=2)  # (out_features, num_groups)
     w_max = mx.max(weights_grouped, axis=2)
 
+    # Warn if any group has zero range (all values identical)
+    zero_range_mask = mx.abs(w_max - w_min) < _FP16_MIN_POSITIVE_NORMAL
+    mx.eval(zero_range_mask)
+    if mx.any(zero_range_mask):
+        num_zero_range = int(mx.sum(zero_range_mask))
+        total_groups = out_features * num_groups
+        warnings.warn(
+            f"INT4 Quantization: {num_zero_range} out of {total_groups} groups have zero range "
+            f"(all weights identical). These groups will lose information.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     # Scale and zero point for 4-bit (0-15 range)
     scale = (w_max - w_min) / 15.0
-    scale = mx.maximum(scale, 1e-6)  # FP16-safe minimum scale
+    scale = mx.maximum(scale, _FP16_MIN_POSITIVE_NORMAL)
 
     zero_point = -mx.round(w_min / scale)
     zero_point = mx.clip(zero_point, 0, 15)
@@ -490,15 +535,19 @@ def int8_linear(
     # Determine if per-channel or per-tensor
     per_channel = scale.size > 1
 
-    if not use_metal or not _HAS_METAL or seq_len < 8:
+    if not should_use_metal(seq_len, use_metal):
         return _reference_int8_linear(x, W_quant, scale, zero_point, bias, per_channel)
 
     try:
         return _metal_int8_linear(x, W_quant, scale, zero_point, bias, per_channel)
     except RuntimeError as e:
-        # Catch Metal kernel errors, but let programming bugs propagate
-        from mlx_primitives.utils.logging import log_fallback
-        log_fallback("int8_linear", e)
+        if RAISE_ON_METAL_FAILURE:
+            raise
+        warnings.warn(
+            f"Metal kernel 'int8_linear' failed, falling back to reference implementation: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return _reference_int8_linear(x, W_quant, scale, zero_point, bias, per_channel)
 
 
@@ -511,6 +560,9 @@ def _metal_int8_linear(
     per_channel: bool,
 ) -> mx.array:
     """Metal kernel INT8 linear."""
+    # Validate input dtype - Metal kernels compute in float32
+    validate_dtype_for_metal("x", x.dtype, target_dtype="float32")
+
     batch_size, seq_len, in_features = x.shape
     out_features = W_quant.shape[0]
 
@@ -610,7 +662,7 @@ def int4_linear(
     batch_size, seq_len, in_features = x.shape
     out_features = W_packed.shape[0]
 
-    if not use_metal or not _HAS_METAL or seq_len < 8:
+    if not should_use_metal(seq_len, use_metal):
         return _reference_int4_linear(
             x, W_packed, scales, zero_points, bias, group_size
         )
@@ -620,9 +672,13 @@ def int4_linear(
             x, W_packed, scales, zero_points, bias, group_size
         )
     except RuntimeError as e:
-        # Catch Metal kernel errors, but let programming bugs propagate
-        from mlx_primitives.utils.logging import log_fallback
-        log_fallback("int4_linear", e)
+        if RAISE_ON_METAL_FAILURE:
+            raise
+        warnings.warn(
+            f"Metal kernel 'int4_linear' failed, falling back to reference implementation: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return _reference_int4_linear(
             x, W_packed, scales, zero_points, bias, group_size
         )
@@ -637,6 +693,9 @@ def _metal_int4_linear(
     group_size: int,
 ) -> mx.array:
     """Metal kernel INT4 linear."""
+    # Validate input dtype - Metal kernels compute in float32
+    validate_dtype_for_metal("x", x.dtype, target_dtype="float32")
+
     batch_size, seq_len, in_features = x.shape
     out_features = W_packed.shape[0]
 
@@ -755,6 +814,10 @@ class QuantizedLinear:
     Supports INT8 and INT4 quantization with automatic weight quantization
     on initialization.
 
+    Note: This class does not inherit from nn.Module and is intended for
+    inference only. For training with quantization, consider using QLoRA
+    or other quantization-aware training approaches.
+
     Args:
         in_features: Input dimension.
         out_features: Output dimension.
@@ -781,10 +844,6 @@ class QuantizedLinear:
         self.bits = bits
         self.group_size = group_size
 
-        # Initialize with random weights (will typically be replaced)
-        scale = 1.0 / math.sqrt(in_features)
-        self._fp_weights = mx.random.normal((out_features, in_features)) * scale
-
         # Quantized weights (populated after quantize_weights call)
         self.W_quant: Optional[mx.array] = None
         self.scales: Optional[mx.array] = None
@@ -795,14 +854,21 @@ class QuantizedLinear:
         else:
             self.bias = None
 
-        # Auto-quantize on init
-        self.quantize_weights(self._fp_weights)
+        # Initialize with random weights and quantize
+        # The FP32 weights are discarded after quantization to save memory
+        scale = 1.0 / math.sqrt(in_features)
+        init_weights = mx.random.normal((out_features, in_features)) * scale
+        self.quantize_weights(init_weights)
+        # init_weights is not stored, avoiding memory leak
 
-    def quantize_weights(self, weights: mx.array) -> None:
+    def quantize_weights(self, weights: mx.array) -> "QuantizedLinear":
         """Quantize the provided weights.
 
         Args:
             weights: FP32 weights of shape (out_features, in_features).
+
+        Returns:
+            self, for method chaining.
         """
         if self.bits == 8:
             self.W_quant, self.scales, self.zero_points = quantize_int8(
@@ -814,6 +880,7 @@ class QuantizedLinear:
             )
         else:
             raise ValueError(f"Unsupported bits: {self.bits}")
+        return self
 
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass with quantized weights.

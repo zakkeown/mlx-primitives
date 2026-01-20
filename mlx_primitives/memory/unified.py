@@ -75,14 +75,22 @@ class UnifiedView:
         self._access_mode = access_mode
         self._numpy_view: Optional[np.ndarray] = None
 
-    def as_numpy(self) -> np.ndarray:
-        """Get zero-copy NumPy view for CPU access.
+    def as_numpy(self, warn_on_copy: bool = False) -> np.ndarray:
+        """Get NumPy view for CPU access, attempting zero-copy.
 
         On Apple Silicon with unified memory, this avoids data copying
         when the underlying data is contiguous.
 
+        Args:
+            warn_on_copy: If True, emit a warning when zero-copy fails
+                and data must be copied.
+
         Returns:
-            NumPy array sharing memory with the MLX tensor.
+            NumPy array, sharing memory with the MLX tensor when possible.
+
+        Note:
+            Use `is_zero_copy` property after calling this to check if
+            the array actually shares memory with the tensor.
         """
         if self._numpy_view is None:
             # Ensure tensor is evaluated
@@ -92,7 +100,36 @@ class UnifiedView:
             # np.array with copy=False attempts zero-copy when possible
             self._numpy_view = np.array(self._tensor, copy=False)
 
+            # Check if zero-copy succeeded
+            if warn_on_copy and not self.is_zero_copy:
+                import warnings
+                warnings.warn(
+                    f"Zero-copy failed for tensor with shape {self._tensor.shape}. "
+                    "Data was copied. This may be due to non-contiguous memory layout.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         return self._numpy_view
+
+    @property
+    def is_zero_copy(self) -> bool:
+        """Check if the numpy view shares memory with the MLX tensor.
+
+        Returns:
+            True if as_numpy() returned a zero-copy view, False if data was copied.
+            Returns False if as_numpy() hasn't been called yet.
+        """
+        if self._numpy_view is None:
+            return False
+
+        # Check if numpy array shares memory with original tensor
+        # by comparing data pointers via another numpy view
+        try:
+            fresh_view = np.array(self._tensor, copy=False)
+            return np.shares_memory(self._numpy_view, fresh_view)
+        except (ValueError, TypeError):
+            return False
 
     def as_mlx(self) -> mx.array:
         """Get the underlying MLX array for GPU compute.
@@ -295,23 +332,29 @@ def _is_contiguous(tensor: mx.array) -> bool:
 
     A tensor is contiguous if its elements are stored in
     row-major order without gaps.
+
+    Returns:
+        True if tensor is contiguous (C-order), False otherwise.
     """
-    # For MLX, we check by comparing actual vs expected strides
     shape = tensor.shape
     if len(shape) == 0:
         return True
 
-    # Compute expected strides for contiguous array
-    expected_stride = 1
-    for i in range(len(shape) - 1, -1, -1):
-        if shape[i] == 1:
-            continue
-        # If any dimension has unexpected stride, not contiguous
-        expected_stride *= shape[i]
+    # Empty tensor is contiguous
+    if tensor.size == 0:
+        return True
 
-    # MLX arrays are typically contiguous unless explicitly sliced
-    # This is a heuristic check
-    return True  # MLX generally maintains contiguity
+    # For MLX, we verify contiguity by checking if a numpy view
+    # can be created without copying. This is the most reliable method
+    # since MLX doesn't expose stride information directly.
+    try:
+        mx.eval(tensor)
+        np_arr = np.array(tensor, copy=False)
+        # Check if numpy array is C-contiguous
+        return np_arr.flags['C_CONTIGUOUS']
+    except (ValueError, TypeError):
+        # If we can't create a view, assume not contiguous
+        return False
 
 
 def _compute_strides(shape: tuple, dtype_size: int) -> tuple:

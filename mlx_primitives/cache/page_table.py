@@ -2,8 +2,25 @@
 
 This module maps logical token positions to physical blocks,
 enabling non-contiguous KV storage with efficient lookup.
+
+Lock Ordering Protocol:
+    When acquiring multiple locks across cache components, always acquire
+    in this order to prevent deadlocks:
+
+    1. PageTable._lock (RLock) - highest priority
+    2. BlockAllocator._lock (RLock)
+    3. EvictionPolicy._lock (Lock) - lowest priority
+
+    This means:
+    - PageTable methods may call BlockAllocator and EvictionPolicy methods
+    - BlockAllocator methods may call EvictionPolicy methods
+    - EvictionPolicy methods must NOT call PageTable or BlockAllocator methods
+      while holding their own lock
+
+    The RLock on PageTable allows re-entrant calls within the same thread.
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -22,10 +39,17 @@ class SequenceMetadata:
         block_table: List of physical block indices in order.
         num_tokens: Current number of cached tokens.
         num_tokens_in_last_block: Tokens used in the last block.
-        last_access_time: Timestamp for LRU eviction.
+        last_access_time: Timestamp for LRU eviction. Access is thread-safe
+            via atomic float assignment on CPython.
         ref_count: Reference count for prefix sharing.
         is_speculative: Whether this is a speculative branch.
         parent_sequence_id: For tree-based speculation/beam search.
+
+    Thread Safety:
+        This dataclass is not inherently thread-safe. All mutations should
+        occur while holding the parent PageTable's lock. The `touch()` method
+        uses atomic float assignment which is safe on CPython, but callers
+        should still hold the PageTable lock for consistency.
     """
 
     sequence_id: int
@@ -38,7 +62,14 @@ class SequenceMetadata:
     parent_sequence_id: Optional[int] = None
 
     def touch(self) -> None:
-        """Update last access time."""
+        """Update last access time.
+
+        Note:
+            This should be called while holding the PageTable lock.
+            The float assignment is atomic on CPython, so reads from
+            eviction policies will see either the old or new value,
+            never a corrupted intermediate state.
+        """
         self.last_access_time = time.time()
 
 
@@ -50,6 +81,8 @@ class PageTable:
     - Prefix sharing via reference counting
     - Efficient lookup for paged attention
     - Batch operations for continuous batching
+
+    Thread-safe via internal locking.
 
     Example:
         >>> allocator = BlockAllocator(config, num_blocks=1000)
@@ -68,11 +101,18 @@ class PageTable:
         self._allocator = block_allocator
         self._sequences: Dict[int, SequenceMetadata] = {}
         self._next_sequence_id = 0
+        self._lock = threading.RLock()
+
+    @property
+    def allocator(self) -> BlockAllocator:
+        """Get the underlying block allocator (public access)."""
+        return self._allocator
 
     @property
     def num_sequences(self) -> int:
         """Number of active sequences."""
-        return len(self._sequences)
+        with self._lock:
+            return len(self._sequences)
 
     @property
     def block_size(self) -> int:
@@ -95,25 +135,28 @@ class PageTable:
         Returns:
             New sequence ID.
         """
-        sequence_id = self._next_sequence_id
-        self._next_sequence_id += 1
+        with self._lock:
+            sequence_id = self._next_sequence_id
+            self._next_sequence_id += 1
 
-        metadata = SequenceMetadata(
-            sequence_id=sequence_id,
-            is_speculative=is_speculative,
-            parent_sequence_id=parent_sequence_id,
-        )
+            metadata = SequenceMetadata(
+                sequence_id=sequence_id,
+                is_speculative=is_speculative,
+                parent_sequence_id=parent_sequence_id,
+            )
 
-        self._sequences[sequence_id] = metadata
+            self._sequences[sequence_id] = metadata
 
-        # Allocate initial blocks if requested
-        if initial_tokens > 0:
-            self._allocate_blocks_for_tokens(sequence_id, initial_tokens)
+            # Allocate initial blocks if requested
+            if initial_tokens > 0:
+                self._allocate_blocks_for_tokens(sequence_id, initial_tokens)
 
-        return sequence_id
+            return sequence_id
 
     def _allocate_blocks_for_tokens(self, sequence_id: int, num_tokens: int) -> None:
         """Allocate blocks to accommodate the given number of tokens.
+
+        Note: Must be called with lock held.
 
         Args:
             sequence_id: Sequence to allocate for.
@@ -143,20 +186,21 @@ class PageTable:
         Raises:
             KeyError: If sequence doesn't exist.
         """
-        if sequence_id not in self._sequences:
-            raise KeyError(f"Sequence {sequence_id} not found")
+        with self._lock:
+            if sequence_id not in self._sequences:
+                raise KeyError(f"Sequence {sequence_id} not found")
 
-        metadata = self._sequences[sequence_id]
-        metadata.touch()
+            metadata = self._sequences[sequence_id]
+            metadata.touch()
 
-        new_total = metadata.num_tokens + num_new_tokens
-        self._allocate_blocks_for_tokens(sequence_id, new_total)
+            new_total = metadata.num_tokens + num_new_tokens
+            self._allocate_blocks_for_tokens(sequence_id, new_total)
 
-        # Update token counts
-        metadata.num_tokens = new_total
-        metadata.num_tokens_in_last_block = new_total % self.block_size
-        if metadata.num_tokens_in_last_block == 0 and new_total > 0:
-            metadata.num_tokens_in_last_block = self.block_size
+            # Update token counts
+            metadata.num_tokens = new_total
+            metadata.num_tokens_in_last_block = new_total % self.block_size
+            if metadata.num_tokens_in_last_block == 0 and new_total > 0:
+                metadata.num_tokens_in_last_block = self.block_size
 
     def truncate_sequence(self, sequence_id: int, new_length: int) -> None:
         """Truncate a sequence to a shorter length, freeing excess blocks.
@@ -165,30 +209,31 @@ class PageTable:
             sequence_id: Sequence to truncate.
             new_length: New number of tokens (must be <= current).
         """
-        if sequence_id not in self._sequences:
-            raise KeyError(f"Sequence {sequence_id} not found")
+        with self._lock:
+            if sequence_id not in self._sequences:
+                raise KeyError(f"Sequence {sequence_id} not found")
 
-        metadata = self._sequences[sequence_id]
+            metadata = self._sequences[sequence_id]
 
-        if new_length >= metadata.num_tokens:
-            return
+            if new_length >= metadata.num_tokens:
+                return
 
-        # Calculate blocks needed for new length
-        blocks_needed = (new_length + self.block_size - 1) // self.block_size
-        if new_length == 0:
-            blocks_needed = 0
+            # Calculate blocks needed for new length
+            blocks_needed = (new_length + self.block_size - 1) // self.block_size
+            if new_length == 0:
+                blocks_needed = 0
 
-        # Free excess blocks
-        excess_blocks = metadata.block_table[blocks_needed:]
-        if excess_blocks:
-            self._allocator.free(excess_blocks)
-            metadata.block_table = metadata.block_table[:blocks_needed]
+            # Free excess blocks
+            excess_blocks = metadata.block_table[blocks_needed:]
+            if excess_blocks:
+                self._allocator.free(excess_blocks)
+                metadata.block_table = metadata.block_table[:blocks_needed]
 
-        # Update token counts
-        metadata.num_tokens = new_length
-        metadata.num_tokens_in_last_block = new_length % self.block_size
-        if metadata.num_tokens_in_last_block == 0 and new_length > 0:
-            metadata.num_tokens_in_last_block = self.block_size
+            # Update token counts
+            metadata.num_tokens = new_length
+            metadata.num_tokens_in_last_block = new_length % self.block_size
+            if metadata.num_tokens_in_last_block == 0 and new_length > 0:
+                metadata.num_tokens_in_last_block = self.block_size
 
     def fork_sequence(self, sequence_id: int, is_speculative: bool = False) -> int:
         """Create a fork of a sequence sharing prefix blocks (for beam search).
@@ -202,31 +247,32 @@ class PageTable:
         Returns:
             New forked sequence ID.
         """
-        if sequence_id not in self._sequences:
-            raise KeyError(f"Sequence {sequence_id} not found")
+        with self._lock:
+            if sequence_id not in self._sequences:
+                raise KeyError(f"Sequence {sequence_id} not found")
 
-        parent = self._sequences[sequence_id]
+            parent = self._sequences[sequence_id]
 
-        # Create new sequence with shared block table
-        new_id = self._next_sequence_id
-        self._next_sequence_id += 1
+            # Create new sequence with shared block table
+            new_id = self._next_sequence_id
+            self._next_sequence_id += 1
 
-        # Increment ref counts on shared blocks
-        for block_id in parent.block_table:
-            self._allocator.increment_ref(block_id)
+            # Increment ref counts on shared blocks
+            for block_id in parent.block_table:
+                self._allocator.increment_ref(block_id)
 
-        new_metadata = SequenceMetadata(
-            sequence_id=new_id,
-            block_table=parent.block_table.copy(),  # Share same block IDs
-            num_tokens=parent.num_tokens,
-            num_tokens_in_last_block=parent.num_tokens_in_last_block,
-            ref_count=1,
-            is_speculative=is_speculative,
-            parent_sequence_id=sequence_id,
-        )
+            new_metadata = SequenceMetadata(
+                sequence_id=new_id,
+                block_table=parent.block_table.copy(),  # Share same block IDs
+                num_tokens=parent.num_tokens,
+                num_tokens_in_last_block=parent.num_tokens_in_last_block,
+                ref_count=1,
+                is_speculative=is_speculative,
+                parent_sequence_id=sequence_id,
+            )
 
-        self._sequences[new_id] = new_metadata
-        return new_id
+            self._sequences[new_id] = new_metadata
+            return new_id
 
     def get_block_table(self, sequence_id: int) -> List[int]:
         """Get the block table for a sequence.
@@ -237,12 +283,13 @@ class PageTable:
         Returns:
             List of physical block indices.
         """
-        if sequence_id not in self._sequences:
-            raise KeyError(f"Sequence {sequence_id} not found")
+        with self._lock:
+            if sequence_id not in self._sequences:
+                raise KeyError(f"Sequence {sequence_id} not found")
 
-        metadata = self._sequences[sequence_id]
-        metadata.touch()
-        return metadata.block_table
+            metadata = self._sequences[sequence_id]
+            metadata.touch()
+            return metadata.block_table.copy()  # Return copy for thread safety
 
     def get_block_table_tensor(
         self,
@@ -258,23 +305,30 @@ class PageTable:
         Returns:
             Block table tensor of shape (batch, max_blocks) with -1 padding.
         """
-        if not sequence_ids:
-            return mx.array([], dtype=mx.int32)
+        with self._lock:
+            if not sequence_ids:
+                return mx.array([], dtype=mx.int32)
 
-        block_tables = [self.get_block_table(sid) for sid in sequence_ids]
+            block_tables = []
+            for sid in sequence_ids:
+                if sid not in self._sequences:
+                    raise KeyError(f"Sequence {sid} not found")
+                metadata = self._sequences[sid]
+                metadata.touch()
+                block_tables.append(metadata.block_table.copy())
 
-        if max_blocks is None:
-            max_blocks = max(len(bt) for bt in block_tables) if block_tables else 0
+            if max_blocks is None:
+                max_blocks = max(len(bt) for bt in block_tables) if block_tables else 0
 
-        # Pad with -1 for invalid blocks
-        padded = []
-        for bt in block_tables:
-            if len(bt) < max_blocks:
-                padded.append(bt + [-1] * (max_blocks - len(bt)))
-            else:
-                padded.append(bt[:max_blocks])
+            # Pad with -1 for invalid blocks
+            padded = []
+            for bt in block_tables:
+                if len(bt) < max_blocks:
+                    padded.append(bt + [-1] * (max_blocks - len(bt)))
+                else:
+                    padded.append(bt[:max_blocks])
 
-        return mx.array(padded, dtype=mx.int32)
+            return mx.array(padded, dtype=mx.int32)
 
     def get_context_lengths(self, sequence_ids: List[int]) -> mx.array:
         """Get the number of cached tokens for each sequence.
@@ -285,8 +339,9 @@ class PageTable:
         Returns:
             Context lengths tensor of shape (batch,).
         """
-        lengths = [self._sequences[sid].num_tokens for sid in sequence_ids]
-        return mx.array(lengths, dtype=mx.int32)
+        with self._lock:
+            lengths = [self._sequences[sid].num_tokens for sid in sequence_ids]
+            return mx.array(lengths, dtype=mx.int32)
 
     def get_sequence_metadata(self, sequence_id: int) -> SequenceMetadata:
         """Get metadata for a sequence.
@@ -297,9 +352,10 @@ class PageTable:
         Returns:
             Sequence metadata.
         """
-        if sequence_id not in self._sequences:
-            raise KeyError(f"Sequence {sequence_id} not found")
-        return self._sequences[sequence_id]
+        with self._lock:
+            if sequence_id not in self._sequences:
+                raise KeyError(f"Sequence {sequence_id} not found")
+            return self._sequences[sequence_id]
 
     def get_token_position(self, sequence_id: int, token_idx: int) -> Tuple[int, int]:
         """Get (block_id, position_in_block) for a token index.
@@ -311,10 +367,11 @@ class PageTable:
         Returns:
             Tuple of (block_id, position_in_block).
         """
-        metadata = self._sequences[sequence_id]
-        block_idx = token_idx // self.block_size
-        pos_in_block = token_idx % self.block_size
-        return metadata.block_table[block_idx], pos_in_block
+        with self._lock:
+            metadata = self._sequences[sequence_id]
+            block_idx = token_idx // self.block_size
+            pos_in_block = token_idx % self.block_size
+            return metadata.block_table[block_idx], pos_in_block
 
     def delete_sequence(self, sequence_id: int) -> None:
         """Delete a sequence and free its blocks.
@@ -322,15 +379,16 @@ class PageTable:
         Args:
             sequence_id: Sequence to delete.
         """
-        if sequence_id not in self._sequences:
-            return
+        with self._lock:
+            if sequence_id not in self._sequences:
+                return
 
-        metadata = self._sequences[sequence_id]
+            metadata = self._sequences[sequence_id]
 
-        # Free all blocks (allocator handles ref counting)
-        self._allocator.free(metadata.block_table)
+            # Free all blocks (allocator handles ref counting)
+            self._allocator.free(metadata.block_table)
 
-        del self._sequences[sequence_id]
+            del self._sequences[sequence_id]
 
     def get_all_sequence_ids(self) -> List[int]:
         """Get all active sequence IDs.
@@ -338,7 +396,8 @@ class PageTable:
         Returns:
             List of sequence IDs.
         """
-        return list(self._sequences.keys())
+        with self._lock:
+            return list(self._sequences.keys())
 
     def get_sequences_by_access_time(self, ascending: bool = True) -> List[int]:
         """Get sequences sorted by last access time.
@@ -349,16 +408,19 @@ class PageTable:
         Returns:
             Sorted list of sequence IDs.
         """
-        return sorted(
-            self._sequences.keys(),
-            key=lambda sid: self._sequences[sid].last_access_time,
-            reverse=not ascending,
-        )
+        with self._lock:
+            return sorted(
+                self._sequences.keys(),
+                key=lambda sid: self._sequences[sid].last_access_time,
+                reverse=not ascending,
+            )
 
     def clear(self) -> None:
         """Delete all sequences."""
-        for seq_id in list(self._sequences.keys()):
-            self.delete_sequence(seq_id)
+        with self._lock:
+            for seq_id in list(self._sequences.keys()):
+                # delete_sequence is re-entrant with RLock
+                self.delete_sequence(seq_id)
 
     def get_stats(self) -> dict:
         """Get page table statistics.
@@ -366,17 +428,19 @@ class PageTable:
         Returns:
             Dictionary with statistics.
         """
-        total_tokens = sum(m.num_tokens for m in self._sequences.values())
-        total_blocks = sum(len(m.block_table) for m in self._sequences.values())
+        with self._lock:
+            num_seqs = len(self._sequences)
+            total_tokens = sum(m.num_tokens for m in self._sequences.values())
+            total_blocks = sum(len(m.block_table) for m in self._sequences.values())
 
-        return {
-            "num_sequences": self.num_sequences,
-            "total_tokens": total_tokens,
-            "total_blocks": total_blocks,
-            "avg_tokens_per_sequence": total_tokens / self.num_sequences
-            if self.num_sequences > 0
-            else 0,
-            "avg_blocks_per_sequence": total_blocks / self.num_sequences
-            if self.num_sequences > 0
+            return {
+                "num_sequences": num_seqs,
+                "total_tokens": total_tokens,
+                "total_blocks": total_blocks,
+                "avg_tokens_per_sequence": total_tokens / num_seqs
+                if num_seqs > 0
+                else 0,
+                "avg_blocks_per_sequence": total_blocks / num_seqs
+                if num_seqs > 0
             else 0,
         }

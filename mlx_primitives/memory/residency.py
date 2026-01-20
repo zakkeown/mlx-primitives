@@ -3,6 +3,27 @@
 This module provides advisory hints for cache behavior and memory
 placement on Apple Silicon's unified memory architecture.
 
+IMPORTANT: Current Implementation Status
+    Most functions in this module are currently NO-OPs because MLX does not
+    expose low-level cache control APIs. These functions exist to:
+
+    1. Document intended access patterns for code clarity
+    2. Provide a stable API for when MLX adds cache control features
+    3. Allow performance-sensitive code to express intent
+
+    Functions that actually do something:
+    - prefetch_to_gpu(): Calls mx.eval() to materialize tensors
+    - prefetch_to_cpu(): Calls mx.eval() and touches numpy view
+    - prefetch_batch(): Same as above for multiple tensors
+    - gpu_residency_context(): Calls mx.eval() on context entry
+    - estimate_cache_usage(): Returns size estimates (heuristic)
+    - recommend_chunk_size(): Returns chunk size recommendation
+
+    Functions that are pure NO-OPs:
+    - set_residency_hint(): Returns tensor unchanged (except GPU_PREFERRED calls eval)
+    - evict_from_cache(): Does nothing
+    - streaming_context(): Just applies no-op hints
+
 Note: These are hints that the system may or may not honor depending
 on memory pressure, access patterns, and hardware generation.
 """
@@ -157,12 +178,13 @@ def evict_from_cache(
         tensor: Tensor to evict.
         device: "cpu", "gpu", or "both".
 
-    Note:
+    Warning:
+        THIS IS A NO-OP. MLX does not expose cache eviction APIs.
+        This function exists for API completeness and future compatibility.
         On unified memory, actual eviction is managed by the system.
-        This hint may help influence cache behavior but is not guaranteed.
     """
-    # On Apple Silicon unified memory, we can't directly evict
-    # from caches. This is a hint for future use.
+    # NO-OP: On Apple Silicon unified memory, we can't directly evict
+    # from caches. This is a placeholder for future MLX cache APIs.
     pass
 
 

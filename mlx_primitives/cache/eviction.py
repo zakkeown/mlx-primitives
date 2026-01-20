@@ -2,10 +2,25 @@
 
 This module provides eviction policies to manage memory when the KV cache
 reaches capacity. Follows patterns from model_cache.py for LRU implementation.
+
+Lock Ordering Protocol:
+    EvictionPolicy locks are the lowest priority in the cache lock hierarchy.
+    See page_table.py for the full lock ordering documentation.
+
+    IMPORTANT: EvictionPolicy methods must NOT call PageTable or BlockAllocator
+    methods while holding their internal _lock. Doing so can cause deadlocks.
+
+    Allowed call patterns:
+    - PageTable -> EvictionPolicy (OK)
+    - BlockAllocator -> EvictionPolicy (OK)
+    - EvictionPolicy -> PageTable (FORBIDDEN while holding _lock)
+    - EvictionPolicy -> BlockAllocator (FORBIDDEN while holding _lock)
 """
 
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -82,8 +97,8 @@ class EvictionPolicy(ABC):
 class LRUEvictionPolicy(EvictionPolicy):
     """Least Recently Used eviction policy.
 
-    Maintains an access order list for O(1) tracking and O(n) eviction selection.
-    Follows the pattern from model_cache.py.
+    Uses OrderedDict for O(1) access tracking and efficient eviction selection.
+    Thread-safe via internal locking.
 
     Example:
         >>> policy = LRUEvictionPolicy()
@@ -95,26 +110,26 @@ class LRUEvictionPolicy(EvictionPolicy):
 
     def __init__(self):
         """Initialize LRU policy."""
-        self._access_order: List[int] = []
-        self._access_times: Dict[int, float] = {}
+        # OrderedDict provides O(1) move_to_end and maintains insertion order
+        self._access_order: OrderedDict[int, float] = OrderedDict()
+        self._lock = threading.Lock()
 
     def on_access(self, sequence_id: int) -> None:
-        """Update access order - move to end (most recent)."""
-        if sequence_id in self._access_order:
-            self._access_order.remove(sequence_id)
-        self._access_order.append(sequence_id)
-        self._access_times[sequence_id] = time.time()
+        """Update access order - move to end (most recent). O(1) operation."""
+        with self._lock:
+            if sequence_id in self._access_order:
+                self._access_order.move_to_end(sequence_id)
+            self._access_order[sequence_id] = time.time()
 
     def on_create(self, sequence_id: int) -> None:
         """Add new sequence to tracking."""
-        self._access_order.append(sequence_id)
-        self._access_times[sequence_id] = time.time()
+        with self._lock:
+            self._access_order[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from tracking."""
-        if sequence_id in self._access_order:
-            self._access_order.remove(sequence_id)
-        self._access_times.pop(sequence_id, None)
+        with self._lock:
+            self._access_order.pop(sequence_id, None)
 
     def select_for_eviction(
         self,
@@ -124,19 +139,21 @@ class LRUEvictionPolicy(EvictionPolicy):
         """Select least recently used sequences."""
         candidate_set = set(candidates)
 
-        # Get sequences in LRU order (oldest first)
-        to_evict = []
-        for seq_id in self._access_order:
-            if seq_id in candidate_set:
-                to_evict.append(seq_id)
-                if len(to_evict) >= num_to_evict:
-                    break
+        with self._lock:
+            # OrderedDict iteration is from oldest to newest
+            to_evict = []
+            for seq_id in self._access_order:
+                if seq_id in candidate_set:
+                    to_evict.append(seq_id)
+                    if len(to_evict) >= num_to_evict:
+                        break
 
         return to_evict
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on access time (older = lower priority)."""
-        return self._access_times.get(sequence_id, 0.0)
+        with self._lock:
+            return self._access_order.get(sequence_id, 0.0)
 
 
 class FIFOEvictionPolicy(EvictionPolicy):
@@ -144,6 +161,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     Simple queue-based eviction suitable for streaming workloads
     where older sequences are naturally less relevant.
+    Thread-safe via internal locking.
 
     Example:
         >>> policy = FIFOEvictionPolicy()
@@ -154,8 +172,9 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     def __init__(self):
         """Initialize FIFO policy."""
-        self._creation_order: List[int] = []
-        self._creation_times: Dict[int, float] = {}
+        # Use OrderedDict for O(1) deletion instead of list.remove()
+        self._creation_order: OrderedDict[int, float] = OrderedDict()
+        self._lock = threading.Lock()
 
     def on_access(self, sequence_id: int) -> None:
         """FIFO ignores access - only creation order matters."""
@@ -163,14 +182,13 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     def on_create(self, sequence_id: int) -> None:
         """Add new sequence to queue."""
-        self._creation_order.append(sequence_id)
-        self._creation_times[sequence_id] = time.time()
+        with self._lock:
+            self._creation_order[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from queue."""
-        if sequence_id in self._creation_order:
-            self._creation_order.remove(sequence_id)
-        self._creation_times.pop(sequence_id, None)
+        with self._lock:
+            self._creation_order.pop(sequence_id, None)
 
     def select_for_eviction(
         self,
@@ -180,18 +198,20 @@ class FIFOEvictionPolicy(EvictionPolicy):
         """Select oldest sequences."""
         candidate_set = set(candidates)
 
-        to_evict = []
-        for seq_id in self._creation_order:
-            if seq_id in candidate_set:
-                to_evict.append(seq_id)
-                if len(to_evict) >= num_to_evict:
-                    break
+        with self._lock:
+            to_evict = []
+            for seq_id in self._creation_order:
+                if seq_id in candidate_set:
+                    to_evict.append(seq_id)
+                    if len(to_evict) >= num_to_evict:
+                        break
 
         return to_evict
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on creation time (older = lower priority)."""
-        return self._creation_times.get(sequence_id, 0.0)
+        with self._lock:
+            return self._creation_order.get(sequence_id, 0.0)
 
 
 class AttentionScoreEvictionPolicy(EvictionPolicy):
@@ -202,6 +222,11 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
     where some prefixes are more relevant than others.
 
     Attention scores decay over time to favor recent relevance.
+    Thread-safe via internal locking.
+
+    Note on decay_factor: Default 0.99 means ~99% weight on history, ~1% on new.
+    After 100 updates, the contribution of the first score is ~0.99^100 ≈ 0.37.
+    Use lower values (e.g., 0.9) for faster adaptation to recent patterns.
 
     Example:
         >>> policy = AttentionScoreEvictionPolicy(decay_factor=0.99)
@@ -214,26 +239,31 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
         """Initialize attention score policy.
 
         Args:
-            decay_factor: Decay factor for exponential moving average.
+            decay_factor: Decay factor for exponential moving average (0.0-1.0).
                 Higher values (closer to 1) give more weight to history.
+                Default 0.99 balances recent relevance with stability.
         """
         self._decay_factor = decay_factor
         self._attention_scores: Dict[int, float] = {}
         self._access_times: Dict[int, float] = {}
+        self._lock = threading.Lock()
 
     def on_access(self, sequence_id: int) -> None:
         """Update access time."""
-        self._access_times[sequence_id] = time.time()
+        with self._lock:
+            self._access_times[sequence_id] = time.time()
 
     def on_create(self, sequence_id: int) -> None:
         """Initialize tracking for new sequence."""
-        self._attention_scores[sequence_id] = 0.0
-        self._access_times[sequence_id] = time.time()
+        with self._lock:
+            self._attention_scores[sequence_id] = 0.0
+            self._access_times[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from tracking."""
-        self._attention_scores.pop(sequence_id, None)
-        self._access_times.pop(sequence_id, None)
+        with self._lock:
+            self._attention_scores.pop(sequence_id, None)
+            self._access_times.pop(sequence_id, None)
 
     def update_attention_score(self, sequence_id: int, score: float) -> None:
         """Update attention score for a sequence.
@@ -244,15 +274,16 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
             sequence_id: Sequence ID.
             score: New attention score to incorporate.
         """
-        if sequence_id not in self._attention_scores:
-            self._attention_scores[sequence_id] = 0.0
+        with self._lock:
+            if sequence_id not in self._attention_scores:
+                self._attention_scores[sequence_id] = 0.0
 
-        # Exponential moving average
-        old_score = self._attention_scores[sequence_id]
-        self._attention_scores[sequence_id] = (
-            self._decay_factor * old_score + (1 - self._decay_factor) * score
-        )
-        self._access_times[sequence_id] = time.time()
+            # Exponential moving average
+            old_score = self._attention_scores[sequence_id]
+            self._attention_scores[sequence_id] = (
+                self._decay_factor * old_score + (1 - self._decay_factor) * score
+            )
+            self._access_times[sequence_id] = time.time()
 
     def select_for_eviction(
         self,
@@ -260,18 +291,20 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
         num_to_evict: int,
     ) -> List[int]:
         """Select sequences with lowest attention scores."""
-        # Sort by attention score (lowest first)
-        scored = [
-            (seq_id, self._attention_scores.get(seq_id, 0.0))
-            for seq_id in candidates
-        ]
+        with self._lock:
+            # Sort by attention score (lowest first)
+            scored = [
+                (seq_id, self._attention_scores.get(seq_id, 0.0))
+                for seq_id in candidates
+            ]
         scored.sort(key=lambda x: x[1])
 
         return [seq_id for seq_id, _ in scored[:num_to_evict]]
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on attention score (higher = keep longer)."""
-        return self._attention_scores.get(sequence_id, 0.0)
+        with self._lock:
+            return self._attention_scores.get(sequence_id, 0.0)
 
 
 class CompositeEvictionPolicy(EvictionPolicy):
@@ -440,7 +473,7 @@ class MemoryBudgetManager:
         Returns:
             Memory statistics.
         """
-        allocator = page_table._allocator
+        allocator = page_table.allocator  # Use public property
         return CacheMemoryStats(
             total_bytes=allocator.total_memory_bytes,
             used_bytes=allocator.memory_usage_bytes,
@@ -491,7 +524,7 @@ class MemoryBudgetManager:
             Number of sequences evicted.
         """
         protected = set(protected_sequences or [])
-        allocator = page_table._allocator
+        allocator = page_table.allocator  # Use public property
         block_bytes = allocator.config.block_bytes
 
         # Get eviction candidates

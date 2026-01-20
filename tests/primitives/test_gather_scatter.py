@@ -169,10 +169,12 @@ class TestSparseMoELayer:
         moe = SparseMoELayer(num_experts, d_model, d_hidden, top_k=2)
         x = mx.random.normal((batch_size, seq_len, d_model))
 
-        output, router_logits = moe(x)
+        result = moe(x)
+        output, aux_loss, router_logits = result
 
         assert output.shape == x.shape
-        assert router_logits.shape == (batch_size * seq_len, num_experts)
+        # router_logits matches input shape for 3D input
+        assert router_logits.shape == (batch_size, seq_len, num_experts)
 
     def test_2d_input(self) -> None:
         """Test with 2D input (n_tokens, d_model)."""
@@ -184,7 +186,8 @@ class TestSparseMoELayer:
         moe = SparseMoELayer(num_experts, d_model, d_hidden, top_k=1)
         x = mx.random.normal((n_tokens, d_model))
 
-        output, router_logits = moe(x)
+        result = moe(x)
+        output, aux_loss, router_logits = result
 
         assert output.shape == x.shape
         assert router_logits.shape == (n_tokens, num_experts)
@@ -198,10 +201,10 @@ class TestSparseMoELayer:
         moe = SparseMoELayer(num_experts, d_model, d_hidden, top_k=2)
         x = mx.random.normal((10, d_model))
 
-        output1, _ = moe(x)
-        output2, _ = moe(x)
+        result1 = moe(x)
+        result2 = moe(x)
 
-        assert mx.allclose(output1, output2).item()
+        assert mx.allclose(result1.output, result2.output).item()
 
 
 class TestLoadBalancingLoss:

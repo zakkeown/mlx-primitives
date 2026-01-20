@@ -50,7 +50,6 @@ def paged_attention(
     scale: Optional[float] = None,
     block_size: int = 16,
     causal: bool = True,
-    use_metal: bool = True,
     alibi_slopes: Optional[mx.array] = None,
 ) -> mx.array:
     """Paged attention with non-contiguous KV cache.
@@ -70,8 +69,6 @@ def paged_attention(
         scale: Attention scale. Defaults to 1/sqrt(head_dim).
         block_size: Tokens per block.
         causal: Apply causal masking.
-        use_metal: Use Metal kernel if available. Currently not implemented;
-            parameter accepted for API consistency with other attention functions.
         alibi_slopes: Optional ALiBi slopes of shape (num_heads,).
             When provided, adds position-dependent bias: slope * (kv_pos - q_pos).
             Use get_alibi_slopes(num_heads) to compute standard ALiBi slopes.
@@ -118,10 +115,11 @@ def _paged_attention_decode(
     block_size: int,
     alibi_slopes: Optional[mx.array] = None,
 ) -> mx.array:
-    """Optimized paged attention for decode (single query token).
+    """Vectorized paged attention for decode (single query token).
 
-    Uses online softmax to process blocks one at a time, maintaining
-    numerical stability without materializing the full attention matrix.
+    Gathers all KV blocks at once and computes attention in a single pass,
+    eliminating Python loop overhead. For decode with seq_q=1, the attention
+    matrix is (batch, heads, context_len) which fits in memory.
 
     Args:
         alibi_slopes: Optional ALiBi slopes (num_heads,). When provided,
@@ -129,151 +127,82 @@ def _paged_attention_decode(
     """
     batch_size, _, num_heads, head_dim = q.shape
     max_blocks = block_tables.shape[1]
+    max_context = max_blocks * block_size
 
     # Squeeze query: (batch, num_heads, head_dim)
     q = q.squeeze(1)
 
-    # Initialize online softmax state per batch/head
-    # max_score: running maximum for numerical stability
-    # sum_exp: running sum of exp(score - max)
-    # output: running weighted sum
-    max_score = mx.full((batch_size, num_heads), float("-inf"))
-    sum_exp = mx.zeros((batch_size, num_heads))
-    output = mx.zeros((batch_size, num_heads, head_dim))
+    # Vectorized block gathering (same approach as prefill):
+    # Replace invalid block IDs (-1) with 0 for safe gathering, mask later
+    safe_block_tables = mx.maximum(block_tables, 0)  # (batch, max_blocks)
 
-    # For decode, query position is context_lens (position of the new token)
-    # Shape: (batch,)
-    q_positions = context_lens
+    # Gather all blocks at once
+    # k_pool: (num_blocks, block_size, num_heads, head_dim)
+    # Result: (batch, max_blocks, block_size, num_heads, head_dim)
+    k_gathered = k_pool[safe_block_tables]
+    v_gathered = v_pool[safe_block_tables]
 
-    # Process each block position
-    for block_idx in range(max_blocks):
-        # Get block IDs for this position: (batch,)
-        block_ids = block_tables[:, block_idx]
+    # Reshape to (batch, max_context, num_heads, head_dim)
+    k = k_gathered.reshape(batch_size, max_context, num_heads, head_dim)
+    v = v_gathered.reshape(batch_size, max_context, num_heads, head_dim)
 
-        # Create mask for valid blocks
-        valid_mask = block_ids >= 0  # (batch,)
+    # Transpose for attention computation
+    # k: (batch, max_context, num_heads, head_dim) -> (batch, num_heads, head_dim, max_context)
+    k_t = mx.transpose(k, (0, 2, 3, 1))
+    # v: (batch, max_context, num_heads, head_dim) -> (batch, num_heads, max_context, head_dim)
+    v_t = mx.transpose(v, (0, 2, 1, 3))
 
-        # Skip if no valid blocks at this position
-        if not mx.any(valid_mask):
-            continue
+    # Compute attention scores: q @ k^T
+    # q: (batch, num_heads, head_dim) -> (batch, num_heads, 1, head_dim)
+    # k_t: (batch, num_heads, head_dim, max_context)
+    # scores: (batch, num_heads, 1, max_context) -> squeeze -> (batch, num_heads, max_context)
+    q_expanded = q[:, :, None, :]
+    scores = (q_expanded @ k_t).squeeze(2) * scale  # (batch, num_heads, max_context)
 
-        # Calculate tokens in this block
-        # For most blocks: block_size tokens
-        # For last block: context_lens % block_size (or block_size if exact multiple)
-        block_start = block_idx * block_size
-        block_end = mx.minimum(
-            mx.array(block_start + block_size), context_lens
-        )  # (batch,)
-        tokens_in_block = mx.maximum(block_end - block_start, mx.array(0))  # (batch,)
+    # Apply ALiBi bias if provided
+    if alibi_slopes is not None:
+        # For decode, query position is context_lens (position of the new token)
+        q_positions = context_lens  # (batch,)
+        kv_positions = mx.arange(max_context)  # (max_context,)
 
-        # Gather K, V for valid blocks
-        # k_pool shape: (num_blocks, block_size, num_heads, head_dim)
-        # We need: (batch, block_size, num_heads, head_dim)
+        # Position difference: kv_pos - q_pos
+        # q_positions: (batch,) -> (batch, 1, 1)
+        # kv_positions: (max_context,) -> (1, 1, max_context)
+        # Result: (batch, 1, max_context)
+        pos_diff = kv_positions[None, None, :] - q_positions[:, None, None]
 
-        # Use valid block_ids for gathering (replace -1 with 0 for gather, mask later)
-        safe_block_ids = mx.where(valid_mask, block_ids, mx.zeros_like(block_ids))
+        # ALiBi bias: slopes[head] * pos_diff
+        # slopes: (num_heads,) -> (1, num_heads, 1)
+        # Result: (batch, num_heads, max_context)
+        alibi_bias = alibi_slopes[None, :, None] * pos_diff.astype(mx.float32)
+        scores = scores + alibi_bias
 
-        # Gather blocks: (batch, block_size, num_heads, head_dim)
-        k_block = k_pool[safe_block_ids]
-        v_block = v_pool[safe_block_ids]
+    # Create combined mask:
+    # 1. Padding mask: positions < context_lens (valid cached tokens)
+    # 2. Block validity mask: block_tables >= 0 (valid blocks)
 
-        # Compute attention scores: q @ k^T
-        # q: (batch, num_heads, head_dim)
-        # k_block: (batch, block_size, num_heads, head_dim)
-        # scores: (batch, num_heads, block_size)
+    positions = mx.arange(max_context)[None, None, :]  # (1, 1, max_context)
+    padding_mask = positions < context_lens[:, None, None]  # (batch, 1, max_context)
 
-        # Transpose k_block for matmul: (batch, num_heads, head_dim, block_size)
-        k_block_t = mx.transpose(k_block, (0, 2, 3, 1))
+    # Block validity: map each position to its block and check validity
+    block_indices_1d = mx.arange(max_context) // block_size  # (max_context,)
+    block_validity = mx.take(block_tables >= 0, block_indices_1d, axis=1)  # (batch, max_context)
+    block_validity = block_validity[:, None, :]  # (batch, 1, max_context)
 
-        # q expanded: (batch, num_heads, 1, head_dim)
-        q_expanded = q[:, :, None, :]
+    # Combined mask
+    combined_mask = padding_mask & block_validity
 
-        # scores: (batch, num_heads, 1, block_size) -> squeeze -> (batch, num_heads, block_size)
-        scores = (q_expanded @ k_block_t).squeeze(2) * scale
+    # Apply mask: invalid positions get -inf
+    scores = mx.where(combined_mask, scores, mx.array(float("-inf")))
 
-        # Apply ALiBi bias if provided
-        if alibi_slopes is not None:
-            # KV positions for this block: block_start + [0, 1, ..., block_size-1]
-            kv_positions = mx.arange(block_size) + block_start  # (block_size,)
+    # Softmax and weighted sum
+    attn_weights = mx.softmax(scores, axis=-1)  # (batch, num_heads, max_context)
 
-            # Position difference: kv_pos - q_pos
-            # q_positions: (batch,) -> (batch, 1, 1)
-            # kv_positions: (block_size,) -> (1, 1, block_size)
-            # Result: (batch, 1, block_size)
-            pos_diff = kv_positions[None, None, :] - q_positions[:, None, None]
-
-            # ALiBi bias: slopes[head] * pos_diff
-            # slopes: (num_heads,) -> (1, num_heads, 1)
-            # pos_diff: (batch, 1, block_size)
-            # Result: (batch, num_heads, block_size)
-            alibi_bias = alibi_slopes[None, :, None] * pos_diff.astype(mx.float32)
-            scores = scores + alibi_bias
-
-        # Create position mask within block
-        positions = mx.arange(block_size)[None, None, :]  # (1, 1, block_size)
-        position_mask = positions < tokens_in_block[:, None, None]  # (batch, 1, block_size)
-
-        # Apply mask: invalid positions get -inf
-        scores = mx.where(position_mask, scores, mx.array(float("-inf")))
-
-        # Also mask invalid blocks entirely
-        block_mask = valid_mask[:, None, None]  # (batch, 1, 1)
-        scores = mx.where(block_mask, scores, mx.array(float("-inf")))
-
-        # Online softmax update
-        # Find max in this block
-        block_max = mx.max(scores, axis=-1)  # (batch, num_heads)
-
-        # New running max
-        new_max = mx.maximum(max_score, block_max)
-
-        # Rescale old accumulator
-        # Handle -inf - (-inf) = NaN by using where with a safe value
-        # When max_score is -inf (first valid block), old_scale should be 0
-        is_first_valid = max_score == float("-inf")
-        old_scale = mx.where(
-            is_first_valid,
-            mx.zeros_like(max_score),
-            mx.exp(max_score - new_max)
-        )
-        new_scale = mx.where(
-            block_max == float("-inf"),
-            mx.zeros_like(block_max),
-            mx.exp(block_max - new_max)
-        )
-
-        # Compute softmax for this block (relative to block max)
-        # Guard against exp(-inf - (-inf)) = exp(NaN)
-        score_diff = mx.where(
-            block_max[:, :, None] == float("-inf"),
-            mx.zeros_like(scores),
-            scores - block_max[:, :, None]
-        )
-        exp_scores = mx.exp(score_diff)  # (batch, num_heads, block_size)
-        block_sum = mx.sum(exp_scores, axis=-1)  # (batch, num_heads)
-
-        # Update running sum
-        sum_exp = old_scale * sum_exp + new_scale * block_sum
-
-        # Compute weighted values for this block
-        # v_block: (batch, block_size, num_heads, head_dim)
-        # Transpose to (batch, num_heads, block_size, head_dim)
-        v_block_t = mx.transpose(v_block, (0, 2, 1, 3))
-
-        # exp_scores: (batch, num_heads, block_size) -> (batch, num_heads, 1, block_size)
-        weights = exp_scores[:, :, None, :]
-
-        # weighted_v: (batch, num_heads, 1, head_dim) -> squeeze
-        weighted_v = (weights @ v_block_t).squeeze(2)  # (batch, num_heads, head_dim)
-
-        # Update output accumulator
-        output = old_scale[:, :, None] * output + new_scale[:, :, None] * weighted_v
-
-        # Update max score
-        max_score = new_max
-
-    # Normalize by sum_exp
-    output = output / (sum_exp[:, :, None] + METAL_SOFTMAX_EPSILON)
+    # Output: attn_weights @ v
+    # attn_weights: (batch, num_heads, max_context) -> (batch, num_heads, 1, max_context)
+    # v_t: (batch, num_heads, max_context, head_dim)
+    # output: (batch, num_heads, 1, head_dim) -> squeeze -> (batch, num_heads, head_dim)
+    output = (attn_weights[:, :, None, :] @ v_t).squeeze(2)
 
     # Reshape to (batch, 1, num_heads, head_dim)
     return output[:, None, :, :]
@@ -375,10 +304,13 @@ def _paged_attention_prefill(
     scores = mx.where(combined_mask, scores, mx.array(float("-inf")))
 
     if causal:
-        # For prefill with cached KV, causal mask allows query to attend
-        # to all cached positions (they came before the query)
-        # This is the typical case for append-style caching
-        pass  # No additional masking needed - all cached KV is "before" query
+        # Apply causal mask: query position i can only attend to positions 0..i
+        # This is standard for prompt prefill where q_pos and kv_pos are aligned
+        q_positions = mx.arange(seq_q)[:, None]  # (seq_q, 1)
+        kv_positions = mx.arange(max_context)[None, :]  # (1, max_context)
+        causal_mask = kv_positions <= q_positions  # (seq_q, max_context)
+        causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq_q, max_context)
+        scores = mx.where(causal_mask, scores, mx.array(float("-inf")))
 
     # Softmax and weighted sum
     attn_weights = mx.softmax(scores, axis=-1)
@@ -399,7 +331,6 @@ def paged_attention_with_bias(
     scale: Optional[float] = None,
     block_size: int = 16,
     causal: bool = True,
-    use_metal: bool = True,
 ) -> mx.array:
     """Paged attention with optional attention bias or ALiBi position encoding.
 
@@ -422,8 +353,6 @@ def paged_attention_with_bias(
         scale: Attention scale. Defaults to 1/sqrt(head_dim).
         block_size: Tokens per block.
         causal: Apply causal masking.
-        use_metal: Use Metal kernel if available. Currently not implemented;
-            parameter accepted for API consistency with other attention functions.
 
     Returns:
         Output tensor same shape as q.
@@ -450,7 +379,7 @@ def paged_attention_with_bias(
         )
 
     return paged_attention(
-        q, k_pool, v_pool, block_tables, context_lens, scale, block_size, causal, use_metal,
+        q, k_pool, v_pool, block_tables, context_lens, scale, block_size, causal,
         alibi_slopes=alibi_slopes
     )
 
@@ -464,6 +393,9 @@ def create_block_table_from_lengths(
 
     Assigns sequential block IDs to each sequence.
 
+    Note: This function is intended for testing/setup, not for hot paths.
+    It uses tensor operations to avoid GPU→CPU sync where possible.
+
     Args:
         sequence_lengths: Lengths of each sequence (batch,).
         block_size: Tokens per block.
@@ -473,21 +405,36 @@ def create_block_table_from_lengths(
         Block tables (batch, max_blocks) with -1 padding.
     """
     batch_size = sequence_lengths.shape[0]
-    lengths_list: List[int] = [int(x) for x in sequence_lengths.tolist()]
 
+    # Calculate blocks per sequence without Python iteration
+    # blocks_per_seq = ceil(length / block_size)
+    blocks_per_seq = (sequence_lengths + block_size - 1) // block_size
+
+    # Evaluate to get max_blocks if not provided (requires sync)
     if max_blocks is None:
-        max_blocks = max((l + block_size - 1) // block_size for l in lengths_list)
+        max_blocks_val = int(mx.max(blocks_per_seq).item())
+    else:
+        max_blocks_val = max_blocks
 
-    block_tables: List[List[int]] = []
-    next_block_id = 0
+    # Build block tables using vectorized operations where possible
+    # cumsum gives us the starting block ID for each sequence
+    cum_blocks = mx.concatenate([mx.array([0]), mx.cumsum(blocks_per_seq)[:-1]])
 
-    for length in lengths_list:
-        num_blocks = (length + block_size - 1) // block_size
-        blocks: List[int] = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
+    # Create block indices for each position
+    # For each sequence i and block position j, block_id = cum_blocks[i] + j
+    # if j < blocks_per_seq[i], else -1
 
-        # Pad to max_blocks
-        blocks += [-1] * (max_blocks - len(blocks))
-        block_tables.append(blocks)
+    # Create position indices: (1, max_blocks)
+    positions = mx.arange(max_blocks_val)[None, :]
 
-    return mx.array(block_tables, dtype=mx.int32)
+    # Create mask: (batch, max_blocks) - True where position < blocks_per_seq
+    valid_mask = positions < blocks_per_seq[:, None]
+
+    # Create block IDs: (batch, max_blocks)
+    # block_id = cum_blocks[batch_idx] + position
+    block_ids = cum_blocks[:, None] + positions
+
+    # Apply mask: -1 for invalid positions
+    block_tables = mx.where(valid_mask, block_ids, mx.array(-1))
+
+    return block_tables.astype(mx.int32)

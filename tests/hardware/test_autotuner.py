@@ -261,11 +261,18 @@ class TestAutoTuner:
         """Test tune_attention convenience method."""
         tuner = AutoTuner(warmup_iters=1, benchmark_iters=2)
 
+        def mock_attention_kernel(q, k, v, config=None):
+            # Simple scaled dot-product attention mock
+            scale = 1.0 / (q.shape[-1] ** 0.5)
+            attn = mx.softmax(q @ k.swapaxes(-2, -1) * scale, axis=-1)
+            return attn @ v
+
         config = tuner.tune_attention(
             batch_size=1,
             seq_len=128,
             num_heads=4,
             head_dim=32,
+            kernel_fn=mock_attention_kernel,
             causal=True,
         )
 
@@ -277,11 +284,18 @@ class TestAutoTuner:
         """Test tune_attention with non-causal attention."""
         tuner = AutoTuner(warmup_iters=1, benchmark_iters=2)
 
+        def mock_attention_kernel(q, k, v, config=None):
+            # Simple scaled dot-product attention mock
+            scale = 1.0 / (q.shape[-1] ** 0.5)
+            attn = mx.softmax(q @ k.swapaxes(-2, -1) * scale, axis=-1)
+            return attn @ v
+
         config = tuner.tune_attention(
             batch_size=2,
             seq_len=64,
             num_heads=8,
             head_dim=64,
+            kernel_fn=mock_attention_kernel,
             causal=False,
         )
 

@@ -25,7 +25,7 @@ EPSILON_NORM = 1e-5
 # GELU approximation constants
 # From: "Gaussian Error Linear Units (GELUs)" - Hendrycks & Gimpel, 2016
 # GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-GELU_SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/π)
+GELU_SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)  # sqrt(2/π) ≈ 0.7978845608
 GELU_TANH_COEFF = 0.044715  # Empirical coefficient for tanh approximation
 
 # Quick GELU constant (less accurate but faster)
@@ -72,10 +72,11 @@ QUANT_INT8_MIN = -128
 QUANT_INT8_MAX = 127
 QUANT_INT8_RANGE = 255
 
-# INT4 quantization range
-QUANT_INT4_MIN = 0
-QUANT_INT4_MAX = 15
-QUANT_INT4_RANGE = 15
+# UINT4 quantization range (unsigned 4-bit, common in LLM quantization)
+# Note: Using unsigned 0-15 range, not signed -8 to 7
+QUANT_UINT4_MIN = 0
+QUANT_UINT4_MAX = 15
+QUANT_UINT4_RANGE = 15
 
 
 # =============================================================================
@@ -85,10 +86,13 @@ QUANT_INT4_RANGE = 15
 # Default L2 cache size assumption (MB) - conservative default for base chips
 # M1/M2/M3 base: 8MB, Pro: 24MB, Max: 48MB, Ultra: 96MB
 # Hardware detection in hardware/detection.py provides accurate values;
-# this is only used as fallback. Override via MLX_PRIMITIVES_L2_CACHE_MB env var.
+# this is only used as fallback.
 DEFAULT_L2_CACHE_MB = 8.0
 
 # Minimum sequence length for Metal kernel dispatch
 # Lowered from 32 to 8 to use Metal for more SSM workloads
-# Override via MLX_PRIMITIVES_MIN_SEQ_FOR_METAL env var
 MIN_SEQ_FOR_METAL = 8
+
+# Sequence length threshold for SSM sequential fallback warning
+# When using sequential SSM scan, warn if sequence length exceeds this
+SSM_SEQUENTIAL_WARNING_THRESHOLD = 256

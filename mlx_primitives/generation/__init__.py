@@ -45,13 +45,14 @@ from mlx_primitives.generation.batch_manager import (
 from mlx_primitives.generation.samplers import (
     TokenSampler,
     apply_frequency_penalty,
+    apply_frequency_penalty_batch,
     apply_presence_penalty,
+    apply_presence_penalty_batch,
     apply_repetition_penalty,
     apply_repetition_penalty_batch,
     apply_temperature,
     apply_top_k,
     apply_top_p,
-    sample_beam,
     sample_greedy,
     sample_multinomial,
 )
@@ -92,10 +93,11 @@ __all__ = [
     "apply_repetition_penalty",
     "apply_repetition_penalty_batch",
     "apply_presence_penalty",
+    "apply_presence_penalty_batch",
     "apply_frequency_penalty",
+    "apply_frequency_penalty_batch",
     "sample_greedy",
     "sample_multinomial",
-    "sample_beam",
     # Scheduling
     "RequestScheduler",
     "PriorityScheduler",

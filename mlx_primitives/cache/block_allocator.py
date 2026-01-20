@@ -4,6 +4,7 @@ This module provides efficient fixed-size block allocation for KV storage,
 enabling paged attention with non-contiguous memory and zero fragmentation.
 """
 
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
@@ -36,13 +37,38 @@ class BlockConfig:
     @property
     def block_bytes(self) -> int:
         """Memory per block (K + V combined)."""
-        dtype_size = 2 if self.dtype in (mx.float16, mx.bfloat16) else 4
+        dtype_size = _get_dtype_size(self.dtype)
         return 2 * self.block_size * self.num_heads * self.head_dim * dtype_size
 
     @property
     def kv_shape(self) -> Tuple[int, int, int]:
         """Shape of a single K or V block: (block_size, num_heads, head_dim)."""
         return (self.block_size, self.num_heads, self.head_dim)
+
+
+def _get_dtype_size(dtype: mx.Dtype) -> int:
+    """Get size in bytes for a given dtype.
+
+    Args:
+        dtype: MLX data type.
+
+    Returns:
+        Size in bytes per element.
+    """
+    dtype_sizes = {
+        mx.float16: 2,
+        mx.bfloat16: 2,
+        mx.float32: 4,
+        mx.int8: 1,
+        mx.uint8: 1,
+        mx.int16: 2,
+        mx.uint16: 2,
+        mx.int32: 4,
+        mx.uint32: 4,
+        mx.int64: 8,
+        mx.uint64: 8,
+    }
+    return dtype_sizes.get(dtype, 4)  # Default to 4 bytes if unknown
 
 
 class BlockAllocator:
@@ -52,6 +78,8 @@ class BlockAllocator:
     - O(1) allocation and deallocation
     - Zero fragmentation
     - Copy-on-write support for prefix sharing
+
+    Thread-safe via internal locking.
 
     Design Considerations for Apple Silicon:
     - Blocks are pre-allocated contiguously for cache efficiency
@@ -82,6 +110,7 @@ class BlockAllocator:
         self._config = config
         self._num_blocks = num_blocks
         self._enable_cow = enable_cow
+        self._lock = threading.RLock()  # RLock allows re-entrant calls
 
         # Pre-allocate block pools as contiguous memory
         # K blocks: (num_blocks, block_size, num_heads, head_dim)
@@ -112,17 +141,20 @@ class BlockAllocator:
     @property
     def num_free_blocks(self) -> int:
         """Number of available blocks."""
-        return len(self._free_blocks)
+        with self._lock:
+            return len(self._free_blocks)
 
     @property
     def num_allocated_blocks(self) -> int:
         """Number of blocks currently in use."""
-        return len(self._allocated_blocks)
+        with self._lock:
+            return len(self._allocated_blocks)
 
     @property
     def memory_usage_bytes(self) -> int:
         """Total memory used by allocated blocks."""
-        return self.num_allocated_blocks * self._config.block_bytes
+        with self._lock:
+            return len(self._allocated_blocks) * self._config.block_bytes
 
     @property
     def total_memory_bytes(self) -> int:
@@ -141,19 +173,20 @@ class BlockAllocator:
         Raises:
             RuntimeError: If not enough blocks are available.
         """
-        if count > len(self._free_blocks):
-            raise RuntimeError(
-                f"Cannot allocate {count} blocks, only {len(self._free_blocks)} available"
-            )
+        with self._lock:
+            if count > len(self._free_blocks):
+                raise RuntimeError(
+                    f"Cannot allocate {count} blocks, only {len(self._free_blocks)} available"
+                )
 
-        allocated = []
-        for _ in range(count):
-            block_id = self._free_blocks.pop()
-            self._allocated_blocks.add(block_id)
-            self._ref_counts[block_id] = 1
-            allocated.append(block_id)
+            allocated = []
+            for _ in range(count):
+                block_id = self._free_blocks.pop()
+                self._allocated_blocks.add(block_id)
+                self._ref_counts[block_id] = 1
+                allocated.append(block_id)
 
-        return allocated
+            return allocated
 
     def _validate_block_id(self, block_id: int, context: str = "") -> None:
         """Validate that a block_id is within bounds.
@@ -182,18 +215,19 @@ class BlockAllocator:
         Raises:
             ValueError: If any block_id is out of bounds.
         """
-        for block_id in block_ids:
-            self._validate_block_id(block_id, "free")
+        with self._lock:
+            for block_id in block_ids:
+                self._validate_block_id(block_id, "free")
 
-            if block_id not in self._allocated_blocks:
-                continue
+                if block_id not in self._allocated_blocks:
+                    continue
 
-            self._ref_counts[block_id] -= 1
+                self._ref_counts[block_id] -= 1
 
-            if self._ref_counts[block_id] <= 0:
-                self._allocated_blocks.discard(block_id)
-                self._free_blocks.add(block_id)
-                self._ref_counts[block_id] = 0
+                if self._ref_counts[block_id] <= 0:
+                    self._allocated_blocks.discard(block_id)
+                    self._free_blocks.add(block_id)
+                    self._ref_counts[block_id] = 0
 
     def increment_ref(self, block_id: int) -> None:
         """Increment reference count for a block (for COW sharing).
@@ -204,9 +238,10 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        self._validate_block_id(block_id, "increment_ref")
-        if block_id in self._allocated_blocks:
-            self._ref_counts[block_id] += 1
+        with self._lock:
+            self._validate_block_id(block_id, "increment_ref")
+            if block_id in self._allocated_blocks:
+                self._ref_counts[block_id] += 1
 
     def get_ref_count(self, block_id: int) -> int:
         """Get reference count for a block.
@@ -220,8 +255,9 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        self._validate_block_id(block_id, "get_ref_count")
-        return self._ref_counts[block_id]
+        with self._lock:
+            self._validate_block_id(block_id, "get_ref_count")
+            return self._ref_counts[block_id]
 
     def copy_on_write(self, block_id: int) -> int:
         """Create a copy of a block for modification.
@@ -239,27 +275,28 @@ class BlockAllocator:
             ValueError: If block_id is out of bounds.
             RuntimeError: If no blocks available for copy.
         """
-        self._validate_block_id(block_id, "copy_on_write")
+        with self._lock:
+            self._validate_block_id(block_id, "copy_on_write")
 
-        if not self._enable_cow:
-            return block_id
+            if not self._enable_cow:
+                return block_id
 
-        if self._ref_counts[block_id] <= 1:
-            # Safe to modify in place
-            return block_id
+            if self._ref_counts[block_id] <= 1:
+                # Safe to modify in place
+                return block_id
 
-        # Need to copy
-        new_blocks = self.allocate(1)
-        new_block_id = new_blocks[0]
+            # Need to copy - allocate is already thread-safe with RLock
+            new_blocks = self.allocate(1)
+            new_block_id = new_blocks[0]
 
-        # Copy data
-        self._k_pool[new_block_id] = self._k_pool[block_id]
-        self._v_pool[new_block_id] = self._v_pool[block_id]
+            # Copy data
+            self._k_pool[new_block_id] = self._k_pool[block_id]
+            self._v_pool[new_block_id] = self._v_pool[block_id]
 
-        # Decrement ref count on original
-        self._ref_counts[block_id] -= 1
+            # Decrement ref count on original
+            self._ref_counts[block_id] -= 1
 
-        return new_block_id
+            return new_block_id
 
     def get_block_data(self, block_id: int) -> Tuple[mx.array, mx.array]:
         """Get K and V data for a block as views (zero-copy).
@@ -273,8 +310,9 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        self._validate_block_id(block_id, "get_block_data")
-        return self._k_pool[block_id], self._v_pool[block_id]
+        with self._lock:
+            self._validate_block_id(block_id, "get_block_data")
+            return self._k_pool[block_id], self._v_pool[block_id]
 
     def set_block_data(
         self,
@@ -296,18 +334,19 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        self._validate_block_id(block_id, "set_block_data")
-        if length is None:
-            length = k.shape[0]
+        with self._lock:
+            self._validate_block_id(block_id, "set_block_data")
+            if length is None:
+                length = k.shape[0]
 
-        end_pos = start_pos + length
+            end_pos = start_pos + length
 
-        # Handle COW if needed
-        actual_block_id = self.copy_on_write(block_id) if self._enable_cow else block_id
+            # Handle COW if needed - copy_on_write is re-entrant with RLock
+            actual_block_id = self.copy_on_write(block_id) if self._enable_cow else block_id
 
-        # Update the block data using direct assignment
-        self._k_pool[actual_block_id, start_pos:end_pos] = k
-        self._v_pool[actual_block_id, start_pos:end_pos] = v
+            # Update the block data using direct assignment
+            self._k_pool[actual_block_id, start_pos:end_pos] = k
+            self._v_pool[actual_block_id, start_pos:end_pos] = v
 
     def get_pools(self) -> Tuple[mx.array, mx.array]:
         """Get the full K and V block pools.
@@ -319,9 +358,10 @@ class BlockAllocator:
 
     def clear(self) -> None:
         """Reset all blocks to free state."""
-        self._free_blocks = set(range(self._num_blocks))
-        self._allocated_blocks.clear()
-        self._ref_counts = [0] * self._num_blocks
+        with self._lock:
+            self._free_blocks = set(range(self._num_blocks))
+            self._allocated_blocks.clear()
+            self._ref_counts = [0] * self._num_blocks
 
     def get_stats(self) -> dict:
         """Get allocator statistics.
@@ -329,17 +369,18 @@ class BlockAllocator:
         Returns:
             Dictionary with allocation statistics.
         """
-        return {
-            "num_blocks": self._num_blocks,
-            "num_free": self.num_free_blocks,
-            "num_allocated": self.num_allocated_blocks,
-            "memory_used_mb": self.memory_usage_bytes / (1024 * 1024),
-            "memory_total_mb": self.total_memory_bytes / (1024 * 1024),
-            "utilization": self.num_allocated_blocks / self._num_blocks
-            if self._num_blocks > 0
-            else 0.0,
-            "cow_enabled": self._enable_cow,
-        }
+        with self._lock:
+            return {
+                "num_blocks": self._num_blocks,
+                "num_free": len(self._free_blocks),
+                "num_allocated": len(self._allocated_blocks),
+                "memory_used_mb": len(self._allocated_blocks) * self._config.block_bytes / (1024 * 1024),
+                "memory_total_mb": self.total_memory_bytes / (1024 * 1024),
+                "utilization": len(self._allocated_blocks) / self._num_blocks
+                if self._num_blocks > 0
+                else 0.0,
+                "cow_enabled": self._enable_cow,
+            }
 
 
 def get_optimal_block_size(

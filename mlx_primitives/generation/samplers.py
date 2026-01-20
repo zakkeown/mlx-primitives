@@ -78,6 +78,8 @@ class TokenSampler:
             and c.top_k == first.top_k
             and c.top_p == first.top_p
             and c.repetition_penalty == first.repetition_penalty
+            and c.presence_penalty == first.presence_penalty
+            and c.frequency_penalty == first.frequency_penalty
             for c in configs[1:]
         )
 
@@ -92,6 +94,18 @@ class TokenSampler:
         if config.repetition_penalty != 1.0 and generated_tokens:
             logits = apply_repetition_penalty_batch(
                 logits, generated_tokens, config.repetition_penalty
+            )
+
+        # Apply presence penalty (batched version)
+        if config.presence_penalty != 0.0 and generated_tokens:
+            logits = apply_presence_penalty_batch(
+                logits, generated_tokens, config.presence_penalty
+            )
+
+        # Apply frequency penalty (batched version)
+        if config.frequency_penalty != 0.0 and generated_tokens:
+            logits = apply_frequency_penalty_batch(
+                logits, generated_tokens, config.frequency_penalty
             )
 
         # Apply temperature
@@ -125,13 +139,24 @@ class TokenSampler:
         for i in range(batch_size):
             config = configs[i]
             sample_logits = logits[i : i + 1]  # Keep batch dim
+            gen_toks = [generated_tokens[i]] if generated_tokens and i < len(generated_tokens) else [[]]
 
             # Apply repetition penalty
-            if config.repetition_penalty != 1.0 and generated_tokens:
+            if config.repetition_penalty != 1.0 and gen_toks[0]:
                 sample_logits = apply_repetition_penalty_batch(
-                    sample_logits,
-                    [generated_tokens[i]] if i < len(generated_tokens) else [[]],
-                    config.repetition_penalty,
+                    sample_logits, gen_toks, config.repetition_penalty,
+                )
+
+            # Apply presence penalty
+            if config.presence_penalty != 0.0 and gen_toks[0]:
+                sample_logits = apply_presence_penalty_batch(
+                    sample_logits, gen_toks, config.presence_penalty,
+                )
+
+            # Apply frequency penalty
+            if config.frequency_penalty != 0.0 and gen_toks[0]:
+                sample_logits = apply_frequency_penalty_batch(
+                    sample_logits, gen_toks, config.frequency_penalty,
                 )
 
             # Apply temperature
@@ -295,6 +320,7 @@ def apply_repetition_penalty(
     """Apply repetition penalty to logits.
 
     Reduces probability of tokens that have already been generated.
+    Uses vectorized MLX operations for efficiency.
 
     Args:
         logits: Input logits (batch, vocab_size) or (vocab_size,).
@@ -312,20 +338,28 @@ def apply_repetition_penalty(
     if was_1d:
         logits = logits[None, :]
 
-    result = logits
-    unique_tokens = list(set(token_ids))
-    for token_id in unique_tokens:
-        if 0 <= token_id < logits.shape[-1]:
-            # Apply penalty: divide positive logits, multiply negative
-            token_logit = float(logits[0, token_id])
-            if token_logit > 0:
-                new_val = token_logit / penalty
-            else:
-                new_val = token_logit * penalty
-            # Use index assignment
-            result_np = result.tolist()
-            result_np[0][token_id] = new_val
-            result = mx.array(result_np, dtype=logits.dtype)
+    vocab_size = logits.shape[-1]
+
+    # Get unique tokens within vocab range
+    unique_tokens = [t for t in set(token_ids) if 0 <= t < vocab_size]
+    if not unique_tokens:
+        return logits.squeeze(0) if was_1d else logits
+
+    # Create mask for tokens to penalize (vocab_size,)
+    token_indices = mx.array(unique_tokens, dtype=mx.int32)
+    penalty_mask = mx.zeros((vocab_size,), dtype=mx.bool_)
+    penalty_mask = penalty_mask.at[token_indices].add(True)
+
+    # Compute what the row should be after penalty
+    # Positive logits: divide by penalty
+    # Negative logits: multiply by penalty
+    positive_row = logits[0] / penalty
+    negative_row = logits[0] * penalty
+    penalized_row = mx.where(logits[0] > 0, positive_row, negative_row)
+
+    # Apply only at penalized positions
+    new_row = mx.where(penalty_mask, penalized_row, logits[0])
+    result = new_row[None, :]
 
     if was_1d:
         result = result.squeeze(0)
@@ -340,6 +374,8 @@ def apply_repetition_penalty_batch(
 ) -> mx.array:
     """Apply repetition penalty to batched logits.
 
+    Uses vectorized MLX operations for efficiency.
+
     Args:
         logits: Input logits (batch, vocab_size).
         generated_tokens: Previously generated tokens for each batch.
@@ -352,20 +388,32 @@ def apply_repetition_penalty_batch(
         return logits
 
     batch_size, vocab_size = logits.shape
-    result_np = logits.tolist()
+
+    # Build a mask of shape (batch_size, vocab_size) indicating which tokens to penalize
+    # For each batch element, mark the tokens that appear in its generated_tokens
+    penalty_mask = mx.zeros((batch_size, vocab_size), dtype=mx.bool_)
 
     for i in range(batch_size):
         if i < len(generated_tokens) and generated_tokens[i]:
-            unique_tokens = list(set(generated_tokens[i]))
-            for token_id in unique_tokens:
-                if 0 <= token_id < vocab_size:
-                    token_logit = result_np[i][token_id]
-                    if token_logit > 0:
-                        result_np[i][token_id] = token_logit / penalty
-                    else:
-                        result_np[i][token_id] = token_logit * penalty
+            unique_tokens = [t for t in set(generated_tokens[i]) if 0 <= t < vocab_size]
+            if unique_tokens:
+                token_indices = mx.array(unique_tokens, dtype=mx.int32)
+                # Set mask to True at these token positions for batch element i
+                row_mask = mx.zeros((vocab_size,), dtype=mx.bool_)
+                row_mask = row_mask.at[token_indices].add(True)
+                penalty_mask = penalty_mask.at[i].add(row_mask)
 
-    return mx.array(result_np, dtype=logits.dtype)
+    # Compute penalized logits for all positions
+    # Positive logits: divide by penalty
+    # Negative logits: multiply by penalty
+    penalized_positive = logits / penalty
+    penalized_negative = logits * penalty
+    penalized_logits = mx.where(logits > 0, penalized_positive, penalized_negative)
+
+    # Apply penalty only where mask is True
+    result = mx.where(penalty_mask, penalized_logits, logits)
+
+    return result
 
 
 def apply_presence_penalty(
@@ -388,13 +436,58 @@ def apply_presence_penalty(
     if penalty == 0.0 or not token_ids:
         return logits
 
-    result_np = logits.tolist()
-    unique_tokens = list(set(token_ids))
-    for token_id in unique_tokens:
-        if 0 <= token_id < len(result_np):
-            result_np[token_id] = result_np[token_id] - penalty
+    vocab_size = logits.shape[-1]
+    unique_tokens = [t for t in set(token_ids) if 0 <= t < vocab_size]
+    if not unique_tokens:
+        return logits
 
-    return mx.array(result_np, dtype=logits.dtype)
+    # Create mask for tokens to penalize
+    token_indices = mx.array(unique_tokens, dtype=mx.int32)
+    penalty_mask = mx.zeros((vocab_size,), dtype=mx.bool_)
+    penalty_mask = penalty_mask.at[token_indices].add(True)
+
+    # Subtract penalty where mask is True
+    penalty_values = mx.where(penalty_mask, mx.array(penalty), mx.array(0.0))
+    return logits - penalty_values
+
+
+def apply_presence_penalty_batch(
+    logits: mx.array,
+    generated_tokens: List[List[int]],
+    penalty: float,
+) -> mx.array:
+    """Apply presence penalty to batched logits.
+
+    Uses vectorized MLX operations for efficiency.
+
+    Args:
+        logits: Input logits (batch, vocab_size).
+        generated_tokens: Previously generated tokens for each batch.
+        penalty: Penalty to subtract.
+
+    Returns:
+        Penalized logits.
+    """
+    if penalty == 0.0:
+        return logits
+
+    batch_size, vocab_size = logits.shape
+
+    # Build a mask of shape (batch_size, vocab_size) indicating which tokens to penalize
+    penalty_mask = mx.zeros((batch_size, vocab_size), dtype=mx.bool_)
+
+    for i in range(batch_size):
+        if i < len(generated_tokens) and generated_tokens[i]:
+            unique_tokens = [t for t in set(generated_tokens[i]) if 0 <= t < vocab_size]
+            if unique_tokens:
+                token_indices = mx.array(unique_tokens, dtype=mx.int32)
+                row_mask = mx.zeros((vocab_size,), dtype=mx.bool_)
+                row_mask = row_mask.at[token_indices].add(True)
+                penalty_mask = penalty_mask.at[i].add(row_mask)
+
+    # Subtract penalty where mask is True
+    penalty_values = mx.where(penalty_mask, mx.array(penalty), mx.array(0.0))
+    return logits - penalty_values
 
 
 def apply_frequency_penalty(
@@ -417,18 +510,67 @@ def apply_frequency_penalty(
     if penalty == 0.0 or not token_ids:
         return logits
 
-    result_np = logits.tolist()
+    vocab_size = logits.shape[-1]
 
     # Count frequencies
     freq: Dict[int, int] = {}
     for token_id in token_ids:
-        freq[token_id] = freq.get(token_id, 0) + 1
+        if 0 <= token_id < vocab_size:
+            freq[token_id] = freq.get(token_id, 0) + 1
 
-    for token_id, count in freq.items():
-        if 0 <= token_id < len(result_np):
-            result_np[token_id] = result_np[token_id] - penalty * count
+    if not freq:
+        return logits
 
-    return mx.array(result_np, dtype=logits.dtype)
+    # Create frequency penalty array
+    freq_penalties = mx.zeros((vocab_size,), dtype=logits.dtype)
+    token_indices = mx.array(list(freq.keys()), dtype=mx.int32)
+    counts = mx.array(list(freq.values()), dtype=logits.dtype)
+    freq_penalties = freq_penalties.at[token_indices].add(counts * penalty)
+
+    return logits - freq_penalties
+
+
+def apply_frequency_penalty_batch(
+    logits: mx.array,
+    generated_tokens: List[List[int]],
+    penalty: float,
+) -> mx.array:
+    """Apply frequency penalty to batched logits.
+
+    Uses vectorized MLX operations for efficiency.
+
+    Args:
+        logits: Input logits (batch, vocab_size).
+        generated_tokens: Previously generated tokens for each batch.
+        penalty: Penalty per occurrence.
+
+    Returns:
+        Penalized logits.
+    """
+    if penalty == 0.0:
+        return logits
+
+    batch_size, vocab_size = logits.shape
+
+    # Build frequency penalty matrix of shape (batch_size, vocab_size)
+    freq_penalties = mx.zeros((batch_size, vocab_size), dtype=logits.dtype)
+
+    for i in range(batch_size):
+        if i < len(generated_tokens) and generated_tokens[i]:
+            # Count frequencies for this batch element
+            freq: Dict[int, int] = {}
+            for token_id in generated_tokens[i]:
+                if 0 <= token_id < vocab_size:
+                    freq[token_id] = freq.get(token_id, 0) + 1
+
+            if freq:
+                token_indices = mx.array(list(freq.keys()), dtype=mx.int32)
+                counts = mx.array(list(freq.values()), dtype=logits.dtype)
+                row_penalties = mx.zeros((vocab_size,), dtype=logits.dtype)
+                row_penalties = row_penalties.at[token_indices].add(counts * penalty)
+                freq_penalties = freq_penalties.at[i].add(row_penalties)
+
+    return logits - freq_penalties
 
 
 def sample_greedy(logits: mx.array) -> mx.array:
@@ -453,23 +595,3 @@ def sample_multinomial(logits: mx.array) -> mx.array:
         Token IDs (batch,).
     """
     return mx.random.categorical(logits)
-
-
-def sample_beam(
-    logits: mx.array,
-    beam_width: int,
-    length_penalty: float = 1.0,
-) -> Tuple[mx.array, mx.array]:
-    """Get top-k tokens for beam search.
-
-    Args:
-        logits: Input logits (batch * beam, vocab_size).
-        beam_width: Number of beams.
-        length_penalty: Length penalty for scoring.
-
-    Returns:
-        Tuple of (token_ids, scores) each (batch * beam, beam_width).
-    """
-    # Get top-k for each beam
-    top_k_values, top_k_indices = mx.topk(logits, k=beam_width, axis=-1)
-    return top_k_indices, top_k_values

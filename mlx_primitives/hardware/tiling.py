@@ -283,6 +283,13 @@ def dtype_to_enum(dtype) -> DataType:
         mx.int8: DataType.INT8,
     }
 
+    # Handle INT4 - MLX may use uint8 for packed int4 or have a dedicated type
+    # Check if mx.int4 exists (may not be available in all MLX versions)
+    if hasattr(mx, "int4"):
+        dtype_map[mx.int4] = DataType.INT4
+    if hasattr(mx, "uint4"):
+        dtype_map[mx.uint4] = DataType.INT4
+
     return dtype_map.get(dtype, DataType.FP32)
 
 

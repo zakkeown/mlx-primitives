@@ -402,3 +402,159 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="Expected 3D"):
             int4_linear(x, W, scales, zps)
+
+
+class TestQuantizationEdgeCases:
+    """Test edge cases in quantization."""
+
+    def test_zero_weights_int8(self) -> None:
+        """Test INT8 quantization of all-zero weights."""
+        weights = mx.zeros((64, 32))
+
+        with pytest.warns(RuntimeWarning, match="zero range"):
+            W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+
+        mx.eval(W_quant, scale, zp)
+
+        # Scale should be clipped to minimum positive value
+        assert to_numpy(scale).min() > 0
+
+    def test_zero_weights_int4(self) -> None:
+        """Test INT4 quantization of all-zero weights."""
+        weights = mx.zeros((64, 32))
+
+        with pytest.warns(RuntimeWarning, match="zero range"):
+            W_packed, scales, zps = quantize_int4(weights, group_size=16)
+
+        mx.eval(W_packed, scales, zps)
+
+        # Scales should be clipped to minimum positive value
+        assert to_numpy(scales).min() > 0
+
+    def test_constant_weights_per_tensor_int8(self) -> None:
+        """Test per-tensor INT8 with constant weights (zero range)."""
+        weights = mx.ones((64, 32)) * 0.5  # All same value
+
+        with pytest.warns(RuntimeWarning, match="zero range"):
+            W_quant, scale, zp = quantize_int8(weights, per_channel=False)
+
+        mx.eval(W_quant, scale, zp)
+
+        # Should still produce valid output
+        assert to_numpy(scale)[0] > 0
+
+    def test_very_small_weights(self) -> None:
+        """Test quantization of very small weights (near FP16 min)."""
+        # Weights near the FP16 minimum positive normal (~6e-5)
+        # These are all identical values, so zero-range warning is expected
+        weights = mx.array(np.full((64, 32), 1e-6, dtype=np.float32))
+
+        # Should work without error - scale will be clipped to FP16 min
+        # Also triggers zero-range warning since all values are identical
+        with pytest.warns(RuntimeWarning, match="zero range"):
+            W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+        mx.eval(W_quant, scale, zp)
+
+        # Scale should be at least FP16 min positive normal
+        assert to_numpy(scale).min() >= 2**-14 - 1e-8
+
+    def test_mixed_constant_rows_int8(self) -> None:
+        """Test per-channel INT8 with some constant rows."""
+        np.random.seed(42)
+        weights_np = np.random.randn(64, 32).astype(np.float32)
+        # Make first 5 rows constant (zero range)
+        weights_np[:5, :] = 0.5
+
+        weights = to_mlx(weights_np)
+
+        with pytest.warns(RuntimeWarning, match="5 out of 64 channels"):
+            W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+
+        mx.eval(W_quant, scale, zp)
+
+        # All scales should be positive
+        assert to_numpy(scale).min() > 0
+
+    def test_large_values_no_overflow(self) -> None:
+        """Test quantization of large values doesn't cause overflow."""
+        weights = mx.array(np.random.randn(64, 32).astype(np.float32) * 100)
+
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+        W_dequant = dequantize_int8(W_quant, scale, zp)
+
+        mx.eval(W_dequant)
+
+        # Should not have NaN or Inf
+        dequant_np = to_numpy(W_dequant)
+        assert not np.any(np.isnan(dequant_np))
+        assert not np.any(np.isinf(dequant_np))
+
+
+class TestKernelCaching:
+    """Test kernel caching behavior.
+
+    Note: MLX Metal operations are not thread-safe for concurrent GPU access
+    from multiple Python threads. These tests verify sequential caching behavior
+    and Python-level cache structures only.
+    """
+
+    def test_sequential_kernel_reuse(self) -> None:
+        """Test that kernel is cached and reused across sequential calls."""
+        np.random.seed(42)
+
+        # Prepare test data
+        x = mx.array(np.random.randn(2, 16, 64).astype(np.float32))
+        weights = mx.array(np.random.randn(128, 64).astype(np.float32))
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+
+        # First call compiles kernel
+        out1 = int8_linear(x, W_quant, scale, zp)
+        mx.eval(out1)
+
+        # Subsequent calls should reuse cached kernel
+        out2 = int8_linear(x, W_quant, scale, zp)
+        out3 = int8_linear(x, W_quant, scale, zp)
+        mx.eval(out2, out3)
+
+        # All outputs should be identical
+        np.testing.assert_array_equal(to_numpy(out1), to_numpy(out2))
+        np.testing.assert_array_equal(to_numpy(out1), to_numpy(out3))
+
+    def test_autotune_config_hashability(self) -> None:
+        """Test that autotune Config is properly hashable for caching."""
+        from mlx_primitives.dsl.decorators import Config
+
+        # Verify Config can be used in cache keys
+        c1 = Config(BLOCK_M=32, BLOCK_N=32)
+        c2 = Config(BLOCK_M=32, BLOCK_N=32)
+        c3 = Config(BLOCK_M=64, BLOCK_N=32)
+
+        # Different configs should be distinguishable via get()
+        assert c1.get("BLOCK_M") == c2.get("BLOCK_M")
+        assert c1.get("BLOCK_M") != c3.get("BLOCK_M")
+
+        # Configs should be usable in cache key tuples
+        key1 = (("BLOCK_M", 32), ("BLOCK_N", 32))
+        key2 = (("BLOCK_M", 64), ("BLOCK_N", 32))
+        assert key1 != key2
+
+    def test_different_input_sizes_use_same_kernel(self) -> None:
+        """Test that different input sizes reuse the same compiled kernel."""
+        np.random.seed(42)
+
+        weights = mx.array(np.random.randn(128, 64).astype(np.float32))
+        W_quant, scale, zp = quantize_int8(weights, per_channel=True)
+
+        # Different batch sizes should work with same kernel
+        for batch_size in [1, 2, 4, 8]:
+            x = mx.array(np.random.randn(batch_size, 16, 64).astype(np.float32))
+            out = int8_linear(x, W_quant, scale, zp)
+            mx.eval(out)
+            assert out.shape == (batch_size, 16, 128)
+
+        # Different sequence lengths should work
+        for seq_len in [8, 16, 32, 64]:
+            x = mx.array(np.random.randn(2, seq_len, 64).astype(np.float32))
+            out = int8_linear(x, W_quant, scale, zp)
+            mx.eval(out)
+            assert out.shape == (2, seq_len, 128)

@@ -5,9 +5,10 @@ request scheduling, batch management, model inference, and token sampling.
 """
 
 import queue
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 
@@ -42,6 +43,9 @@ class EngineConfig:
         max_batch_tokens: Maximum tokens per batch.
         max_batch_size: Maximum sequences per batch.
         enable_continuous_batching: Allow adding requests mid-generation.
+            Note: Without KV cache, the engine recomputes the full sequence
+            each step (O(n²) complexity). For efficient inference, use a
+            model with KV cache management.
         eval_frequency: Evaluate MLX graph every N steps.
     """
 
@@ -82,7 +86,6 @@ class GenerationEngine:
         self,
         model_forward_fn: Callable[[mx.array, Optional[mx.array]], mx.array],
         config: EngineConfig,
-        kv_cache: Optional[Any] = None,
     ):
         """Initialize generation engine.
 
@@ -90,11 +93,14 @@ class GenerationEngine:
             model_forward_fn: Function that takes (input_ids, attention_mask)
                 and returns logits (batch, seq_len, vocab_size).
             config: Engine configuration.
-            kv_cache: Optional KV cache for efficient inference.
+
+        Note:
+            This engine does not currently support KV caching. Each generation
+            step recomputes attention over the full sequence. For long sequences,
+            consider using a model with built-in KV cache management.
         """
         self._model_forward = model_forward_fn
         self._config = config
-        self._kv_cache = kv_cache
 
         # Initialize components
         scheduler_config = SchedulerConfig(
@@ -108,8 +114,11 @@ class GenerationEngine:
 
         # Streaming output queue
         self._output_queue: queue.Queue[Tuple[str, int]] = queue.Queue()
-        self._running = False
         self._step_count = 0
+
+        # Thread synchronization
+        self._lock = threading.Lock()
+        self._running = False
 
     @property
     def config(self) -> EngineConfig:
@@ -126,7 +135,7 @@ class GenerationEngine:
         input_ids: Union[mx.array, List[int]],
         sampling_config: Optional[SamplingConfig] = None,
         max_new_tokens: int = 100,
-        stop_sequences: Optional[List[int]] = None,
+        stop_token_ids: Optional[List[int]] = None,
         priority: int = 0,
         request_id: Optional[str] = None,
         metadata: Optional[dict] = None,
@@ -139,14 +148,21 @@ class GenerationEngine:
             input_ids: Input token IDs.
             sampling_config: Sampling configuration.
             max_new_tokens: Maximum tokens to generate.
-            stop_sequences: Additional stop token IDs.
+            stop_token_ids: Additional stop token IDs.
             priority: Request priority (higher = earlier).
             request_id: Optional custom request ID.
             metadata: Optional user metadata.
 
         Returns:
             Submitted request.
+
+        Raises:
+            ValueError: If sampling_config has invalid values.
         """
+        # Validate sampling config if provided
+        if sampling_config is not None:
+            sampling_config.validate()
+
         request = create_request(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -157,7 +173,7 @@ class GenerationEngine:
             if sampling_config
             else 1.0,
             eos_token_id=self._config.eos_token_id,
-            stop_token_ids=stop_sequences,
+            stop_token_ids=stop_token_ids,
             priority=priority,
             request_id=request_id,
             metadata=metadata,
@@ -206,7 +222,7 @@ class GenerationEngine:
             self._output_queue.put((request.request_id, token))
 
             # Check stop conditions
-            if self._should_stop(request, token):
+            if self._should_stop(request):
                 self._scheduler.complete_request(request.request_id)
 
         return results
@@ -222,42 +238,53 @@ class GenerationEngine:
         """
         return self._model_forward(batch.input_ids, batch.attention_mask)
 
-    def _should_stop(self, request: GenerationRequest, new_token: int) -> bool:
+    def _should_stop(self, request: GenerationRequest) -> bool:
         """Check if generation should stop for a request.
 
         Args:
-            request: The request.
-            new_token: Newly generated token.
+            request: The request to check.
 
         Returns:
             True if should stop.
         """
-        # Check all stop conditions
         return request.check_stop_conditions()
 
     def generate_stream(self) -> Iterator[Tuple[str, int]]:
         """Generate tokens with streaming output.
 
         Yields (request_id, token) tuples as tokens are generated.
+        Thread-safe: can be stopped from another thread via stop().
 
         Example:
             >>> for request_id, token in engine.generate_stream():
             ...     print(f"Request {request_id}: {token}")
         """
-        self._running = True
+        with self._lock:
+            self._running = True
 
-        while self._running and self._scheduler.has_work():
-            # Run generation step
-            self.step()
+        try:
+            while True:
+                # Check if we should stop (thread-safe read)
+                with self._lock:
+                    if not self._running:
+                        break
 
-            # Yield any queued outputs
-            while not self._output_queue.empty():
-                try:
-                    yield self._output_queue.get_nowait()
-                except queue.Empty:
+                if not self._scheduler.has_work():
                     break
 
-        self._running = False
+                # Run generation step
+                self.step()
+
+                # Yield any queued outputs using timeout to avoid TOCTOU race
+                while True:
+                    try:
+                        item = self._output_queue.get(timeout=0.001)
+                        yield item
+                    except queue.Empty:
+                        break
+        finally:
+            with self._lock:
+                self._running = False
 
     def generate(
         self,
@@ -342,8 +369,12 @@ class GenerationEngine:
         return [r.generated_tokens for r in requests]
 
     def stop(self) -> None:
-        """Stop the generation loop."""
-        self._running = False
+        """Stop the generation loop.
+
+        Thread-safe: can be called from any thread.
+        """
+        with self._lock:
+            self._running = False
 
     def clear(self) -> None:
         """Clear all pending and active requests."""
@@ -383,11 +414,13 @@ class GenerationEngine:
             Dictionary with statistics.
         """
         scheduler_stats = self._scheduler.get_stats()
+        with self._lock:
+            running = self._running
         return {
             **scheduler_stats,
             "step_count": self._step_count,
             "output_queue_size": self._output_queue.qsize(),
-            "running": self._running,
+            "running": running,
         }
 
 

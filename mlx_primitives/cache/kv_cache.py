@@ -417,9 +417,12 @@ class KVCache:
 
         Args:
             sequence_id: User sequence ID to delete.
+
+        Raises:
+            KeyError: If sequence does not exist.
         """
         if sequence_id not in self._sequence_ids:
-            return
+            raise KeyError(f"Sequence {sequence_id} not found")
 
         # Delete from each layer
         for layer_idx in range(self.num_layers):

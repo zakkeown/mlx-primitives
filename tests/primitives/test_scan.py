@@ -439,6 +439,126 @@ class TestSSMScanOptimization:
         np.testing.assert_allclose(mlx_out, np_out, rtol=1e-3, atol=1e-3)
 
 
+class TestMultiBlockSSMScan:
+    """Tests for multi-block SSM scan (sequences > 1024)."""
+
+    @pytest.mark.parametrize("seq_len", [1025, 2048, 4096])
+    def test_multiblock_ssm_vs_numpy(self, seq_len: int) -> None:
+        """Test multi-block SSM scan matches NumPy for long sequences."""
+        np.random.seed(42)
+        batch, state = 2, 16
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        # Slightly relaxed tolerance for long sequences due to accumulating numerical error
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-2, atol=1e-2)
+
+    def test_multiblock_ssm_vs_numpy_8192(self) -> None:
+        """Test multi-block SSM scan at 8192 sequence length."""
+        np.random.seed(42)
+        batch, state = 1, 8
+
+        seq_len = 8192
+        A_np = np.random.uniform(0.9, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        # Tolerance scaled for sequence length: expect ~sqrt(seq_len) numerical accumulation
+        # For 8192 elements: ~90 ULPs accumulated, rtol=1e-2 gives ~2000 ULP margin
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.slow
+    def test_multiblock_ssm_vs_numpy_16384(self) -> None:
+        """Test multi-block SSM scan at 16384 sequence length (stress test)."""
+        np.random.seed(42)
+        batch, state = 1, 4
+
+        seq_len = 16384
+        A_np = np.random.uniform(0.95, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        # Tolerance scaled for sequence length: 2e-2 gives reasonable margin
+        # while still catching algorithmic bugs (was 1e-1 which is too loose)
+        np.testing.assert_allclose(mlx_out, np_out, rtol=2e-2, atol=2e-2)
+
+    def test_multiblock_ssm_boundary_1025(self) -> None:
+        """Test SSM scan at exact boundary (1025 = 1024 + 1)."""
+        np.random.seed(42)
+        batch, state = 2, 32
+
+        seq_len = 1025
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-2, atol=1e-2)
+
+    def test_multiblock_ssm_single_batch(self) -> None:
+        """Test multi-block SSM scan with single batch."""
+        np.random.seed(42)
+        batch, seq_len, state = 1, 2048, 64
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-2, atol=1e-2)
+
+    def test_multiblock_ssm_large_batch(self) -> None:
+        """Test multi-block SSM scan with larger batch size."""
+        np.random.seed(42)
+        batch, seq_len, state = 8, 2048, 16
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        mlx_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        np_out = np_ssm_scan(A_np, h_np)
+
+        np.testing.assert_allclose(mlx_out, np_out, rtol=1e-2, atol=1e-2)
+
+    def test_multiblock_ssm_properties(self) -> None:
+        """Test SSM properties hold for multi-block scan."""
+        np.random.seed(42)
+        seq_len = 2048
+
+        # Test: A=1 should equal cumsum
+        x_np = np.random.randn(1, seq_len, 8).astype(np.float32)
+        A_np = np.ones((1, seq_len, 8), dtype=np.float32)
+
+        result = to_numpy(associative_scan(
+            to_mlx(x_np), operator="ssm", A=to_mlx(A_np), axis=1
+        ))
+        expected = np.cumsum(x_np, axis=1)
+
+        np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+
 class TestVectorizedOptimization:
     """Tests for vectorized (float4) memory access optimization."""
 
@@ -504,6 +624,49 @@ def _reference_selective_scan(
         outputs.append(y_t)
 
     return mx.stack(outputs, axis=1)
+
+
+class TestMetalFallbackConsistency:
+    """Tests that Metal and fallback implementations produce identical results."""
+
+    @pytest.mark.parametrize("seq_len", [32, 64, 128, 256, 512])
+    def test_cumsum_metal_vs_fallback(self, seq_len: int) -> None:
+        """Test Metal and fallback cumsum produce same results."""
+        np.random.seed(42)
+        x_np = np.random.randn(4, seq_len).astype(np.float32)
+
+        metal_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", use_metal=True))
+        fallback_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", use_metal=False))
+
+        np.testing.assert_allclose(metal_out, fallback_out, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("seq_len", [32, 64, 128, 256, 512])
+    def test_ssm_metal_vs_fallback(self, seq_len: int) -> None:
+        """Test Metal and fallback SSM scan produce same results."""
+        np.random.seed(42)
+        batch, state = 2, 16
+
+        A_np = np.random.uniform(0.8, 0.99, (batch, seq_len, state)).astype(np.float32)
+        h_np = np.random.randn(batch, seq_len, state).astype(np.float32)
+
+        metal_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1, use_metal=True
+        ))
+        fallback_out = to_numpy(associative_scan(
+            to_mlx(h_np), operator="ssm", A=to_mlx(A_np), axis=1, use_metal=False
+        ))
+
+        np.testing.assert_allclose(metal_out, fallback_out, rtol=1e-4, atol=1e-4)
+
+    def test_multiblock_cumsum_metal_vs_fallback(self) -> None:
+        """Test Metal and fallback for multi-block cumsum."""
+        np.random.seed(42)
+        x_np = np.random.randn(2, 2048).astype(np.float32)
+
+        metal_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", use_metal=True))
+        fallback_out = to_numpy(associative_scan(to_mlx(x_np), operator="add", use_metal=False))
+
+        np.testing.assert_allclose(metal_out, fallback_out, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+import warnings
 from typing import Any, Optional
 
 from mlx_primitives.dsl.types import (
@@ -96,6 +97,9 @@ class ASTParser(ast.NodeVisitor):
         ast.UAdd: "+",
     }
 
+    # Track type inference fallbacks to avoid warning spam
+    _type_inference_warned: set[str] = set()
+
     def __init__(self, parameters: list[tuple[str, Any]], constexpr_params: list[str]):
         self.parameters = parameters
         self.constexpr_params = constexpr_params
@@ -154,8 +158,25 @@ class ASTParser(ast.NodeVisitor):
                 return TypeInfo(ir_type=IRType.SCALAR, dtype=uint32, is_const=True)
             if "Pointer" in annotation:
                 return TypeInfo(ir_type=IRType.POINTER, dtype=float32)
+            # Unknown string annotation - warn the user
+            warnings.warn(
+                f"Parameter '{name}' has unrecognized type annotation '{annotation}'. "
+                f"Defaulting to Pointer[float32]. "
+                f"Valid annotations: mt.constexpr, Pointer[dtype], or DType.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return TypeInfo(ir_type=IRType.POINTER, dtype=float32)
 
         # Default: assume pointer for function params without clear annotation
+        # Warn for non-None, non-empty annotations that weren't recognized
+        warnings.warn(
+            f"Parameter '{name}' has unrecognized type annotation of type {type(annotation).__name__}. "
+            f"Defaulting to Pointer[float32]. "
+            f"Valid annotations: mt.constexpr, Pointer[dtype], or DType.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
         return TypeInfo(ir_type=IRType.POINTER, dtype=float32)
 
     def parse(self, source: str) -> IRFunction:
@@ -278,6 +299,14 @@ class ASTParser(ast.NodeVisitor):
                     is_declaration=True,
                     type_info=type_info,
                 )
+
+        # Special case: assigning array declaration (mt.zeros, mt.full)
+        # Replace temporary name with actual variable name and track type
+        if isinstance(value, IRArrayDecl):
+            value.name = var_name
+            self.local_vars[var_name] = value.type_info
+            self.declared_vars.add(var_name)
+            return value
 
         # Determine if this is a declaration
         is_declaration = var_name not in self.declared_vars
@@ -1148,7 +1177,15 @@ class ASTParser(ast.NodeVisitor):
             dtype = bp_decl.dtype
         else:
             # Fallback - this shouldn't happen if usage is correct
-            size_expr = "256"  # Default size
+            # Using a default size is dangerous as it may cause buffer overflows
+            warnings.warn(
+                f"Block pointer '{bp_name}' declaration not found. "
+                f"Using default size 256 which may cause buffer overflow or data corruption. "
+                f"Ensure make_block_ptr() is called before load_block().",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            size_expr = "256"  # Default size - DANGEROUS FALLBACK
             dtype = float32
 
         shared_decl = IRSharedMemoryDecl(
@@ -1215,22 +1252,15 @@ class ASTParser(ast.NodeVisitor):
         value = self.visit(node.value)
         index = self.visit(node.slice)
 
-        # Check if this is shared memory or a local array (use array indexing)
-        # vs a device pointer (use pointer arithmetic for load/store)
+        # Check if this is shared memory, a local array, or device pointer
         if isinstance(node.value, ast.Name):
             var_name = node.value.id
-            # Check if variable is shared memory or a local array
             if var_name in self.local_vars:
                 type_info = self.local_vars[var_name]
-                # Use array indexing for shared memory pointers
-                if type_info.ir_type == IRType.POINTER:
-                    # Check if it's a shared memory alias
-                    is_shared = any(
-                        var_name == assign_target
-                        for assign_target in self.declared_vars
-                        if var_name in self.local_vars
-                    )
-                    # For shared memory and local arrays, use array indexing
+                # Use array indexing for:
+                # - Local arrays (mt.zeros, mt.full) with ARRAY type
+                # - Shared memory pointers with POINTER type
+                if type_info.ir_type in (IRType.ARRAY, IRType.POINTER):
                     return IRSubscript(value, index, type_info)
 
         # Default: treat as pointer arithmetic for device memory loads
@@ -1261,23 +1291,51 @@ class ASTParser(ast.NodeVisitor):
     }
 
     def _infer_type(self, node: IRNode) -> TypeInfo:
-        """Infer type from IR node."""
+        """Infer type from IR node.
+
+        Note: This method may return default types (float32) when type information
+        is not available. Enable DEBUG logging to see warnings about type inference
+        fallbacks, which may indicate missing type annotations in the kernel code.
+        """
         if isinstance(node, IRLiteral):
             return node.type_info
         elif isinstance(node, IRVariable):
-            return node.type_info or TypeInfo(IRType.SCALAR, float32)
+            if node.type_info is not None:
+                return node.type_info
+            # Variable without type_info - likely from untracked source
+            # This is expected for some internal variables, so we don't warn here
+            # unless explicitly debugging. The warning was added in _annotation_to_type_info
+            # for unrecognized annotations which is the more actionable case.
+            return TypeInfo(IRType.SCALAR, float32)
         elif isinstance(node, IRCall):
             # Thread indexing functions return uint
             if node.func_name in self.UINT_RETURNING_FUNCTIONS:
                 return TypeInfo(IRType.SCALAR, uint32)
-            # Most math functions return float
+            # Return explicit type_info if set on the call node
+            if node.type_info is not None:
+                return node.type_info
+            # Most math functions return float - this is well-defined behavior
             return TypeInfo(IRType.SCALAR, float32)
         elif isinstance(node, IRBinaryOp):
             # Return type of left operand
             return self._infer_type(node.left)
         elif isinstance(node, IRLoad):
+            # Load type should ideally come from pointer type
+            if node.type_info is not None:
+                return node.type_info
             return TypeInfo(IRType.SCALAR, float32)
         else:
+            # Unknown node type - use float32 default
+            node_type = type(node).__name__
+            warn_key = f"infer_type_{node_type}"
+            if warn_key not in ASTParser._type_inference_warned:
+                ASTParser._type_inference_warned.add(warn_key)
+                warnings.warn(
+                    f"Type inference for '{node_type}' defaulting to float32. "
+                    f"Consider adding explicit type information for better type safety.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
             return TypeInfo(IRType.SCALAR, float32)
 
     def _parse_type_annotation(self, node: ast.expr) -> TypeInfo:

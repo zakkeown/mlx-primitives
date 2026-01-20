@@ -62,7 +62,11 @@ class StreamingTensor:
         self._open()
 
     def _open(self) -> None:
-        """Open or create the memory-mapped file."""
+        """Open or create the memory-mapped file.
+
+        Uses proper resource cleanup to prevent file handle leaks if
+        mmap creation or numpy view creation fails.
+        """
         np_dtype = _mlx_to_numpy_dtype(self._dtype)
 
         if self._mode == "w+":
@@ -87,13 +91,35 @@ class StreamingTensor:
                 f"got {actual_size} bytes"
             )
 
-        # Open file and create mmap
-        self._file = open(self._path, file_mode)
-        mmap_mode = mmap.ACCESS_WRITE if "+" in self._mode else mmap.ACCESS_READ
-        self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap_mode)
+        # Open file with proper cleanup on failure
+        file_handle = None
+        mmap_handle = None
+        try:
+            file_handle = open(self._path, file_mode)
+            mmap_mode = mmap.ACCESS_WRITE if "+" in self._mode else mmap.ACCESS_READ
+            mmap_handle = mmap.mmap(file_handle.fileno(), 0, access=mmap_mode)
 
-        # Create numpy view of mmap
-        self._np_array = np.frombuffer(self._mmap, dtype=np_dtype).reshape(self._shape)
+            # Create numpy view of mmap
+            np_array = np.frombuffer(mmap_handle, dtype=np_dtype).reshape(self._shape)
+
+            # All succeeded, assign to instance
+            self._file = file_handle
+            self._mmap = mmap_handle
+            self._np_array = np_array
+
+        except Exception:
+            # Clean up on failure to prevent handle leaks
+            if mmap_handle is not None:
+                try:
+                    mmap_handle.close()
+                except Exception:
+                    pass
+            if file_handle is not None:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+            raise
 
     def close(self) -> None:
         """Close the memory-mapped file.

@@ -84,6 +84,8 @@ class PingPongBuffer:
     while CPU fills buffer[i+1]. This hides data transfer latency
     and maximizes hardware utilization.
 
+    Thread-safe: All index operations are protected by an internal lock.
+
     Example:
         >>> buffer = PingPongBuffer(shape=(64, 512), count=2)
         >>> while has_data:
@@ -115,6 +117,7 @@ class PingPongBuffer:
         self._count = count
         self._shape = shape
         self._dtype = dtype
+        self._lock = threading.Lock()
 
         # Create buffers
         self._buffers = [mx.zeros(shape, dtype=dtype) for _ in range(count)]
@@ -122,7 +125,7 @@ class PingPongBuffer:
         # Initialize all buffers
         mx.eval(*self._buffers)
 
-        # Current positions
+        # Current positions (protected by _lock)
         self._write_idx = 0
         self._read_idx = 0
         self._filled_count = 0
@@ -143,7 +146,8 @@ class PingPongBuffer:
         Returns:
             Tuple of (buffer_index, buffer_array).
         """
-        return self._write_idx, self._buffers[self._write_idx]
+        with self._lock:
+            return self._write_idx, self._buffers[self._write_idx]
 
     def get_for_read(self) -> Tuple[int, mx.array]:
         """Get buffer ready for GPU to read from.
@@ -154,21 +158,24 @@ class PingPongBuffer:
         Raises:
             ValueError: If no buffer is ready for reading.
         """
-        if self._filled_count == 0:
-            raise ValueError("No buffer ready for reading")
+        with self._lock:
+            if self._filled_count == 0:
+                raise ValueError("No buffer ready for reading")
 
-        return self._read_idx, self._buffers[self._read_idx]
+            return self._read_idx, self._buffers[self._read_idx]
 
     def advance_write(self) -> None:
         """Mark current write buffer as filled and move to next."""
-        self._write_idx = (self._write_idx + 1) % self._count
-        self._filled_count = min(self._filled_count + 1, self._count)
+        with self._lock:
+            self._write_idx = (self._write_idx + 1) % self._count
+            self._filled_count = min(self._filled_count + 1, self._count)
 
     def advance_read(self) -> None:
         """Mark current read buffer as consumed and move to next."""
-        if self._filled_count > 0:
-            self._read_idx = (self._read_idx + 1) % self._count
-            self._filled_count -= 1
+        with self._lock:
+            if self._filled_count > 0:
+                self._read_idx = (self._read_idx + 1) % self._count
+                self._filled_count -= 1
 
     def advance(self) -> None:
         """Advance both read and write positions.
@@ -180,17 +187,20 @@ class PingPongBuffer:
 
     def reset(self) -> None:
         """Reset buffer positions to initial state."""
-        self._write_idx = 0
-        self._read_idx = 0
-        self._filled_count = 0
+        with self._lock:
+            self._write_idx = 0
+            self._read_idx = 0
+            self._filled_count = 0
 
     def is_full(self) -> bool:
         """Check if all buffers are filled."""
-        return self._filled_count >= self._count
+        with self._lock:
+            return self._filled_count >= self._count
 
     def is_empty(self) -> bool:
         """Check if no buffers are filled."""
-        return self._filled_count == 0
+        with self._lock:
+            return self._filled_count == 0
 
 
 def ping_pong_buffer(
@@ -348,13 +358,15 @@ class WorkQueue:
         """Execute multi-stage pipeline with automatic overlapping.
 
         Creates a pipeline where each stage can overlap with others,
-        maximizing throughput.
+        maximizing throughput. Uses generator chaining to avoid loading
+        the entire input into memory.
 
         Args:
             stages: List of (device, function) tuples.
                 device is "cpu" or "gpu".
             inputs: Iterator of input data.
-            buffer_size: Number of items to buffer between stages.
+            buffer_size: Number of items to buffer between stages (unused
+                in current implementation, reserved for future async version).
 
         Yields:
             Results from the final stage.
@@ -373,23 +385,27 @@ class WorkQueue:
             yield from inputs
             return
 
-        # Simple sequential pipeline with overlapping
-        # For full async pipeline, would need more complex implementation
-        current_data = list(inputs)
-
-        for device, fn in stages:
-            next_data = []
-            for item in current_data:
+        def make_stage_generator(upstream: Iterator, device: str, fn: Callable) -> Iterator:
+            """Create a generator for a single pipeline stage."""
+            for item in upstream:
                 if device == "gpu":
                     result = fn(item)
                     if isinstance(result, mx.array):
                         mx.eval(result)
+                    elif isinstance(result, (list, tuple)):
+                        arrays = [x for x in result if isinstance(x, mx.array)]
+                        if arrays:
+                            mx.eval(*arrays)
                 else:
                     result = fn(item)
-                next_data.append(result)
-            current_data = next_data
+                yield result
 
-        yield from current_data
+        # Chain generators for true streaming
+        current = inputs
+        for device, fn in stages:
+            current = make_stage_generator(current, device, fn)
+
+        yield from current
 
     def shutdown(self, wait: bool = True) -> None:
         """Shutdown the work queue.

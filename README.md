@@ -57,11 +57,12 @@ These are available via direct import from submodules:
 
 The `associative_scan` with `operator="ssm"` implements parallel prefix scan for SSM recurrences:
 
-- **seq_len > 8**: Uses parallel Metal kernel with O(log n) complexity
 - **seq_len <= 8**: Uses vectorized MLX fallback (still GPU-accelerated)
-- **seq_len > 1024**: Currently falls back to sequential (multi-block kernel not yet implemented)
+- **8 < seq_len <= 1024**: Uses single-block parallel Metal kernel with O(log n) complexity
+- **seq_len > 1024**: Uses multi-block parallel Metal kernel with O(log n) complexity
 
-For typical autoregressive inference (seq_len=1 per step), the vectorized fallback is used.
+All sequence lengths now use parallel algorithms. For typical autoregressive inference
+(seq_len=1 per step), the vectorized fallback is used.
 Configure threshold via `MLX_PRIMITIVES_MIN_SEQ_FOR_METAL` environment variable.
 
 ## Quick Start

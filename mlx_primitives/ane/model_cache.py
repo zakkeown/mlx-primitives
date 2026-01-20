@@ -6,11 +6,15 @@ used to dispatch operations to the Neural Engine.
 
 import hashlib
 import json
+import logging
 import tempfile
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -87,9 +91,9 @@ class CoreMLModelCache:
         """
         self._cache_dir = cache_dir or Path.home() / ".mlx_primitives" / "ane_cache"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._memory_cache: Dict[str, Any] = {}
+        # Use OrderedDict for O(1) LRU operations instead of list
+        self._memory_cache: OrderedDict[str, Any] = OrderedDict()
         self._max_memory_cache = max_memory_cache
-        self._access_order: list = []  # For LRU eviction
 
     def get_or_compile(
         self,
@@ -109,18 +113,20 @@ class CoreMLModelCache:
 
         # Check memory cache first (fastest)
         if cache_key in self._memory_cache:
-            self._update_access_order(cache_key)
+            # Move to end for LRU (O(1) with OrderedDict)
+            self._memory_cache.move_to_end(cache_key)
             return self._memory_cache[cache_key]
 
         # Check disk cache
         disk_path = self._cache_dir / f"{cache_key}.mlmodelc"
         if disk_path.exists():
-            model = self._load_from_disk(disk_path)
+            model = self._load_from_disk(disk_path, cache_key)
             if model is not None:
                 self._add_to_memory_cache(cache_key, model)
                 return model
 
         # Compile new model
+        logger.debug(f"Compiling new Core ML model for {spec.operation} with key {cache_key}")
         model = compile_fn(spec)
 
         # Save to caches
@@ -129,42 +135,44 @@ class CoreMLModelCache:
 
         return model
 
-    def _update_access_order(self, key: str) -> None:
-        """Update LRU access order."""
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
-
     def _add_to_memory_cache(self, key: str, model: Any) -> None:
         """Add model to memory cache with LRU eviction."""
-        # Evict oldest if at capacity
+        # Evict oldest if at capacity (O(1) with OrderedDict)
         while len(self._memory_cache) >= self._max_memory_cache:
-            if self._access_order:
-                oldest_key = self._access_order.pop(0)
-                self._memory_cache.pop(oldest_key, None)
-            else:
-                break
+            # popitem(last=False) removes the oldest entry
+            evicted_key, _ = self._memory_cache.popitem(last=False)
+            logger.debug(f"Evicted model {evicted_key} from memory cache (LRU)")
 
         self._memory_cache[key] = model
-        self._access_order.append(key)
 
-    def _load_from_disk(self, path: Path) -> Optional[Any]:
+    def _load_from_disk(self, path: Path, cache_key: str = "") -> Optional[Any]:
         """Load compiled model from disk.
 
         Args:
             path: Path to .mlmodelc directory.
+            cache_key: Cache key for logging purposes.
 
         Returns:
             Loaded model or None if loading fails.
         """
         try:
             import coremltools as ct
-            return ct.models.MLModel(str(path))
-        except Exception:
-            # If loading fails, remove corrupted cache
+            model = ct.models.MLModel(str(path))
+            logger.debug(f"Loaded cached Core ML model from {path}")
+            return model
+        except Exception as e:
+            # If loading fails, remove corrupted cache and log the event
+            logger.warning(
+                f"Failed to load cached Core ML model from {path} (key: {cache_key}): {e}. "
+                "Removing corrupted cache and will recompile."
+            )
             if path.exists():
                 import shutil
-                shutil.rmtree(path, ignore_errors=True)
+                try:
+                    shutil.rmtree(path)
+                    logger.info(f"Removed corrupted cache directory: {path}")
+                except OSError as rm_err:
+                    logger.error(f"Failed to remove corrupted cache {path}: {rm_err}")
             return None
 
     def _save_to_disk(
@@ -182,19 +190,23 @@ class CoreMLModelCache:
         """
         try:
             model.save(str(path))
+            logger.debug(f"Saved Core ML model to {path}")
 
             # Save metadata alongside
             metadata_path = path.parent / f"{path.stem}.json"
             with open(metadata_path, "w") as f:
                 json.dump(spec.to_dict(), f, indent=2)
-        except Exception:
-            # Non-critical - model will be recompiled next time
-            pass
+        except OSError as e:
+            # Disk full, permissions, etc. - log but don't fail
+            logger.warning(f"Failed to save Core ML model to {path}: {e}")
+        except Exception as e:
+            # Other unexpected errors - log at debug level
+            logger.debug(f"Unexpected error saving Core ML model to {path}: {e}")
 
     def clear_memory_cache(self) -> None:
         """Clear in-memory cache."""
         self._memory_cache.clear()
-        self._access_order.clear()
+        logger.debug("Cleared in-memory model cache")
 
     def clear_disk_cache(self) -> None:
         """Clear disk cache."""
@@ -250,7 +262,8 @@ def warmup_cache(operations: list[str], shapes: list[Tuple[int, ...]]) -> None:
     """Pre-compile models for common operations.
 
     Useful for reducing first-call latency by triggering
-    compilation ahead of time.
+    compilation ahead of time. This actually compiles models,
+    not just generates cache keys.
 
     Args:
         operations: List of operation names (e.g., ["matmul"]).
@@ -265,11 +278,20 @@ def warmup_cache(operations: list[str], shapes: list[Tuple[int, ...]]) -> None:
     try:
         from mlx_primitives.ane.dispatch import is_ane_available
         if not is_ane_available():
+            logger.debug("ANE not available, skipping warmup")
             return
     except ImportError:
+        logger.debug("ANE dispatch module not available, skipping warmup")
+        return
+
+    try:
+        from mlx_primitives.ane.primitives.matmul import _compile_matmul_model
+    except ImportError:
+        logger.debug("Matmul primitives not available, skipping warmup")
         return
 
     cache = get_model_cache()
+    compiled_count = 0
 
     for operation in operations:
         if operation == "matmul":
@@ -280,8 +302,11 @@ def warmup_cache(operations: list[str], shapes: list[Tuple[int, ...]]) -> None:
                     shape_b = shapes[j]
 
                     # Only compile if shapes are compatible for matmul
-                    if len(shape_a) >= 1 and len(shape_b) >= 1:
-                        # Assume (M, K) @ (K, N) pattern
+                    # Shape A: (M, K), Shape B: (K, N) -> inner dims must match
+                    if len(shape_a) >= 2 and len(shape_b) >= 2:
+                        if shape_a[-1] != shape_b[-2]:
+                            continue  # Incompatible shapes
+
                         spec = ModelSpec(
                             operation="matmul",
                             input_shapes=(shape_a, shape_b),
@@ -289,8 +314,11 @@ def warmup_cache(operations: list[str], shapes: list[Tuple[int, ...]]) -> None:
                             params=(),
                         )
                         try:
-                            # Trigger compilation by checking cache
-                            # This is a warmup - actual compile happens on first use
-                            _ = spec.cache_key()
-                        except Exception:
-                            pass  # Non-critical warmup failure
+                            # Actually trigger compilation via get_or_compile
+                            cache.get_or_compile(spec, _compile_matmul_model)
+                            compiled_count += 1
+                            logger.debug(f"Warmed up matmul for shapes {shape_a} @ {shape_b}")
+                        except Exception as e:
+                            logger.debug(f"Warmup failed for {shape_a} @ {shape_b}: {e}")
+
+    logger.info(f"Cache warmup complete: compiled {compiled_count} models")

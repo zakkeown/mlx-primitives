@@ -35,6 +35,9 @@ class SchedulerConfig:
         enable_continuous_batching: Allow adding requests mid-generation.
         padding_side: Which side to pad sequences.
         pad_token_id: Token ID for padding.
+        max_completed_requests: Maximum completed requests to keep in memory.
+            Oldest completed requests are pruned when limit is exceeded.
+            Set to 0 for unlimited (not recommended for long-running services).
     """
 
     max_batch_tokens: int = 8192
@@ -43,6 +46,7 @@ class SchedulerConfig:
     enable_continuous_batching: bool = True
     padding_side: PaddingSide = PaddingSide.LEFT
     pad_token_id: int = 0
+    max_completed_requests: int = 1000
 
 
 class RequestScheduler:
@@ -145,6 +149,7 @@ class RequestScheduler:
                     req.cancel()
                     self._completed_requests[request_id] = req
                     del self._pending_queue[i]
+                    self._prune_completed_requests()
                     return True
 
             # Check active requests
@@ -152,6 +157,7 @@ class RequestScheduler:
                 req = self._active_requests.pop(request_id)
                 req.cancel()
                 self._completed_requests[request_id] = req
+                self._prune_completed_requests()
                 return True
 
         return False
@@ -219,14 +225,18 @@ class RequestScheduler:
         """Form batch combining prefill and generation requests.
 
         Strategy:
-        1. Take active generation requests (1 token each)
+        1. Take active generation requests
         2. Fill remaining capacity with pending prefill requests
+
+        Note: Without KV cache support, generation requests include the FULL
+        sequence (prompt + generated tokens) for correct model inference.
+        This is inefficient but correct.
         """
         batch_requests = []
         batch_tokens = 0
         sequences = []
 
-        # First: active generation requests (each needs 1 new token)
+        # First: active generation requests
         generation_requests = [
             req
             for req in self._active_requests.values()
@@ -237,17 +247,16 @@ class RequestScheduler:
             if len(batch_requests) >= self._config.max_batch_size:
                 break
 
-            batch_requests.append(req)
-            batch_tokens += 1  # Generation: 1 token per request
+            # Without KV cache, we need the full sequence for context
+            full_seq = req.get_all_tokens()
+            seq_len = full_seq.shape[0]
 
-            # For generation, we only need the last generated token
-            if req.generated_tokens:
-                sequences.append(mx.array([req.generated_tokens[-1]], dtype=mx.int32))
-            else:
-                # First generation step after prefill
-                sequences.append(
-                    req.input_ids[-1:] if req.input_ids.size > 0 else mx.array([0])
-                )
+            if batch_tokens + seq_len > self._config.max_batch_tokens:
+                continue  # Skip if too long
+
+            batch_requests.append(req)
+            batch_tokens += seq_len
+            sequences.append(full_seq)
 
         # Second: pending prefill requests
         remaining_tokens = self._config.max_batch_tokens - batch_tokens
@@ -324,6 +333,7 @@ class RequestScheduler:
 
             req.complete()
             self._completed_requests[request_id] = req
+            self._prune_completed_requests()
 
     def fail_request(self, request_id: str, error: str) -> None:
         """Mark request as failed.
@@ -337,6 +347,30 @@ class RequestScheduler:
                 req = self._active_requests.pop(request_id)
                 req.fail(error)
                 self._completed_requests[request_id] = req
+                self._prune_completed_requests()
+
+    def _prune_completed_requests(self) -> None:
+        """Prune oldest completed requests if over limit.
+
+        Must be called while holding the lock.
+        """
+        max_completed = self._config.max_completed_requests
+        if max_completed <= 0:
+            return  # Unlimited
+
+        while len(self._completed_requests) > max_completed:
+            # Find oldest completed request by finish_time
+            oldest_id = None
+            oldest_time = float("inf")
+            for req_id, req in self._completed_requests.items():
+                finish = req.finish_time or 0
+                if finish < oldest_time:
+                    oldest_time = finish
+                    oldest_id = req_id
+            if oldest_id:
+                del self._completed_requests[oldest_id]
+            else:
+                break
 
     def get_request(self, request_id: str) -> Optional[GenerationRequest]:
         """Get a request by ID.
@@ -455,18 +489,37 @@ class PriorityScheduler(RequestScheduler):
         self,
         include_generating: bool = True,
     ) -> Tuple[List[GenerationRequest], Optional[BatchedSequences]]:
-        """Get batch with aging applied."""
-        # Apply aging to pending requests
+        """Get batch with aging applied.
+
+        Re-sorts pending queue based on effective priority (base + aging boost).
+        """
+        # First pass: update wait cycles and re-sort (holding our own lock check)
+        # Note: We modify _pending_queue directly which parent's get_batch will use
+        # Parent's get_batch will acquire the lock, so we do this before calling it
+        self._apply_aging_and_resort()
+
+        return super().get_batch(include_generating)
+
+    def _apply_aging_and_resort(self) -> None:
+        """Apply aging to pending requests and re-sort by effective priority."""
         with self._lock:
+            if not self._pending_queue:
+                return
+
+            # Update wait cycles and compute effective priorities
+            effective_priorities = []
             for req in self._pending_queue:
                 cycles = self._wait_cycles.get(req.request_id, 0)
                 self._wait_cycles[req.request_id] = cycles + 1
-
-                # Boost effective priority
                 effective_boost = int(cycles * self._aging_factor)
-                # Don't modify actual priority, just use for sorting
+                effective_priority = req.priority + effective_boost
+                effective_priorities.append(
+                    (-effective_priority, req.arrival_time, req)
+                )
 
-        return super().get_batch(include_generating)
+            # Re-sort queue by effective priority (descending), then arrival time
+            effective_priorities.sort(key=lambda x: (x[0], x[1]))
+            self._pending_queue = [item[2] for item in effective_priorities]
 
     def complete_request(
         self,

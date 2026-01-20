@@ -393,3 +393,236 @@ class TestKVCacheIntegration:
                                   block_size=block_size)
 
         assert output.shape == (3, 1, 8, 64)
+
+
+def numpy_paged_prefill_reference(
+    q: NDArray,
+    k_pool: NDArray,
+    v_pool: NDArray,
+    block_tables: NDArray,
+    context_lens: NDArray,
+    scale: float,
+    block_size: int,
+    causal: bool = True,
+) -> NDArray:
+    """NumPy reference for paged attention prefill mode.
+
+    For prefill, queries attend to all keys up to their position (causal)
+    or all keys in the context (non-causal).
+
+    Args:
+        q: Query (batch, seq_q, heads, dim)
+        k_pool: Key block pool (num_blocks, block_size, heads, dim)
+        v_pool: Value block pool (num_blocks, block_size, heads, dim)
+        block_tables: Block indices (batch, max_blocks), -1 for invalid
+        context_lens: Context length per sequence (batch,)
+        scale: Attention scale
+        block_size: Tokens per block
+        causal: Apply causal masking
+
+    Returns:
+        Output (batch, seq_q, heads, dim)
+    """
+    batch, seq_q, heads, dim = q.shape
+    max_context = int(np.max(context_lens))
+
+    # Reconstruct K, V from blocks
+    k_full = np.zeros((batch, max_context, heads, dim), dtype=q.dtype)
+    v_full = np.zeros((batch, max_context, heads, dim), dtype=q.dtype)
+
+    for b in range(batch):
+        ctx_len = int(context_lens[b])
+        token_idx = 0
+
+        for block_idx in range(block_tables.shape[1]):
+            block_id = int(block_tables[b, block_idx])
+            if block_id < 0:
+                break
+
+            tokens_remaining = ctx_len - token_idx
+            tokens_in_block = min(block_size, tokens_remaining)
+
+            if tokens_in_block <= 0:
+                break
+
+            k_full[b, token_idx:token_idx + tokens_in_block] = k_pool[block_id, :tokens_in_block]
+            v_full[b, token_idx:token_idx + tokens_in_block] = v_pool[block_id, :tokens_in_block]
+            token_idx += tokens_in_block
+
+    # Process each sequence with proper causal masking
+    outputs = []
+    for b in range(batch):
+        ctx_len = int(context_lens[b])
+        q_b = q[b:b+1]  # (1, seq_q, heads, dim)
+        k_b = k_full[b:b+1, :ctx_len]  # (1, ctx_len, heads, dim)
+        v_b = v_full[b:b+1, :ctx_len]
+
+        # Transpose to (batch, heads, seq, dim)
+        q_t = np.transpose(q_b, (0, 2, 1, 3))  # (1, heads, seq_q, dim)
+        k_t = np.transpose(k_b, (0, 2, 1, 3))  # (1, heads, ctx_len, dim)
+        v_t = np.transpose(v_b, (0, 2, 1, 3))
+
+        # Attention scores: (1, heads, seq_q, ctx_len)
+        scores = np.matmul(q_t, np.transpose(k_t, (0, 1, 3, 2))) * scale
+
+        if causal:
+            # For prefill: query at position i can attend to positions 0..i
+            # Create mask of shape (seq_q, ctx_len)
+            # For q_pos i, valid k_pos are 0 to i (inclusive)
+            q_positions = np.arange(seq_q)[:, None]  # (seq_q, 1)
+            k_positions = np.arange(ctx_len)[None, :]  # (1, ctx_len)
+            mask = k_positions <= q_positions  # (seq_q, ctx_len)
+            scores = np.where(mask, scores, -1e9)
+
+        # Softmax
+        scores_max = np.max(scores, axis=-1, keepdims=True)
+        scores_exp = np.exp(scores - scores_max)
+        weights = scores_exp / (np.sum(scores_exp, axis=-1, keepdims=True) + 1e-10)
+
+        # Output
+        out_b = np.matmul(weights, v_t)  # (1, heads, seq_q, dim)
+        out_b = np.transpose(out_b, (0, 2, 1, 3))  # (1, seq_q, heads, dim)
+        outputs.append(out_b)
+
+    return np.concatenate(outputs, axis=0)
+
+
+class TestPagedAttentionPrefillCorrectness:
+    """Verify prefill mode matches reference implementation."""
+
+    def test_prefill_single_sequence(self) -> None:
+        """Test prefill mode with single sequence."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 1, 10, 8, 64
+        block_size = 16
+        context_len = 10  # Prefill processes its own tokens
+
+        # For prefill, context equals query length (processing the prompt)
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_pool = mx.random.normal((5, block_size, heads, dim))
+        v_pool = mx.random.normal((5, block_size, heads, dim))
+        block_tables = mx.array([[0]], dtype=mx.int32)  # 1 block for 10 tokens
+        context_lens = mx.array([context_len], dtype=mx.int32)
+
+        scale = 1.0 / math.sqrt(dim)
+        mlx_out = paged_attention(
+            q, k_pool, v_pool, block_tables, context_lens,
+            scale=scale, block_size=block_size, causal=True
+        )
+
+        numpy_out = numpy_paged_prefill_reference(
+            np.array(q), np.array(k_pool), np.array(v_pool),
+            np.array(block_tables), np.array(context_lens),
+            scale, block_size, causal=True
+        )
+
+        np.testing.assert_allclose(
+            np.array(mlx_out), numpy_out, rtol=1e-3, atol=1e-4
+        )
+
+    def test_prefill_batch(self) -> None:
+        """Test prefill mode with batched sequences."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 2, 20, 8, 64
+        block_size = 16
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_pool = mx.random.normal((10, block_size, heads, dim))
+        v_pool = mx.random.normal((10, block_size, heads, dim))
+
+        # Different context lengths for each sequence
+        context_lens = mx.array([20, 20], dtype=mx.int32)
+        block_tables = mx.array([
+            [0, 1],
+            [2, 3],
+        ], dtype=mx.int32)
+
+        scale = 1.0 / math.sqrt(dim)
+        mlx_out = paged_attention(
+            q, k_pool, v_pool, block_tables, context_lens,
+            scale=scale, block_size=block_size, causal=True
+        )
+
+        numpy_out = numpy_paged_prefill_reference(
+            np.array(q), np.array(k_pool), np.array(v_pool),
+            np.array(block_tables), np.array(context_lens),
+            scale, block_size, causal=True
+        )
+
+        np.testing.assert_allclose(
+            np.array(mlx_out), numpy_out, rtol=1e-3, atol=1e-4
+        )
+
+    def test_prefill_longer_sequence(self) -> None:
+        """Test prefill with sequence spanning multiple blocks."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 1, 50, 8, 64
+        block_size = 16
+        context_len = 50  # 4 blocks (50 tokens)
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_pool = mx.random.normal((10, block_size, heads, dim))
+        v_pool = mx.random.normal((10, block_size, heads, dim))
+        block_tables = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+        context_lens = mx.array([context_len], dtype=mx.int32)
+
+        scale = 1.0 / math.sqrt(dim)
+        mlx_out = paged_attention(
+            q, k_pool, v_pool, block_tables, context_lens,
+            scale=scale, block_size=block_size, causal=True
+        )
+
+        numpy_out = numpy_paged_prefill_reference(
+            np.array(q), np.array(k_pool), np.array(v_pool),
+            np.array(block_tables), np.array(context_lens),
+            scale, block_size, causal=True
+        )
+
+        np.testing.assert_allclose(
+            np.array(mlx_out), numpy_out, rtol=1e-3, atol=1e-4
+        )
+
+    def test_prefill_non_causal(self) -> None:
+        """Test prefill without causal masking."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 1, 16, 8, 64
+        block_size = 16
+        context_len = 16
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_pool = mx.random.normal((5, block_size, heads, dim))
+        v_pool = mx.random.normal((5, block_size, heads, dim))
+        block_tables = mx.array([[0]], dtype=mx.int32)
+        context_lens = mx.array([context_len], dtype=mx.int32)
+
+        scale = 1.0 / math.sqrt(dim)
+        mlx_out = paged_attention(
+            q, k_pool, v_pool, block_tables, context_lens,
+            scale=scale, block_size=block_size, causal=False
+        )
+
+        numpy_out = numpy_paged_prefill_reference(
+            np.array(q), np.array(k_pool), np.array(v_pool),
+            np.array(block_tables), np.array(context_lens),
+            scale, block_size, causal=False
+        )
+
+        np.testing.assert_allclose(
+            np.array(mlx_out), numpy_out, rtol=1e-3, atol=1e-4
+        )
+
+    def test_prefill_output_shape(self) -> None:
+        """Test prefill output has same shape as query."""
+        mx.random.seed(42)
+        batch, seq_q, heads, dim = 2, 25, 8, 64
+        block_size = 16
+
+        q = mx.random.normal((batch, seq_q, heads, dim))
+        k_pool = mx.random.normal((10, block_size, heads, dim))
+        v_pool = mx.random.normal((10, block_size, heads, dim))
+        block_tables = mx.array([[0, 1], [2, 3]], dtype=mx.int32)
+        context_lens = mx.array([25, 25], dtype=mx.int32)
+
+        output = paged_attention(q, k_pool, v_pool, block_tables, context_lens,
+                                  block_size=block_size)
+        assert output.shape == q.shape

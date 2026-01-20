@@ -9,87 +9,99 @@ This provides significant memory and compute savings for MoE models:
 - Compute: O(tokens * top_k) forward passes instead of O(tokens * experts)
 """
 
+import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import mlx.core as mx
+import mlx.nn as nn
+
+if TYPE_CHECKING:
+    from mlx_primitives.advanced.moe import MoEOutput
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
-# Kernel cache
+# Thread-safe kernel cache
+_kernel_lock = threading.Lock()
 _gather_kernel: Optional[mx.fast.metal_kernel] = None
 _scatter_add_kernel: Optional[mx.fast.metal_kernel] = None
 
 
 def _get_gather_kernel() -> mx.fast.metal_kernel:
-    """Get or create the selective gather kernel."""
+    """Get or create the selective gather kernel (thread-safe)."""
     global _gather_kernel
-    if _gather_kernel is None:
-        source = """
-        uint idx = thread_position_in_grid.x;
-        uint d = thread_position_in_grid.y;
+    if _gather_kernel is not None:
+        return _gather_kernel
 
-        // Dereference scalar parameters (passed as single-element arrays)
-        uint _capacity = capacity[0];
-        uint _dim = dim[0];
+    with _kernel_lock:
+        # Double-check after acquiring lock
+        if _gather_kernel is None:
+            source = """
+            uint idx = thread_position_in_grid.x;
+            uint d = thread_position_in_grid.y;
 
-        if (idx >= _capacity || d >= _dim) return;
+            // Dereference scalar parameters (passed as single-element arrays)
+            uint _capacity = capacity[0];
+            uint _dim = dim[0];
 
-        uint src_idx = indices[idx];
-        output[idx * _dim + d] = input[src_idx * _dim + d];
-        """
-        _gather_kernel = mx.fast.metal_kernel(
-            name="selective_gather",
-            input_names=["input", "indices", "capacity", "dim"],
-            output_names=["output"],
-            source=source,
-        )
+            if (idx >= _capacity || d >= _dim) return;
+
+            uint src_idx = indices[idx];
+            output[idx * _dim + d] = input[src_idx * _dim + d];
+            """
+            _gather_kernel = mx.fast.metal_kernel(
+                name="selective_gather",
+                input_names=["input", "indices", "capacity", "dim"],
+                output_names=["output"],
+                source=source,
+            )
     return _gather_kernel
 
 
 def _get_scatter_add_kernel() -> mx.fast.metal_kernel:
-    """Get or create the selective scatter-add kernel."""
+    """Get or create the selective scatter-add kernel (thread-safe).
+
+    Uses atomic operations for thread-safe accumulation.
+    Takes accumulator as input and atomically adds values to it.
+    """
     global _scatter_add_kernel
-    if _scatter_add_kernel is None:
-        source = """
-        uint idx = thread_position_in_grid.x;
-        uint d = thread_position_in_grid.y;
+    if _scatter_add_kernel is not None:
+        return _scatter_add_kernel
 
-        // Dereference scalar parameters (passed as single-element arrays)
-        uint _capacity = capacity[0];
-        uint _dim = dim[0];
-        uint _n_tokens = n_tokens[0];
+    with _kernel_lock:
+        # Double-check after acquiring lock
+        if _scatter_add_kernel is None:
+            source = """
+            uint idx = thread_position_in_grid.x;
+            uint d = thread_position_in_grid.y;
 
-        if (idx >= _capacity || d >= _dim) return;
+            // Dereference scalar parameters (passed as single-element arrays)
+            uint _capacity = capacity[0];
+            uint _dim = dim[0];
+            uint _n_tokens = n_tokens[0];
 
-        uint dst_idx = indices[idx];
-        float weight = weights[idx];
-        float value = values[idx * _dim + d] * weight;
+            if (idx >= _capacity || d >= _dim) return;
 
-        // Copy base value to output first (for proper initialization)
-        // Each thread copies its target position
-        if (idx == 0) {
-            // First thread for each d initializes the entire output column
-            for (uint t = 0; t < _n_tokens; t++) {
-                output[t * _dim + d] = accumulator[t * _dim + d];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_device);
+            uint dst_idx = indices[idx];
+            float weight = weights[idx];
+            float value = values[idx * _dim + d] * weight;
 
-        // Atomic add for thread-safe accumulation
-        atomic_fetch_add_explicit(
-            (device atomic_float*)&output[dst_idx * _dim + d],
-            value,
-            memory_order_relaxed
-        );
-        """
-        _scatter_add_kernel = mx.fast.metal_kernel(
-            name="selective_scatter_add",
-            input_names=["accumulator", "values", "indices", "weights", "capacity", "dim", "n_tokens"],
-            output_names=["output"],
-            source=source,
-        )
+            // Copy accumulator to output (first thread for each output position)
+            // Then atomically add the scatter value
+            // Note: This relies on accumulator being pre-copied to output
+            atomic_fetch_add_explicit(
+                (device atomic_float*)&output[dst_idx * _dim + d],
+                value,
+                memory_order_relaxed
+            );
+            """
+            _scatter_add_kernel = mx.fast.metal_kernel(
+                name="selective_scatter_add",
+                input_names=["values", "indices", "weights", "capacity", "dim", "n_tokens"],
+                output_names=["output"],
+                source=source,
+            )
     return _scatter_add_kernel
 
 
@@ -158,7 +170,7 @@ def selective_gather(
             result = result.squeeze(-1)
 
         return result
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, TypeError) as e:
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("selective_gather", e)
         # Fallback to simple indexing
@@ -209,16 +221,33 @@ def selective_scatter_add(
 
     # For simple cases or fallback
     if not use_metal or not _HAS_METAL or values.ndim > 2:
-        # Pure MLX implementation using scatter
-        weighted_values = values * weights[:, None]
-        for i in range(capacity):
-            idx = int(indices[i].item())
-            output = output.at[idx].add(weighted_values[i])
-        return output
+        # Fully vectorized MLX implementation - no GPU sync
+        # Use broadcasting to scatter-add without explicit loops
+        #
+        # We want: output[indices[i]] += values[i] * weights[i] for all i
+        # Vectorized: for each output position j, sum all (values[i] * weights[i])
+        # where indices[i] == j
+        #
+        # indices: (capacity,)
+        # values: (capacity, dim)
+        # weights: (capacity,)
+        weighted_values = values * weights[:, None]  # (capacity, dim)
+
+        # Create indicator matrix: indicator[i, j] = 1 if indices[i] == j
+        # Shape: (capacity, n_tokens)
+        position_indices = mx.arange(n_tokens)[None, :]  # (1, n_tokens)
+        indicator = (indices[:, None] == position_indices).astype(output.dtype)  # (capacity, n_tokens)
+
+        # Scatter-add via matrix multiply: updates = indicator.T @ weighted_values
+        # This sums weighted_values[i] for all i where indices[i] == j
+        updates = indicator.T @ weighted_values  # (n_tokens, dim)
+
+        return output + updates
 
     try:
         kernel = _get_scatter_add_kernel()
 
+        # Prepare inputs
         accumulator = mx.contiguous(output.astype(mx.float32))
         values = mx.contiguous(values.astype(mx.float32))
         indices = mx.contiguous(indices.astype(mx.uint32))
@@ -227,25 +256,29 @@ def selective_scatter_add(
         dim_arr = mx.array([dim], dtype=mx.uint32)
         n_tokens_arr = mx.array([n_tokens], dtype=mx.uint32)
 
+        # Initialize output with accumulator values (scalar init_value 0.0)
+        # Then atomically add scatter values
         outputs = kernel(
-            inputs=[accumulator, values, indices, weights, capacity_arr, dim_arr, n_tokens_arr],
+            inputs=[values, indices, weights, capacity_arr, dim_arr, n_tokens_arr],
             grid=(capacity, dim, 1),
             threadgroup=(min(capacity, 32), min(dim, 32), 1),
             output_shapes=[(n_tokens, dim)],
             output_dtypes=[mx.float32],
+            init_value=0.0,  # Initialize with zeros, add accumulator separately
             stream=mx.default_stream(mx.default_device()),
         )
 
-        return outputs[0]
-    except Exception as e:
+        # Add accumulator to the scattered output
+        return outputs[0] + accumulator
+    except (ImportError, RuntimeError, ValueError, TypeError) as e:
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("selective_scatter_add", e)
-        # Fallback to pure MLX
+        # Fallback to pure MLX - vectorized via indicator matrix (no GPU sync)
         weighted_values = values * weights[:, None]
-        for i in range(capacity):
-            idx = int(indices[i].item())
-            output = output.at[idx].add(weighted_values[i])
-        return output
+        position_indices = mx.arange(n_tokens)[None, :]
+        indicator = (indices[:, None] == position_indices).astype(output.dtype)
+        updates = indicator.T @ weighted_values
+        return output + updates
 
 
 @dataclass
@@ -356,12 +389,14 @@ def build_expert_dispatch(
     return dispatch, router_probs
 
 
-class SparseMoELayer:
+class SparseMoELayer(nn.Module):
     """Mixture of Experts layer with sparse routing.
 
     Uses selective gather/scatter for efficient computation where only
     tokens assigned to each expert are processed, rather than running
     all tokens through all experts and masking.
+
+    Inherits from nn.Module for proper weight serialization and gradient tracking.
 
     Args:
         num_experts: Number of expert networks.
@@ -379,42 +414,46 @@ class SparseMoELayer:
         top_k: int = 2,
         capacity_factor: float = 1.25,
     ) -> None:
+        super().__init__()
         self.num_experts = num_experts
         self.d_model = d_model
         self.d_hidden = d_hidden
         self.top_k = top_k
         self.capacity_factor = capacity_factor
 
-        # Router
-        self.gate = mx.random.normal((d_model, num_experts)) * 0.02
+        # Router - uses nn.Linear for proper weight management
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
 
-        # Expert MLPs (SwiGLU)
+        # Expert MLPs (SwiGLU) - store as lists of nn.Linear
         # Each expert: gate_proj, up_proj -> down_proj
-        scale = (2 / (d_model + d_hidden)) ** 0.5
-        self.gate_proj = mx.random.normal((num_experts, d_hidden, d_model)) * scale
-        self.up_proj = mx.random.normal((num_experts, d_hidden, d_model)) * scale
-        self.down_proj = mx.random.normal((num_experts, d_model, d_hidden)) * scale
+        self.gate_proj = [nn.Linear(d_model, d_hidden, bias=False) for _ in range(num_experts)]
+        self.up_proj = [nn.Linear(d_model, d_hidden, bias=False) for _ in range(num_experts)]
+        self.down_proj = [nn.Linear(d_hidden, d_model, bias=False) for _ in range(num_experts)]
 
-    def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array) -> "MoEOutput":
         """Forward pass with sparse routing.
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model) or (n_tokens, d_model).
 
         Returns:
-            Tuple of (output, router_logits) where:
-            - output has same shape as input
-            - router_logits has shape (n_tokens, num_experts)
+            MoEOutput with output, aux_loss, and router_logits.
+            Can be unpacked as: output, aux_loss, router_logits = layer(x)
         """
+        from mlx_primitives.advanced.moe import MoEOutput
+
         # Flatten to (n_tokens, d_model)
         original_shape = x.shape
         if x.ndim == 3:
             batch, seq_len, d_model = x.shape
             x = x.reshape(-1, d_model)
+            router_logits_shape = (batch, seq_len, self.num_experts)
+        else:
+            router_logits_shape = None
         n_tokens = x.shape[0]
 
         # Compute router logits
-        router_logits = x @ self.gate  # (n_tokens, num_experts)
+        router_logits = self.gate(x)  # (n_tokens, num_experts)
 
         # Build dispatch indices
         dispatch, router_probs = build_expert_dispatch(
@@ -437,20 +476,27 @@ class SparseMoELayer:
             # Gather tokens for this expert
             x_expert = selective_gather(x, indices)
 
-            # Expert forward (SwiGLU MLP)
-            gate = x_expert @ self.gate_proj[expert_idx].T
-            up = x_expert @ self.up_proj[expert_idx].T
-            hidden = mx.sigmoid(gate) * gate * up  # SiLU(gate) * up
-            y_expert = hidden @ self.down_proj[expert_idx].T
+            # Expert forward (SwiGLU MLP) using nn.Linear layers
+            gate_out = self.gate_proj[expert_idx](x_expert)
+            up_out = self.up_proj[expert_idx](x_expert)
+            # SwiGLU activation: SiLU(gate) * up = (sigmoid(gate) * gate) * up
+            hidden = mx.sigmoid(gate_out) * gate_out * up_out
+            y_expert = self.down_proj[expert_idx](hidden)
 
             # Scatter back with weights
             output = selective_scatter_add(output, y_expert, indices, weights)
 
+        # Compute auxiliary load balancing loss
+        aux_loss = compute_load_balancing_loss(
+            router_probs, dispatch.expert_counts, self.num_experts
+        )
+
         # Reshape back
         if len(original_shape) == 3:
             output = output.reshape(original_shape)
+            router_logits = router_logits.reshape(router_logits_shape)
 
-        return output, router_logits
+        return MoEOutput(output=output, aux_loss=aux_loss, router_logits=router_logits)
 
 
 def compute_load_balancing_loss(

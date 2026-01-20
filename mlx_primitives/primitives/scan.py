@@ -103,6 +103,13 @@ def associative_scan(
         >>> associative_scan(x, operator="ssm", A=A)
         array([[1.0, 1.9, 2.71]])  # 1, 0.9*1+1, 0.9*1.9+1
     """
+    # Exclusive scan not yet implemented
+    if not inclusive:
+        raise NotImplementedError(
+            "Exclusive scan (inclusive=False) is not yet implemented. "
+            "Only inclusive scans are currently supported."
+        )
+
     # Handle reverse scan
     if reverse:
         x = _reverse_along_axis(x, axis=axis)
@@ -154,7 +161,7 @@ def _simple_scan(
         )
 
         return metal_associative_scan(x, operator, axis, inclusive)
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, TypeError) as e:
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("associative_scan", e)
         # Fall back to MLX builtins
@@ -231,7 +238,7 @@ def _ssm_scan(
             result = mx.transpose(result, (0, 2, 1))
 
         return result
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, TypeError) as e:
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("ssm_scan", e)
         # Fall back to sequential

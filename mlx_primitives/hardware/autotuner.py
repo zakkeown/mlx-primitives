@@ -4,6 +4,8 @@ This module provides infrastructure for automatically discovering
 optimal tiling configurations through micro-benchmarking.
 """
 
+import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -11,6 +13,8 @@ from typing import Callable, List, Optional, Tuple
 import mlx.core as mx
 
 from mlx_primitives.hardware.detection import ChipInfo, get_chip_info
+
+logger = logging.getLogger(__name__)
 from mlx_primitives.hardware.tiling import (
     DataType,
     OperationType,
@@ -247,7 +251,11 @@ class AutoTuner:
                 valid=True,
             )
 
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                f"Benchmark failed for config (block_m={config.block_m}, "
+                f"block_n={config.block_n}, block_k={config.block_k}): {e}"
+            )
             return BenchmarkResult(
                 config=config,
                 time_ms=float("inf"),
@@ -335,22 +343,52 @@ class AutoTuner:
         seq_len: int,
         num_heads: int,
         head_dim: int,
+        kernel_fn: Callable,
         causal: bool = True,
     ) -> TilingConfig:
         """Auto-tune for attention workload.
 
-        Convenience method for tuning attention operations.
+        Benchmarks the provided kernel function with different tiling configurations
+        to find the optimal one for this workload.
+
+        IMPORTANT: The kernel_fn MUST actually use the config parameter to control
+        tiling behavior. Passing a kernel that ignores the config will produce
+        meaningless results.
 
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
             num_heads: Number of attention heads.
             head_dim: Head dimension.
+            kernel_fn: The actual tiled attention kernel to benchmark. Must accept
+                signature (q, k, v, config=TilingConfig) and use the config to
+                control block sizes. The kernel should use config.block_m,
+                config.block_n, and config.block_k for tiling.
             causal: Whether attention is causal.
 
         Returns:
             Optimal TilingConfig for this workload.
+
+        Example:
+            >>> def my_flash_attention(q, k, v, config=None):
+            ...     # Kernel that actually uses config.block_m, config.block_n
+            ...     return tiled_attention_impl(q, k, v, config)
+            >>> tuner = AutoTuner()
+            >>> config = tuner.tune_attention(
+            ...     batch_size=1, seq_len=2048, num_heads=8, head_dim=64,
+            ...     kernel_fn=my_flash_attention,
+            ... )
+
+        Raises:
+            ValueError: If kernel_fn is None.
         """
+        if kernel_fn is None:
+            raise ValueError(
+                "kernel_fn is required. You must provide an actual tiled attention "
+                "kernel that uses the config parameter. Passing None or a kernel "
+                "that ignores config will produce meaningless auto-tuning results."
+            )
+
         # Create test inputs
         q = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
         k = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
@@ -365,39 +403,33 @@ class AutoTuner:
         av_flops = 2 * batch_size * num_heads * seq_len * seq_len * head_dim
         expected_flops = qk_flops + av_flops
 
-        # Define kernel function (placeholder - would use actual kernel)
-        def attention_kernel(q, k, v, config=None):
-            # Simplified attention for tuning
-            scale = 1.0 / (head_dim ** 0.5)
-            # This would be replaced with the actual tiled kernel
-            scores = mx.matmul(q, mx.swapaxes(k, -1, -2)) * scale
-            if causal:
-                mask = mx.triu(mx.ones((seq_len, seq_len)), k=1) * -1e9
-                scores = scores + mask
-            weights = mx.softmax(scores, axis=-1)
-            return mx.matmul(weights, v)
-
         return self.tune(
             operation=OperationType.FLASH_ATTENTION,
-            kernel_fn=attention_kernel,
+            kernel_fn=kernel_fn,
             inputs=[q, k, v],
             expected_flops=expected_flops,
         )
 
 
-# Global tuner instance
+# Global tuner instance with thread-safe initialization
 _autotuner: Optional[AutoTuner] = None
+_autotuner_lock = threading.Lock()
 
 
 def get_autotuner() -> AutoTuner:
     """Get the global auto-tuner instance.
+
+    Thread-safe singleton accessor.
 
     Returns:
         Singleton AutoTuner instance.
     """
     global _autotuner
     if _autotuner is None:
-        _autotuner = AutoTuner()
+        with _autotuner_lock:
+            # Double-check locking pattern
+            if _autotuner is None:
+                _autotuner = AutoTuner()
     return _autotuner
 
 

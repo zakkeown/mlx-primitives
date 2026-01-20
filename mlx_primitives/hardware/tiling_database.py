@@ -5,13 +5,15 @@ different Apple Silicon chips, operations, problem sizes, and data types.
 """
 
 import json
+import logging
 from dataclasses import asdict
-from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 from mlx_primitives.hardware.detection import ChipFamily, ChipTier
+
+logger = logging.getLogger(__name__)
 from mlx_primitives.hardware.tiling import (
     DataType,
     OperationType,
@@ -132,7 +134,8 @@ _DEFAULT_CONFIGS: dict[ConfigKey, TilingConfig] = {
     (OperationType.FLASH_ATTENTION, ChipFamily.M1, ChipTier.MAX, ProblemSize.MEDIUM, DataType.FP32): _make_attention_config(64, 48, 64, prefetch=2),
     (OperationType.FLASH_ATTENTION, ChipFamily.M1, ChipTier.MAX, ProblemSize.LARGE, DataType.FP32): _make_attention_config(64, 48, 64, prefetch=2),
     # M1 with head_dim=128 needs smaller blocks
-    (OperationType.FLASH_ATTENTION, ChipFamily.M1, ChipTier.BASE, ProblemSize.MEDIUM, DataType.FP32): _make_attention_config(32, 24, 128, prefetch=1),
+    # NOTE: Key includes head_dim via block_k parameter, using LARGE size to differentiate from head_dim=64
+    (OperationType.FLASH_ATTENTION, ChipFamily.M1, ChipTier.BASE, ProblemSize.LARGE, DataType.FP32): _make_attention_config(32, 24, 128, prefetch=1),
 
     # =========================================================================
     # FLASH ATTENTION - M2 Family
@@ -275,16 +278,35 @@ class TilingDatabase:
             try:
                 with open(cache_file) as f:
                     data = json.load(f)
+                loaded_count = 0
+                skipped_count = 0
                 for key_str, config_dict in data.items():
                     # Parse key from string representation
                     try:
                         key = self._parse_key_string(key_str)
                         config = TilingConfig(**config_dict)
                         self._user_configs[key] = config
-                    except (ValueError, TypeError):
-                        continue  # Skip invalid entries
-            except (json.JSONDecodeError, OSError):
-                pass  # Start with empty cache
+                        loaded_count += 1
+                    except (ValueError, TypeError) as e:
+                        skipped_count += 1
+                        logger.debug(f"Skipping invalid cache entry '{key_str}': {e}")
+                if loaded_count > 0:
+                    logger.debug(f"Loaded {loaded_count} tuned configs from cache")
+                if skipped_count > 0:
+                    logger.warning(
+                        f"Skipped {skipped_count} invalid entries in tiling cache. "
+                        f"Consider clearing cache with TilingDatabase.clear_user_cache()."
+                    )
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Tiling cache file is corrupted ({e}). "
+                    f"Starting with empty cache. Your previously tuned configs have been lost. "
+                    f"Cache file: {cache_file}"
+                )
+            except OSError as e:
+                logger.warning(
+                    f"Could not read tiling cache ({e}). Starting with empty cache."
+                )
 
     def _parse_key_string(self, key_str: str) -> ConfigKey:
         """Parse a key string back to ConfigKey tuple."""
@@ -428,18 +450,13 @@ class TilingDatabase:
             cache_file.unlink()
 
 
-# Global database instance
-_tiling_database: Optional[TilingDatabase] = None
-
-
 @lru_cache(maxsize=1)
 def get_tiling_database() -> TilingDatabase:
     """Get the global tiling database instance.
 
+    Thread-safe singleton via lru_cache (thread-safe in Python 3.9+).
+
     Returns:
         Singleton TilingDatabase instance.
     """
-    global _tiling_database
-    if _tiling_database is None:
-        _tiling_database = TilingDatabase()
-    return _tiling_database
+    return TilingDatabase()

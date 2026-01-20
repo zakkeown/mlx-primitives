@@ -12,12 +12,19 @@ Memory savings: 2x read + 1x write eliminated per operation.
 
 import math
 import threading
+import warnings
 from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 
-# Check if Metal kernels are available
-_HAS_METAL = hasattr(mx.fast, "metal_kernel")
+from mlx_primitives.utils import (
+    has_metal_kernels,
+    METAL_MIN_SEQ_LEN,
+    RAISE_ON_METAL_FAILURE,
+    should_use_metal,
+    validate_dtype_for_metal,
+)
 
 # Kernel cache with thread safety
 _fused_rmsnorm_linear_kernel: Optional[mx.fast.metal_kernel] = None
@@ -268,7 +275,7 @@ def fused_rmsnorm_linear(
         )
 
     # For small tensors or when Metal not available, use separate ops
-    if not use_metal or not _HAS_METAL or seq_len < 8:
+    if not should_use_metal(seq_len, use_metal):
         return _reference_rmsnorm_linear(x, norm_weight, linear_weight, linear_bias, eps)
 
     try:
@@ -276,9 +283,13 @@ def fused_rmsnorm_linear(
             x, norm_weight, linear_weight, linear_bias, eps
         )
     except RuntimeError as e:
-        # Catch Metal kernel errors, but let programming bugs propagate
-        from mlx_primitives.utils.logging import log_fallback
-        log_fallback("fused_rmsnorm_linear", e)
+        if RAISE_ON_METAL_FAILURE:
+            raise
+        warnings.warn(
+            f"Metal kernel 'fused_rmsnorm_linear' failed, falling back to reference implementation: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return _reference_rmsnorm_linear(x, norm_weight, linear_weight, linear_bias, eps)
 
 
@@ -290,6 +301,9 @@ def _metal_fused_rmsnorm_linear(
     eps: float,
 ) -> mx.array:
     """Metal kernel implementation with parallel reduction for RMS computation."""
+    # Validate input dtype - Metal kernels compute in float32
+    validate_dtype_for_metal("x", x.dtype, target_dtype="float32")
+
     batch_size, seq_len, hidden_dim = x.shape
     out_features = linear_weight.shape[0]
 
@@ -318,9 +332,17 @@ def _metal_fused_rmsnorm_linear(
     # Configure threadgroup for efficient parallel reduction
     # Use up to 256 threads per threadgroup (8 SIMD groups)
     # Must be at least 32 for SIMD operations
+    # CONSTRAINT: Max 1024 threads (32 SIMD groups) due to simd_sums[32] in kernel
     threads_per_group = min(256, max(32, hidden_dim))
     # Round up to multiple of 32 (SIMD width)
     threads_per_group = ((threads_per_group + 31) // 32) * 32
+
+    # Safety check: kernel has fixed simd_sums[32] array, max 1024 threads
+    if threads_per_group > 1024:
+        raise ValueError(
+            f"threads_per_group ({threads_per_group}) exceeds kernel limit of 1024. "
+            "Kernel simd_sums array is fixed at 32 elements (32 SIMD groups * 32 threads)."
+        )
 
     outputs = kernel(
         inputs=[
@@ -382,14 +404,19 @@ def rmsnorm(
         Normalized tensor of same shape as input.
     """
     # Metal kernel requires 3D input
-    if x.ndim != 3 or not use_metal or not _HAS_METAL:
+    if x.ndim != 3 or not should_use_metal(x.shape[1], use_metal):
         return _reference_rmsnorm(x, weight, eps)
 
     try:
         return _metal_rmsnorm(x, weight, eps)
     except RuntimeError as e:
-        from mlx_primitives.utils.logging import log_fallback
-        log_fallback("rmsnorm", e)
+        if RAISE_ON_METAL_FAILURE:
+            raise
+        warnings.warn(
+            f"Metal kernel 'rmsnorm' failed, falling back to reference implementation: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return _reference_rmsnorm(x, weight, eps)
 
 
@@ -401,6 +428,9 @@ def _reference_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
 
 def _metal_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     """Metal kernel implementation with parallel reduction."""
+    # Validate input dtype - Metal kernels compute in float32
+    validate_dtype_for_metal("x", x.dtype, target_dtype="float32")
+
     batch_size, seq_len, hidden_dim = x.shape
 
     kernel = _get_rmsnorm_kernel()
@@ -417,9 +447,17 @@ def _metal_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
 
     # Configure threadgroup size for efficient parallel reduction
     # Use up to 256 threads per threadgroup (8 SIMD groups)
+    # CONSTRAINT: Max 1024 threads (32 SIMD groups) due to simd_sums[32] in kernel
     threads_per_group = min(256, hidden_dim)
     # Round up to multiple of 32 (SIMD width)
     threads_per_group = ((threads_per_group + 31) // 32) * 32
+
+    # Safety check: kernel has fixed simd_sums[32] array, max 1024 threads
+    if threads_per_group > 1024:
+        raise ValueError(
+            f"threads_per_group ({threads_per_group}) exceeds kernel limit of 1024. "
+            "Kernel simd_sums array is fixed at 32 elements (32 SIMD groups * 32 threads)."
+        )
 
     outputs = kernel(
         inputs=[x, weight, batch_arr, seq_arr, hidden_arr, eps_arr],
@@ -434,17 +472,31 @@ def _metal_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return outputs[0]
 
 
-class FusedRMSNormLinear:
+class FusedRMSNormLinear(nn.Module):
     """Fused RMSNorm + Linear layer.
 
     Combines RMSNorm and Linear projection into a single operation
     to reduce memory bandwidth.
+
+    This class properly inherits from nn.Module for compatibility with
+    MLX's model serialization, parameter enumeration, and gradient tracking.
 
     Args:
         hidden_dim: Input dimension.
         out_features: Output dimension.
         eps: RMSNorm epsilon.
         bias: Whether to include bias in linear.
+
+    Example:
+        >>> layer = FusedRMSNormLinear(768, 3072)
+        >>> x = mx.random.normal((2, 128, 768))
+        >>> out = layer(x)
+        >>> out.shape
+        (2, 128, 3072)
+
+        # Access parameters for training
+        >>> params = layer.parameters()
+        >>> mx.eval(params)
     """
 
     def __init__(
@@ -454,15 +506,18 @@ class FusedRMSNormLinear:
         eps: float = 1e-5,
         bias: bool = False,
     ) -> None:
+        super().__init__()
+
         self.hidden_dim = hidden_dim
         self.out_features = out_features
         self.eps = eps
 
-        # Initialize weights
+        # Initialize weights using proper MLX initialization
         scale = 1.0 / math.sqrt(hidden_dim)
         self.norm_weight = mx.ones((hidden_dim,))
         self.linear_weight = mx.random.normal((out_features, hidden_dim)) * scale
-        self.linear_bias = mx.zeros((out_features,)) if bias else None
+        if bias:
+            self.linear_bias = mx.zeros((out_features,))
 
     def __call__(self, x: mx.array) -> mx.array:
         """Apply fused RMSNorm + Linear.
@@ -473,10 +528,11 @@ class FusedRMSNormLinear:
         Returns:
             Output tensor (batch, seq, out_features).
         """
+        linear_bias = getattr(self, "linear_bias", None)
         return fused_rmsnorm_linear(
             x,
             self.norm_weight,
             self.linear_weight,
-            self.linear_bias,
+            linear_bias,
             self.eps,
         )

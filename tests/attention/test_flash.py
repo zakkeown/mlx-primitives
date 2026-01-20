@@ -16,10 +16,15 @@ from mlx_primitives.attention._online_softmax import (
     online_softmax_merge,
     compute_chunk_attention,
 )
+from mlx_primitives.constants import ATTENTION_MASK_VALUE
 
 
 def numpy_attention(q, k, v, scale, causal):
-    """NumPy reference implementation for testing."""
+    """NumPy reference implementation for testing.
+
+    Uses ATTENTION_MASK_VALUE from constants for consistency with
+    production code paths.
+    """
     q_np = np.array(q)
     k_np = np.array(k)
     v_np = np.array(v)
@@ -36,7 +41,8 @@ def numpy_attention(q, k, v, scale, causal):
 
     if causal:
         mask = np.tril(np.ones((seq, seq)))
-        scores = np.where(mask == 1, scores, -1e9)
+        # Use the same mask value as production code for consistency
+        scores = np.where(mask == 1, scores, ATTENTION_MASK_VALUE)
 
     # Softmax
     scores_max = np.max(scores, axis=-1, keepdims=True)

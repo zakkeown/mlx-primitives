@@ -12,10 +12,13 @@ import mlx.core as mx
 
 
 class BatchingStrategy(Enum):
-    """Strategy for handling variable-length sequences."""
+    """Strategy for handling variable-length sequences.
+
+    Note: Currently only PADDED is implemented. PACKED batching (sequence
+    packing with position tracking) may be added in a future release.
+    """
 
     PADDED = "padded"  # Pad to max length in batch
-    PACKED = "packed"  # Pack sequences with position tracking
 
 
 class PaddingSide(Enum):
@@ -383,6 +386,7 @@ class DynamicBatcher:
         max_wait_sequences: int = 32,
         padding_side: PaddingSide = PaddingSide.LEFT,
         pad_token_id: int = 0,
+        flush_threshold: float = 0.8,
     ):
         """Initialize dynamic batcher.
 
@@ -392,6 +396,8 @@ class DynamicBatcher:
             max_wait_sequences: Flush when this many sequences waiting.
             padding_side: Side to pad sequences.
             pad_token_id: Padding token ID.
+            flush_threshold: Fraction of max_batch_tokens at which to trigger
+                automatic flush (0.0 to 1.0). Default 0.8.
         """
         self._batcher = SequenceBatcher(
             max_batch_tokens=max_batch_tokens,
@@ -400,6 +406,7 @@ class DynamicBatcher:
             pad_token_id=pad_token_id,
         )
         self._max_wait = max_wait_sequences
+        self._flush_threshold = flush_threshold
 
         self._pending_sequences: List[mx.array] = []
         self._pending_indices: List[int] = []
@@ -445,7 +452,7 @@ class DynamicBatcher:
             return False
         if len(self._pending_sequences) >= self._max_wait:
             return True
-        if self._pending_tokens >= self._batcher.max_batch_tokens * 0.8:
+        if self._pending_tokens >= self._batcher.max_batch_tokens * self._flush_threshold:
             return True
         return False
 

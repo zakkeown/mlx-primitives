@@ -4,13 +4,20 @@ Detects the specific Apple Silicon chip and provides optimal configurations
 for Metal kernels based on hardware capabilities.
 """
 
+import os
 import re
+import threading
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+
+from mlx_primitives.utils.logging import get_logger
+
+# Manual cache for chip info - allows us to skip caching fallback results
+_chip_info_cache: Optional["ChipInfo"] = None
+_chip_info_lock = threading.Lock()
 
 
 class ChipFamily(Enum):
@@ -20,6 +27,7 @@ class ChipFamily(Enum):
     M2 = "M2"
     M3 = "M3"
     M4 = "M4"
+    M5 = "M5"
     UNKNOWN = "UNKNOWN"
 
 
@@ -95,9 +103,16 @@ _GPU_CORES = {
     (ChipFamily.M3, ChipTier.BASE): 10,
     (ChipFamily.M3, ChipTier.PRO): 18,
     (ChipFamily.M3, ChipTier.MAX): 40,
+    (ChipFamily.M3, ChipTier.ULTRA): 80,
     (ChipFamily.M4, ChipTier.BASE): 10,
     (ChipFamily.M4, ChipTier.PRO): 20,
     (ChipFamily.M4, ChipTier.MAX): 40,
+    # NOTE: M4 Ultra will NOT ship - Apple confirmed M4 Max lacks UltraFusion connector
+    # M5 family (released October 2025)
+    (ChipFamily.M5, ChipTier.BASE): 10,
+    (ChipFamily.M5, ChipTier.PRO): 22,  # Expected Spring 2026
+    (ChipFamily.M5, ChipTier.MAX): 40,  # Expected Q1 2026
+    (ChipFamily.M5, ChipTier.ULTRA): 80,  # Expected 2026, 2x MAX
 }
 
 # ANE (Neural Engine) TOPS for different chip variants
@@ -113,9 +128,16 @@ _ANE_TOPS = {
     (ChipFamily.M3, ChipTier.BASE): 18.0,
     (ChipFamily.M3, ChipTier.PRO): 18.0,
     (ChipFamily.M3, ChipTier.MAX): 18.0,
+    (ChipFamily.M3, ChipTier.ULTRA): 36.0,
     (ChipFamily.M4, ChipTier.BASE): 38.0,
     (ChipFamily.M4, ChipTier.PRO): 38.0,
     (ChipFamily.M4, ChipTier.MAX): 38.0,
+    # NOTE: M4 Ultra will NOT ship
+    # M5 family - 16-core Neural Engine, competitive with 45-48 TOPS class
+    (ChipFamily.M5, ChipTier.BASE): 45.0,
+    (ChipFamily.M5, ChipTier.PRO): 45.0,
+    (ChipFamily.M5, ChipTier.MAX): 45.0,
+    (ChipFamily.M5, ChipTier.ULTRA): 90.0,  # 2x MAX pattern
 }
 
 # L2 cache sizes in MB (approximate)
@@ -131,9 +153,16 @@ _L2_CACHE_MB = {
     (ChipFamily.M3, ChipTier.BASE): 8,
     (ChipFamily.M3, ChipTier.PRO): 24,
     (ChipFamily.M3, ChipTier.MAX): 48,
+    (ChipFamily.M3, ChipTier.ULTRA): 96,
     (ChipFamily.M4, ChipTier.BASE): 12,
     (ChipFamily.M4, ChipTier.PRO): 24,
     (ChipFamily.M4, ChipTier.MAX): 48,
+    # NOTE: M4 Ultra will NOT ship
+    # M5 family
+    (ChipFamily.M5, ChipTier.BASE): 12,
+    (ChipFamily.M5, ChipTier.PRO): 24,
+    (ChipFamily.M5, ChipTier.MAX): 48,
+    (ChipFamily.M5, ChipTier.ULTRA): 96,
 }
 
 # Memory bandwidth in GB/s
@@ -149,9 +178,16 @@ _MEMORY_BANDWIDTH = {
     (ChipFamily.M3, ChipTier.BASE): 100.0,
     (ChipFamily.M3, ChipTier.PRO): 150.0,
     (ChipFamily.M3, ChipTier.MAX): 400.0,
+    (ChipFamily.M3, ChipTier.ULTRA): 800.0,
     (ChipFamily.M4, ChipTier.BASE): 120.0,
     (ChipFamily.M4, ChipTier.PRO): 273.0,
     (ChipFamily.M4, ChipTier.MAX): 546.0,
+    # NOTE: M4 Ultra will NOT ship
+    # M5 family (153.6 GB/s base = ~30% increase over M4)
+    (ChipFamily.M5, ChipTier.BASE): 153.6,
+    (ChipFamily.M5, ChipTier.PRO): 200.0,
+    (ChipFamily.M5, ChipTier.MAX): 546.0,  # Estimated similar to M4 Max
+    (ChipFamily.M5, ChipTier.ULTRA): 1092.0,  # 2x MAX
 }
 
 # Optimal block sizes for attention kernels per chip family
@@ -172,6 +208,10 @@ _ATTENTION_BLOCK_SIZES: dict[ChipFamily, dict[int, tuple[int, int]]] = {
         64: (64, 64),
         128: (64, 64),
     },
+    ChipFamily.M5: {
+        64: (64, 64),
+        128: (64, 64),
+    },
 }
 
 
@@ -179,16 +219,18 @@ def _parse_device_name(device_name: str) -> tuple[ChipFamily, ChipTier]:
     """Parse device name to extract chip family and tier."""
     name_lower = device_name.lower()
 
-    # Determine family
+    # Determine family (check newer chips first to avoid false matches)
     family = ChipFamily.UNKNOWN
-    if "m1" in name_lower:
-        family = ChipFamily.M1
-    elif "m2" in name_lower:
-        family = ChipFamily.M2
-    elif "m3" in name_lower:
-        family = ChipFamily.M3
+    if "m5" in name_lower:
+        family = ChipFamily.M5
     elif "m4" in name_lower:
         family = ChipFamily.M4
+    elif "m3" in name_lower:
+        family = ChipFamily.M3
+    elif "m2" in name_lower:
+        family = ChipFamily.M2
+    elif "m1" in name_lower:
+        family = ChipFamily.M1
 
     # Determine tier
     tier = ChipTier.BASE
@@ -202,7 +244,6 @@ def _parse_device_name(device_name: str) -> tuple[ChipFamily, ChipTier]:
     return family, tier
 
 
-@lru_cache(maxsize=1)
 def get_chip_info() -> ChipInfo:
     """Get information about the current Apple Silicon chip.
 
@@ -214,47 +255,105 @@ def get_chip_info() -> ChipInfo:
         >>> print(f"Running on {info.device_name}")
         >>> print(f"Family: {info.family.value}, Tier: {info.tier.value}")
         >>> print(f"GPU cores: {info.gpu_cores}, Memory: {info.memory_gb}GB")
+
+    Note:
+        Set MLX_PRIMITIVES_LOG_LEVEL=DEBUG to see detection details.
+        Set MLX_PRIMITIVES_LOG_LEVEL=WARNING to see fallback notifications.
+
+        Results are cached after successful detection. Fallback results
+        (when Metal is unavailable) are NOT cached, allowing retry if
+        Metal becomes available later.
     """
-    try:
-        device_info = mx.metal.device_info()
-    except Exception:
-        # Fallback if Metal not available
-        return ChipInfo(
-            family=ChipFamily.UNKNOWN,
-            tier=ChipTier.BASE,
-            device_name="Unknown",
-            gpu_cores=8,
-            memory_gb=8.0,
+    global _chip_info_cache
+
+    # Fast path: return cached result if available
+    if _chip_info_cache is not None:
+        return _chip_info_cache
+
+    with _chip_info_lock:
+        # Double-check after acquiring lock
+        if _chip_info_cache is not None:
+            return _chip_info_cache
+
+        try:
+            device_info = mx.metal.device_info()
+            get_logger().debug(f"Metal device info: {device_info}")
+        except Exception as e:
+            # Fallback if Metal not available - DO NOT CACHE
+            # This allows retry if Metal becomes available later
+            get_logger().warning(
+                f"Hardware detection failed: {e}. "
+                "Using conservative fallback values (8 GPU cores, 8MB L2 cache). "
+                "Performance may be suboptimal. This result is not cached - "
+                "detection will be retried on next call."
+            )
+            return ChipInfo(
+                family=ChipFamily.UNKNOWN,
+                tier=ChipTier.BASE,
+                device_name="Unknown",
+                gpu_cores=8,
+                memory_gb=8.0,
+            )
+
+        device_name = device_info.get("device_name", "Unknown")
+        memory_size = device_info.get("memory_size", 8 * 1024 * 1024 * 1024)
+        memory_gb = memory_size / (1024**3)
+
+        family, tier = _parse_device_name(device_name)
+        get_logger().debug(f"Detected chip: family={family.value}, tier={tier.value}")
+
+        # Track if we're using fallback values
+        using_fallback = False
+
+        # Get GPU core count
+        gpu_cores = _GPU_CORES.get((family, tier))
+        if gpu_cores is None:
+            gpu_cores = 8
+            using_fallback = True
+            get_logger().debug(f"GPU cores not in lookup table for {family.value} {tier.value}, using default: {gpu_cores}")
+
+        # Get ANE TOPS
+        ane_tops = _ANE_TOPS.get((family, tier))
+        if ane_tops is None:
+            ane_tops = 11.0
+            using_fallback = True
+            get_logger().debug(f"ANE TOPS not in lookup table for {family.value} {tier.value}, using default: {ane_tops}")
+
+        # Get L2 cache size
+        l2_cache_mb = _L2_CACHE_MB.get((family, tier))
+        if l2_cache_mb is None:
+            l2_cache_mb = 8
+            using_fallback = True
+            get_logger().debug(f"L2 cache not in lookup table for {family.value} {tier.value}, using default: {l2_cache_mb}MB")
+
+        # Get memory bandwidth
+        bandwidth = _MEMORY_BANDWIDTH.get((family, tier))
+        if bandwidth is None:
+            bandwidth = 100.0
+            using_fallback = True
+            get_logger().debug(f"Memory bandwidth not in lookup table for {family.value} {tier.value}, using default: {bandwidth} GB/s")
+
+        if using_fallback:
+            get_logger().warning(
+                f"Chip variant '{device_name}' not fully recognized. "
+                "Using some fallback values. Performance may be suboptimal. "
+                "Please report this chip at: https://github.com/anthropics/mlx-primitives/issues"
+            )
+
+        result = ChipInfo(
+            family=family,
+            tier=tier,
+            device_name=device_name,
+            gpu_cores=gpu_cores,
+            memory_gb=memory_gb,
+            ane_tops=ane_tops,
+            l2_cache_mb=l2_cache_mb,
+            memory_bandwidth_gbps=bandwidth,
         )
 
-    device_name = device_info.get("device_name", "Unknown")
-    memory_size = device_info.get("memory_size", 8 * 1024 * 1024 * 1024)
-    memory_gb = memory_size / (1024**3)
-
-    family, tier = _parse_device_name(device_name)
-
-    # Get GPU core count
-    gpu_cores = _GPU_CORES.get((family, tier), 8)
-
-    # Get ANE TOPS
-    ane_tops = _ANE_TOPS.get((family, tier), 11.0)
-
-    # Get L2 cache size
-    l2_cache_mb = _L2_CACHE_MB.get((family, tier), 8)
-
-    # Get memory bandwidth
-    bandwidth = _MEMORY_BANDWIDTH.get((family, tier), 100.0)
-
-    return ChipInfo(
-        family=family,
-        tier=tier,
-        device_name=device_name,
-        gpu_cores=gpu_cores,
-        memory_gb=memory_gb,
-        ane_tops=ane_tops,
-        l2_cache_mb=l2_cache_mb,
-        memory_bandwidth_gbps=bandwidth,
-    )
+        # Cache successful detection result
+        _chip_info_cache = result
+        return result
 
 
 def get_optimal_attention_config(head_dim: int) -> KernelConfig:

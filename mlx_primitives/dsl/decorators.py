@@ -85,10 +85,10 @@ class CompiledKernel:
         self._compiled_cache: dict[tuple, Any] = {}
         self._metal_source_cache: dict[tuple, str] = {}
         self._best_config: Optional[Config] = None
-        # Auto-tuning state
+        # Auto-tuning state - use lock for thread-safe cache access
         self._autotune_results: dict[tuple, Config] = {}  # (name, tuning_key) -> Config
         self._persistent_cache: bool = True
-        self._autotuning_lock = None  # Lazy init to avoid threading import at module load
+        self._cache_lock = threading.Lock()  # Protects _autotune_results and _compiled_cache
 
     def __call__(self, *args, grid: tuple, **kwargs) -> Any:
         """Execute the kernel.
@@ -103,21 +103,22 @@ class CompiledKernel:
         """
         from mlx_primitives.dsl.compiler import compile_kernel, execute_kernel
 
-        # Determine configuration
+        # Determine configuration (thread-safe via _cache_lock)
         config = self._select_config(args, kwargs, grid)
 
-        # Get or compile kernel for this configuration
+        # Get or compile kernel for this configuration (thread-safe)
         cache_key = self._make_cache_key(config)
-        if cache_key not in self._compiled_cache:
-            metal_source, kernel_info = compile_kernel(
-                self.kernel_def,
-                config,
-                debug=self.debug,
-            )
-            self._compiled_cache[cache_key] = kernel_info
-            self._metal_source_cache[cache_key] = metal_source
+        with self._cache_lock:
+            if cache_key not in self._compiled_cache:
+                metal_source, kernel_info = compile_kernel(
+                    self.kernel_def,
+                    config,
+                    debug=self.debug,
+                )
+                self._compiled_cache[cache_key] = kernel_info
+                self._metal_source_cache[cache_key] = metal_source
 
-        kernel_info = self._compiled_cache[cache_key]
+            kernel_info = self._compiled_cache[cache_key]
 
         # Build full args list, adding constexpr values in order
         # Args are positional (tensors), kwargs contain constexpr values and grid
@@ -137,6 +138,8 @@ class CompiledKernel:
         1. Already-tuned best config for this tuning key
         2. Run auto-tuning if configs are provided and key matches
         3. Default config from kwargs
+
+        Thread-safe: uses _cache_lock to protect cache access.
         """
         # If we have a globally set best config, use it
         if self._best_config is not None:
@@ -151,21 +154,23 @@ class CompiledKernel:
         tuning_key = self._compute_tuning_key(kwargs)
         cache_key = (self.kernel_def.name, tuning_key)
 
-        # Check local cache first
-        if cache_key in self._autotune_results:
-            return self._autotune_results[cache_key]
+        # Thread-safe cache access
+        with self._cache_lock:
+            # Check local cache first
+            if cache_key in self._autotune_results:
+                return self._autotune_results[cache_key]
 
-        # Check global cache (including disk persistence)
-        from mlx_primitives.dsl.autotuner import get_autotune_cache
-        cached = get_autotune_cache().get(self.kernel_def.name, tuning_key)
-        if cached is not None:
-            self._autotune_results[cache_key] = cached
-            return cached
+            # Check global cache (including disk persistence)
+            from mlx_primitives.dsl.autotuner import get_autotune_cache
+            cached = get_autotune_cache().get(self.kernel_def.name, tuning_key)
+            if cached is not None:
+                self._autotune_results[cache_key] = cached
+                return cached
 
-        # Run auto-tuning
-        best_config = self._run_autotune(args, kwargs, grid, tuning_key)
-        self._autotune_results[cache_key] = best_config
-        return best_config
+            # Run auto-tuning (still inside lock to prevent duplicate tuning)
+            best_config = self._run_autotune(args, kwargs, grid, tuning_key)
+            self._autotune_results[cache_key] = best_config
+            return best_config
 
     def _compute_tuning_key(self, kwargs: dict) -> tuple:
         """Compute the tuning key from current invocation kwargs.
@@ -192,45 +197,34 @@ class CompiledKernel:
     ) -> Config:
         """Execute auto-tuning over all configs.
 
-        Uses a lock to prevent concurrent auto-tuning of the same kernel.
+        Note: Caller must hold _cache_lock to prevent concurrent auto-tuning.
         """
-        # Lazy init the lock
-        if self._autotuning_lock is None:
-            self._autotuning_lock = threading.Lock()
+        from mlx_primitives.dsl.autotuner import DSLAutoTuner, get_autotune_cache
 
-        # Acquire lock to prevent concurrent tuning
-        with self._autotuning_lock:
-            # Double-check cache after acquiring lock
-            cache_key = (self.kernel_def.name, tuning_key)
-            if cache_key in self._autotune_results:
-                return self._autotune_results[cache_key]
+        tuner = DSLAutoTuner(
+            warmup=self.kernel_def.autotune_warmup,
+            rep=self.kernel_def.autotune_rep,
+        )
 
-            from mlx_primitives.dsl.autotuner import DSLAutoTuner, get_autotune_cache
+        result = tuner.tune(
+            kernel=self,
+            configs=self.kernel_def.configs,
+            args=args,
+            kwargs=kwargs,
+            grid=grid,
+            tuning_key=tuning_key,
+        )
 
-            tuner = DSLAutoTuner(
-                warmup=self.kernel_def.autotune_warmup,
-                rep=self.kernel_def.autotune_rep,
+        # Cache result
+        if self._persistent_cache:
+            get_autotune_cache().put(
+                self.kernel_def.name,
+                tuning_key,
+                result.best_config,
+                result,
             )
 
-            result = tuner.tune(
-                kernel=self,
-                configs=self.kernel_def.configs,
-                args=args,
-                kwargs=kwargs,
-                grid=grid,
-                tuning_key=tuning_key,
-            )
-
-            # Cache result
-            if self._persistent_cache:
-                get_autotune_cache().put(
-                    self.kernel_def.name,
-                    tuning_key,
-                    result.best_config,
-                    result,
-                )
-
-            return result.best_config
+        return result.best_config
 
     def _make_cache_key(self, config: Config) -> tuple:
         """Create hashable cache key from config."""

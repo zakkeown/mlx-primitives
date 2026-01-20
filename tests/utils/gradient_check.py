@@ -30,20 +30,18 @@ def numerical_gradient(
         Numerical gradient with same shape as inputs[arg_idx].
     """
     x = inputs[arg_idx]
-    grad = mx.zeros_like(x)
     flat_x = x.flatten()
-    flat_grad = grad.flatten()
+    num_elements = flat_x.size
+    grad_values = []
 
-    for i in range(flat_x.size):
-        # Create perturbed inputs
-        x_plus = flat_x.tolist()
-        x_minus = flat_x.tolist()
-        x_plus[i] = x_plus[i] + eps
-        x_minus[i] = x_minus[i] - eps
+    for i in range(num_elements):
+        # Create one-hot perturbation vector using MLX ops (avoids O(n) tolist)
+        one_hot = mx.zeros((num_elements,), dtype=flat_x.dtype)
+        one_hot = one_hot.at[i].add(1.0)
 
-        # Reshape back
-        x_plus_arr = mx.array(x_plus).reshape(x.shape)
-        x_minus_arr = mx.array(x_minus).reshape(x.shape)
+        # Create perturbed arrays
+        x_plus_arr = (flat_x + eps * one_hot).reshape(x.shape)
+        x_minus_arr = (flat_x - eps * one_hot).reshape(x.shape)
 
         # Compute function values
         inputs_plus = inputs[:arg_idx] + [x_plus_arr] + inputs[arg_idx + 1:]
@@ -54,9 +52,9 @@ def numerical_gradient(
 
         # Central difference
         grad_i = (f_plus.item() - f_minus.item()) / (2 * eps)
-        flat_grad = flat_grad.at[i].add(grad_i)
+        grad_values.append(grad_i)
 
-    return flat_grad.reshape(x.shape)
+    return mx.array(grad_values).reshape(x.shape)
 
 
 def numerical_gradient_fast(
@@ -90,17 +88,17 @@ def numerical_gradient_fast(
     flat_x = x.flatten()
 
     numerical_grads = []
-    for idx in indices.tolist():
-        idx = int(idx)
-        # Create perturbed inputs
-        x_plus = flat_x.tolist()
-        x_minus = flat_x.tolist()
-        x_plus[idx] = x_plus[idx] + eps
-        x_minus[idx] = x_minus[idx] - eps
+    # Convert indices once for iteration (small array, acceptable)
+    indices_list = [int(i) for i in indices.tolist()]
 
-        # Reshape back
-        x_plus_arr = mx.array(x_plus).reshape(x.shape)
-        x_minus_arr = mx.array(x_minus).reshape(x.shape)
+    for idx in indices_list:
+        # Create one-hot perturbation vector using MLX ops (avoids O(n) tolist)
+        one_hot = mx.zeros((num_elements,), dtype=flat_x.dtype)
+        one_hot = one_hot.at[idx].add(1.0)
+
+        # Create perturbed arrays
+        x_plus_arr = (flat_x + eps * one_hot).reshape(x.shape)
+        x_minus_arr = (flat_x - eps * one_hot).reshape(x.shape)
 
         # Compute function values
         inputs_plus = inputs[:arg_idx] + [x_plus_arr] + inputs[arg_idx + 1:]
