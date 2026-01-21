@@ -381,6 +381,11 @@ class AvgPool1d(nn.Module):
         if self.padding > 0:
             x = mx.pad(x, [(0, 0), (0, 0), (self.padding, self.padding)])
 
+        # Use fp32 accumulation for numerical stability (matches PyTorch behavior)
+        orig_dtype = x.dtype
+        if x.dtype in (mx.float16, mx.bfloat16):
+            x = x.astype(mx.float32)
+
         batch, channels, length = x.shape
 
         # Calculate output length
@@ -393,7 +398,8 @@ class AvgPool1d(nn.Module):
             pooled = mx.mean(x[..., start:end], axis=-1, keepdims=True)
             outputs.append(pooled)
 
-        return mx.concatenate(outputs, axis=-1)
+        result = mx.concatenate(outputs, axis=-1)
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class MaxPool1d(nn.Module):

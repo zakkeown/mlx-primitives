@@ -1,7 +1,7 @@
 """Tolerance configurations and standard test shapes for golden file generation."""
 
 from typing import Dict
-from .base import ToleranceConfig
+from base import ToleranceConfig
 
 
 # =============================================================================

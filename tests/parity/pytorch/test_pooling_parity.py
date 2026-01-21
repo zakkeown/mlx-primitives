@@ -775,3 +775,341 @@ class TestSpatialPyramidPoolingParity:
 
         assert mlx_out.shape == (batch, expected_features), \
             f"SPP output shape mismatch: expected {(batch, expected_features)}, got {mlx_out.shape}"
+
+
+# =============================================================================
+# AvgPool1d Parity Tests
+# =============================================================================
+
+POOLING_1D_SIZE_CONFIGS = {
+    "tiny": {"batch": 2, "channels": 32, "length": 64},
+    "small": {"batch": 4, "channels": 64, "length": 128},
+    "medium": {"batch": 8, "channels": 128, "length": 256},
+    "large": {"batch": 4, "channels": 128, "length": 512},
+}
+
+
+class TestAvgPool1dParity:
+    """Tests for AvgPool1d parity with PyTorch."""
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.forward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium", "large"])
+    @pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
+    @pytest.mark.parametrize("kernel_size", [2, 3, 5])
+    def test_forward_parity(self, size, dtype, kernel_size, skip_without_pytorch):
+        """Test AvgPool1d forward pass matches PyTorch."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        config = POOLING_1D_SIZE_CONFIGS[size]
+        batch, channels, length = config["batch"], config["channels"], config["length"]
+
+        if kernel_size > length:
+            pytest.skip(f"kernel_size={kernel_size} > length={length}")
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size)
+        x_mlx = _convert_to_mlx(x_np, dtype)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = _convert_to_torch(x_np, dtype)
+        torch_out = F.avg_pool1d(x_torch, kernel_size=kernel_size)
+
+        rtol, atol = get_tolerance("pooling", "avg_pool1d", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(torch_out),
+            rtol=rtol, atol=atol,
+            err_msg=f"AvgPool1d mismatch [{size}, {dtype}, kernel={kernel_size}]"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.parametrize("stride", [1, 2, 3])
+    def test_various_strides(self, stride, skip_without_pytorch):
+        """Test AvgPool1d with different strides."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size, stride=stride)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.avg_pool1d(x_torch, kernel_size=kernel_size, stride=stride)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"AvgPool1d with stride={stride} mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.parametrize("padding", [0, 1, 2])
+    def test_with_padding(self, padding, skip_without_pytorch):
+        """Test AvgPool1d with padding."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 5
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size, padding=padding)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.avg_pool1d(x_torch, kernel_size=kernel_size, padding=padding)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"AvgPool1d with padding={padding} mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.edge_case
+    def test_kernel_equals_input(self, skip_without_pytorch):
+        """Test AvgPool1d when kernel_size equals input length (global pooling)."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        batch, channels, length = 4, 64, 32
+        kernel_size = length
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.avg_pool1d(x_torch, kernel_size=kernel_size)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg="AvgPool1d global pooling mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small"])
+    def test_backward_parity(self, size, skip_without_pytorch):
+        """Test AvgPool1d backward pass matches PyTorch."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        config = POOLING_1D_SIZE_CONFIGS[size]
+        batch, channels, length = config["batch"], config["channels"], config["length"]
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size)
+
+        def mlx_loss_fn(x):
+            return mx.sum(pool(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        x_torch = torch.from_numpy(x_np).requires_grad_(True)
+        torch_out = F.avg_pool1d(x_torch, kernel_size=kernel_size)
+        torch_out.sum().backward()
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), x_torch.grad.numpy(),
+            rtol=1e-4, atol=1e-5,
+            err_msg=f"AvgPool1d backward mismatch [{size}]"
+        )
+
+
+# =============================================================================
+# MaxPool1d Parity Tests
+# =============================================================================
+
+class TestMaxPool1dParity:
+    """Tests for MaxPool1d parity with PyTorch."""
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.forward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium", "large"])
+    @pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
+    @pytest.mark.parametrize("kernel_size", [2, 3, 5])
+    def test_forward_parity(self, size, dtype, kernel_size, skip_without_pytorch):
+        """Test MaxPool1d forward pass matches PyTorch."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        config = POOLING_1D_SIZE_CONFIGS[size]
+        batch, channels, length = config["batch"], config["channels"], config["length"]
+
+        if kernel_size > length:
+            pytest.skip(f"kernel_size={kernel_size} > length={length}")
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+        x_mlx = _convert_to_mlx(x_np, dtype)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = _convert_to_torch(x_np, dtype)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size)
+
+        rtol, atol = get_tolerance("pooling", "max_pool1d", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(torch_out),
+            rtol=rtol, atol=atol,
+            err_msg=f"MaxPool1d mismatch [{size}, {dtype}, kernel={kernel_size}]"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.parametrize("stride", [1, 2, 3])
+    def test_various_strides(self, stride, skip_without_pytorch):
+        """Test MaxPool1d with different strides."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size, stride=stride)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size, stride=stride)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"MaxPool1d with stride={stride} mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.parametrize("padding", [0, 1, 2])
+    def test_with_padding(self, padding, skip_without_pytorch):
+        """Test MaxPool1d with padding."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 5
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size, padding=padding)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size, padding=padding)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"MaxPool1d with padding={padding} mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.edge_case
+    def test_kernel_equals_input(self, skip_without_pytorch):
+        """Test MaxPool1d when kernel_size equals input length (global max pooling)."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 4, 64, 32
+        kernel_size = length
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg="MaxPool1d global pooling mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.edge_case
+    def test_with_negative_values(self, skip_without_pytorch):
+        """Test MaxPool1d with all negative values."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 2, 32, 64
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = -np.abs(np.random.randn(batch, channels, length)).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        x_torch = torch.from_numpy(x_np)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), torch_out.numpy(),
+            rtol=1e-5, atol=1e-6,
+            err_msg="MaxPool1d with negative values mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small"])
+    def test_backward_parity(self, size, skip_without_pytorch):
+        """Test MaxPool1d backward pass matches PyTorch."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        config = POOLING_1D_SIZE_CONFIGS[size]
+        batch, channels, length = config["batch"], config["channels"], config["length"]
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+
+        def mlx_loss_fn(x):
+            return mx.sum(pool(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        x_torch = torch.from_numpy(x_np).requires_grad_(True)
+        torch_out = F.max_pool1d(x_torch, kernel_size=kernel_size)
+        torch_out.sum().backward()
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), x_torch.grad.numpy(),
+            rtol=1e-4, atol=1e-5,
+            err_msg=f"MaxPool1d backward mismatch [{size}]"
+        )

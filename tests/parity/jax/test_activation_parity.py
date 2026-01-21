@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from tests.parity.shared.input_generators import SIZE_CONFIGS
-from tests.parity.shared.tolerance_config import get_tolerance
+from tests.parity.shared.tolerance_config import get_tolerance, get_gradient_tolerance
 from tests.parity.conftest import get_mlx_dtype, get_jax_dtype, HAS_JAX
 
 if HAS_JAX:
@@ -561,4 +561,492 @@ class TestHardSigmoidParity:
             _to_numpy(mlx_out), _to_numpy(jax_out),
             rtol=rtol, atol=atol,
             err_msg=f"Hard Sigmoid forward mismatch (JAX) [{size}]"
+        )
+
+
+# =============================================================================
+# Backward Parity Tests
+# =============================================================================
+
+class TestGELUExactBackwardParity:
+    """GELU (exact) backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test exact GELU backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(nn.gelu(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.gelu(x, approximate=False))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "gelu_exact", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"GELU exact backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestGELUApproximateBackwardParity:
+    """GELU (approximate/tanh) backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test approximate GELU backward pass parity with JAX."""
+        from mlx_primitives.layers import gelu_tanh
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(gelu_tanh(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.gelu(x, approximate=True))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "gelu_approx", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"GELU approximate backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestSiLUBackwardParity:
+    """SiLU backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test SiLU backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(nn.silu(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.silu(x))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "silu", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"SiLU backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestReLUBackwardParity:
+    """ReLU backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test ReLU backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(nn.relu(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.relu(x))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        # ReLU is tight - use smaller tolerances
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"ReLU backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestSoftmaxBackwardParity:
+    """Softmax backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test Softmax backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(mx.softmax(x, axis=-1))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.softmax(x, axis=-1))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=1e-4, atol=1e-5,
+            err_msg=f"Softmax backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestSigmoidBackwardParity:
+    """Sigmoid backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test Sigmoid backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(mx.sigmoid(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnn.sigmoid(x))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"Sigmoid backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestTanhBackwardParity:
+    """Tanh backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test Tanh backward pass parity with JAX."""
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(mx.tanh(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        def jax_loss_fn(x):
+            return jnp.sum(jnp.tanh(x))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=1e-5, atol=1e-6,
+            err_msg=f"Tanh backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestMishBackwardParity:
+    """Mish backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test Mish backward pass parity with JAX."""
+        from mlx_primitives.layers import mish
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(mish(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward: mish = x * tanh(softplus(x))
+        def jax_loss_fn(x):
+            softplus = jnp.log1p(jnp.exp(x))
+            return jnp.sum(x * jnp.tanh(softplus))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "mish", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"Mish backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestHardSwishBackwardParity:
+    """Hard Swish backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test Hard Swish backward pass parity with JAX."""
+        from mlx_primitives.layers import hard_swish
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(hard_swish(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward: hard_swish = x * clip(x + 3, 0, 6) / 6
+        def jax_loss_fn(x):
+            return jnp.sum(x * jnp.clip(x + 3, 0, 6) / 6)
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "hard_swish", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"Hard Swish backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestGeGLUBackwardParity:
+    """GeGLU backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test GeGLU backward pass parity with JAX."""
+        from mlx_primitives.layers import GeGLU
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+        hidden_dim = dim * 4
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX forward and backward
+        geglu_mlx = GeGLU(dim, hidden_dim)
+        mx.eval(geglu_mlx.parameters())
+
+        w1_np = np.array(geglu_mlx.w1.weight)
+        w2_np = np.array(geglu_mlx.w2.weight)
+        w_gate_np = np.array(geglu_mlx.w_gate.weight)
+
+        def mlx_loss_fn(x):
+            return mx.sum(geglu_mlx(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        w1_jax = jnp.array(w1_np.T)
+        w2_jax = jnp.array(w2_np.T)
+        w_gate_jax = jnp.array(w_gate_np.T)
+
+        def jax_loss_fn(x):
+            gate = jnn.gelu(x @ w_gate_jax, approximate=False)
+            up = x @ w1_jax
+            out = (gate * up) @ w2_jax
+            return jnp.sum(out)
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "geglu", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"GeGLU backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestReGLUBackwardParity:
+    """ReGLU backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test ReGLU backward pass parity with JAX."""
+        from mlx_primitives.layers import ReGLU
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+        hidden_dim = dim * 4
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX forward and backward
+        reglu_mlx = ReGLU(dim, hidden_dim)
+        mx.eval(reglu_mlx.parameters())
+
+        w1_np = np.array(reglu_mlx.w1.weight)
+        w2_np = np.array(reglu_mlx.w2.weight)
+        w_gate_np = np.array(reglu_mlx.w_gate.weight)
+
+        def mlx_loss_fn(x):
+            return mx.sum(reglu_mlx(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward
+        w1_jax = jnp.array(w1_np.T)
+        w2_jax = jnp.array(w2_np.T)
+        w_gate_jax = jnp.array(w_gate_np.T)
+
+        def jax_loss_fn(x):
+            gate = jnn.relu(x @ w_gate_jax)
+            up = x @ w1_jax
+            out = (gate * up) @ w2_jax
+            return jnp.sum(out)
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "reglu", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"ReGLU backward mismatch (JAX) [{size}]"
+        )
+
+
+class TestQuickGELUBackwardParity:
+    """QuickGELU backward parity tests against JAX."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_jax):
+        """Test QuickGELU backward pass parity with JAX."""
+        from mlx_primitives.layers import quick_gelu
+
+        config = SIZE_CONFIGS[size]["activation"]
+        batch, seq, dim = config["batch"], config["seq"], config["dim"]
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, dim).astype(np.float32)
+
+        # MLX backward
+        def mlx_loss_fn(x):
+            return mx.sum(quick_gelu(x))
+
+        x_mlx = mx.array(x_np)
+        mlx_grad = mx.grad(mlx_loss_fn)(x_mlx)
+        mx.eval(mlx_grad)
+
+        # JAX backward: quick_gelu = x * sigmoid(1.702 * x)
+        def jax_loss_fn(x):
+            return jnp.sum(x * jnn.sigmoid(1.702 * x))
+
+        x_jax = jnp.array(x_np)
+        jax_grad = jax.grad(jax_loss_fn)(x_jax)
+
+        rtol, atol = get_gradient_tolerance("activations", "quick_gelu", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad), _to_numpy(jax_grad),
+            rtol=rtol, atol=atol,
+            err_msg=f"QuickGELU backward mismatch (JAX) [{size}]"
         )

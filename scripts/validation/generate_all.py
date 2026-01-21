@@ -55,6 +55,7 @@ from generators.activations import (
     GeGLUGenerator,
     ReGLUGenerator,
     FusedSwiGLUGenerator,
+    FusedGeGLUGenerator,
     GELUGenerator,
     GELUTanhGenerator,
     QuickGELUGenerator,
@@ -80,6 +81,7 @@ from generators.attention import (
     RoPEGenerator,
     RoPENTKGenerator,
     RoPEYaRNGenerator,
+    FusedRoPEAttentionGenerator,
 )
 
 from generators.normalization import (
@@ -88,6 +90,7 @@ from generators.normalization import (
     InstanceNormGenerator,
     AdaLayerNormGenerator,
     QKNormGenerator,
+    FusedRMSNormLinearGenerator,
 )
 
 from generators.ssm import (
@@ -149,6 +152,7 @@ GENERATORS: Dict[str, List[Tuple[str, Type[GoldenGenerator]]]] = {
         ("geglu", GeGLUGenerator),
         ("reglu", ReGLUGenerator),
         ("fused_swiglu", FusedSwiGLUGenerator),
+        ("fused_geglu", FusedGeGLUGenerator),
         ("gelu", GELUGenerator),
         ("gelu_tanh", GELUTanhGenerator),
         ("quick_gelu", QuickGELUGenerator),
@@ -173,6 +177,7 @@ GENERATORS: Dict[str, List[Tuple[str, Type[GoldenGenerator]]]] = {
         ("rope", RoPEGenerator),
         ("rope_ntk", RoPENTKGenerator),
         ("rope_yarn", RoPEYaRNGenerator),
+        ("fused_rope_attention", FusedRoPEAttentionGenerator),
     ],
     "normalization": [
         ("rmsnorm", RMSNormGenerator),
@@ -180,6 +185,7 @@ GENERATORS: Dict[str, List[Tuple[str, Type[GoldenGenerator]]]] = {
         ("instancenorm", InstanceNormGenerator),
         ("adalayernorm", AdaLayerNormGenerator),
         ("qknorm", QKNormGenerator),
+        ("fused_rmsnorm_linear", FusedRMSNormLinearGenerator),
     ],
     "ssm": [
         ("selective_scan", SelectiveScanGenerator),

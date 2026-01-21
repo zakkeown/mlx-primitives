@@ -68,6 +68,11 @@ class AttentionBenchmarks:
         results.extend(self.run_sparse_attention_benchmarks())
         results.extend(self.run_chunked_attention_benchmarks())
 
+        # Extended variants
+        results.extend(self.run_quantized_kv_cache_benchmarks())
+        results.extend(self.run_bigbird_benchmarks())
+        results.extend(self.run_cosformer_benchmarks())
+
         return results
 
     def _benchmark_naive_attention(
@@ -769,5 +774,196 @@ class AttentionBenchmarks:
             "head_dim": head_dim,
             "type": "optimized",
             "operation": "chunked_cross_attention",
+        }
+        return result
+
+    def run_quantized_kv_cache_benchmarks(self) -> list[BenchmarkResult]:
+        """Run quantized KV cache attention benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (4, 1024, 16, 64),
+        ]
+
+        for batch, seq, heads, dim in configs:
+            result = self._benchmark_quantized_kv_cache_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_quantized_kv_cache_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark quantized KV cache attention (INT8 KV cache)."""
+        try:
+            from mlx_primitives.attention.quantized_kv_cache import QuantizedKVCacheAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        dims = num_heads * head_dim
+        attn = QuantizedKVCacheAttention(
+            dims=dims,
+            num_heads=num_heads,
+            max_seq_len=seq_len * 2,
+            causal=True,
+        )
+        mx.eval(attn.parameters())
+
+        x = mx.random.normal((batch_size, seq_len, dims))
+
+        def fn():
+            return attn(x)
+
+        name = f"quantized_kv_cache_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "quantized_kv_cache_attention",
+        }
+        return result
+
+    def run_bigbird_benchmarks(self) -> list[BenchmarkResult]:
+        """Run BigBird attention benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (2, 2048, 8, 64),
+        ]
+
+        for batch, seq, heads, dim in configs:
+            result = self._benchmark_bigbird_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_bigbird_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark BigBird attention (random + window + global)."""
+        try:
+            from mlx_primitives.attention.sparse import BigBirdAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        dims = num_heads * head_dim
+        window_size = min(64, seq_len // 4)
+        num_global_tokens = min(4, seq_len // 16)
+
+        attn = BigBirdAttention(
+            dims=dims,
+            num_heads=num_heads,
+            window_size=window_size,
+            num_global_tokens=num_global_tokens,
+        )
+        mx.eval(attn.parameters())
+
+        x = mx.random.normal((batch_size, seq_len, dims))
+
+        def fn():
+            return attn(x)
+
+        name = f"bigbird_attn_b{batch_size}_s{seq_len}_w{window_size}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "window_size": window_size,
+            "type": "optimized",
+            "operation": "bigbird_attention",
+        }
+        return result
+
+    def run_cosformer_benchmarks(self) -> list[BenchmarkResult]:
+        """Run CosFormer attention benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (4, 1024, 8, 64),
+        ]
+
+        for batch, seq, heads, dim in configs:
+            result = self._benchmark_cosformer_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_cosformer_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark CosFormer attention (cos-based reweighting)."""
+        try:
+            from mlx_primitives.attention.linear import CosFormerAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        dims = num_heads * head_dim
+        attn = CosFormerAttention(
+            dims=dims,
+            num_heads=num_heads,
+        )
+        mx.eval(attn.parameters())
+
+        x = mx.random.normal((batch_size, seq_len, dims))
+
+        def fn():
+            return attn(x)
+
+        name = f"cosformer_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "cosformer_attention",
         }
         return result

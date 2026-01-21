@@ -19,6 +19,12 @@ from benchmarks.suites import (
     GenerationBenchmarks,
     TrainingBenchmarks,
     QuantizationBenchmarks,
+    MemoryBenchmarks,
+)
+from benchmarks.backward import (
+    AttentionBackwardBenchmarks,
+    KernelsBackwardBenchmarks,
+    MoEBackwardBenchmarks,
 )
 from benchmarks.reports.table_formatter import print_results_table, print_comparison_table
 from benchmarks.reports.json_exporter import export_to_json
@@ -35,6 +41,11 @@ SUITE_NAMES = [
     "generation",
     "training",
     "quantization",
+    "memory",
+    "backward",
+    "backward_attention",
+    "backward_kernels",
+    "backward_moe",
     "all",
 ]
 
@@ -62,6 +73,12 @@ class BenchmarkRunner:
         self.generation = GenerationBenchmarks(config=self.config)
         self.training = TrainingBenchmarks(config=self.config)
         self.quantization = QuantizationBenchmarks(config=self.config)
+        self.memory = MemoryBenchmarks(config=self.config)
+
+        # Backward pass suites
+        self.backward_attention = AttentionBackwardBenchmarks(config=self.config)
+        self.backward_kernels = KernelsBackwardBenchmarks(config=self.config)
+        self.backward_moe = MoEBackwardBenchmarks(config=self.config)
 
         # External baselines (lazy loaded)
         self._pytorch_baselines = None
@@ -137,6 +154,23 @@ class BenchmarkRunner:
         if suite_name in ("quantization", "all"):
             print("Running quantization benchmarks...")
             results.extend(self.quantization.run_all())
+
+        if suite_name in ("memory", "all"):
+            print("Running memory benchmarks...")
+            results.extend(self.memory.run_all())
+
+        # Backward pass suites
+        if suite_name in ("backward", "backward_attention", "all"):
+            print("Running attention backward benchmarks...")
+            results.extend(self.backward_attention.run_all())
+
+        if suite_name in ("backward", "backward_kernels", "all"):
+            print("Running kernel backward benchmarks...")
+            results.extend(self.backward_kernels.run_all())
+
+        if suite_name in ("backward", "backward_moe", "all"):
+            print("Running MoE backward benchmarks...")
+            results.extend(self.backward_moe.run_all())
 
         return results
 

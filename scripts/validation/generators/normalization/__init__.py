@@ -4,6 +4,7 @@ from .standard import RMSNormGenerator, GroupNormGenerator
 from .instance import InstanceNormGenerator
 from .adaptive import AdaLayerNormGenerator
 from .qknorm import QKNormGenerator
+from .fused import FusedRMSNormLinearGenerator
 
 __all__ = [
     "RMSNormGenerator",
@@ -11,4 +12,5 @@ __all__ = [
     "InstanceNormGenerator",
     "AdaLayerNormGenerator",
     "QKNormGenerator",
+    "FusedRMSNormLinearGenerator",
 ]

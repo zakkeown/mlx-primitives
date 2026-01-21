@@ -260,9 +260,11 @@ def apply_top_k(logits: mx.array, k: int) -> mx.array:
         return logits
 
     # Get k-th largest value for each batch
-    # Use ascending sort and negative index to avoid MLX slicing bug
+    # Use ascending sort and take the k-th element from the end
     sorted_logits = mx.sort(logits, axis=-1)  # Ascending
-    threshold = sorted_logits[:, -k : -k + 1]  # k-th largest, shape (batch, 1)
+    # Note: [:, -k:-k+1] fails when k=1 (becomes [:, -1:0] which is empty)
+    # Instead, use [:, -k] and reshape to preserve the batch dimension
+    threshold = sorted_logits[:, -k : sorted_logits.shape[-1] - k + 1]  # k-th largest, shape (batch, 1)
 
     # Mask values below threshold
     return mx.where(logits >= threshold, logits, mx.array(float("-inf")))
@@ -287,8 +289,9 @@ def apply_top_p(logits: mx.array, p: float) -> mx.array:
     sorted_indices = mx.argsort(logits, axis=-1)[:, ::-1]  # Descending
     sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
 
-    # Compute cumulative probabilities
-    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    # Compute cumulative probabilities in fp32 for numerical stability
+    # bf16/fp16 cumsum accumulates significant error over large vocab sizes
+    sorted_probs = mx.softmax(sorted_logits.astype(mx.float32), axis=-1)
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
 
     # Find cutoff: keep tokens until cumulative prob exceeds p
@@ -595,3 +598,43 @@ def sample_multinomial(logits: mx.array) -> mx.array:
         Token IDs (batch,).
     """
     return mx.random.categorical(logits)
+
+
+def apply_min_p(logits: mx.array, min_p: float) -> mx.array:
+    """Apply min-p filtering to logits.
+
+    Keeps tokens with probability >= min_p * max_prob, where max_prob
+    is the maximum probability in each row. This dynamically adjusts
+    the threshold based on the confidence of the top prediction.
+
+    Args:
+        logits: Input logits (batch, vocab_size).
+        min_p: Minimum probability ratio threshold (0 to 1).
+            Higher values are more selective.
+
+    Returns:
+        Filtered logits with low-probability tokens set to -inf.
+    """
+    if min_p <= 0.0:
+        return logits
+
+    # Convert logits to probabilities using softmax
+    # Use float32 for numerical stability
+    probs = mx.softmax(logits.astype(mx.float32), axis=-1)
+
+    # Get max probability for each batch element
+    max_prob = mx.max(probs, axis=-1, keepdims=True)
+
+    # Compute threshold: min_p * max_prob
+    threshold = min_p * max_prob
+
+    # Create mask for tokens to keep (prob >= threshold)
+    keep_mask = probs >= threshold
+
+    # Ensure at least the top token is always kept
+    # This handles edge cases where min_p is very high
+    top_mask = probs == max_prob
+    keep_mask = mx.logical_or(keep_mask, top_mask)
+
+    # Set filtered tokens to -inf
+    return mx.where(keep_mask, logits, mx.array(float("-inf")))

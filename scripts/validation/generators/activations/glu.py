@@ -340,3 +340,118 @@ class FusedSwiGLUGenerator(GoldenGenerator):
             expected_outputs={"out": out.numpy()},
             metadata={"batch": batch, "seq": seq},
         )
+
+
+class FusedGeGLUGenerator(GoldenGenerator):
+    """Generate golden files for FusedGeGLU.
+
+    FusedGeGLU: gelu(x @ W_gate.T, approximate='tanh') * (x @ W_up.T)
+    Same computation as GeGLU but tests the fused (optimized) implementation.
+    Uses GELU tanh approximation to match the fused_activations.py implementation.
+    """
+
+    @property
+    def name(self) -> str:
+        return "fused_geglu"
+
+    def get_tolerance_config(self) -> ToleranceConfig:
+        return TOLERANCE_CONFIGS["activations_glu"]
+
+    def get_test_configs(self) -> List[Dict[str, Any]]:
+        configs = []
+
+        for size_name, shape in STANDARD_SHAPES.items():
+            configs.append(
+                {
+                    "name": f"fused_geglu_{size_name}",
+                    "batch": shape["batch"],
+                    "seq": shape["seq"],
+                    "in_dims": shape["dims"],
+                    "hidden_dims": shape["hidden"],
+                    "out_dims": shape["dims"],
+                }
+            )
+
+        return configs
+
+    def generate_pytorch_reference(self, config: Dict[str, Any]) -> TestConfig:
+        torch.manual_seed(self.seed)
+
+        batch = config["batch"]
+        seq = config["seq"]
+        in_dims = config["in_dims"]
+        hidden_dims = config["hidden_dims"]
+        out_dims = config["out_dims"]
+
+        # Input
+        x = torch.randn(batch, seq, in_dims)
+
+        # Weight matrices for fused GeGLU
+        w1 = torch.randn(in_dims, hidden_dims) * 0.02
+        w_gate = torch.randn(in_dims, hidden_dims) * 0.02
+        w2 = torch.randn(hidden_dims, out_dims) * 0.02
+
+        # FusedGeGLU forward: w2 @ (gelu(x @ w_gate, approximate='tanh') * (x @ w1))
+        gate = F.gelu(x @ w_gate, approximate="tanh")
+        hidden = gate * (x @ w1)
+        out = hidden @ w2
+
+        return TestConfig(
+            name=config["name"],
+            inputs={
+                "x": x.numpy(),
+                "w1": w1.numpy(),
+                "w_gate": w_gate.numpy(),
+                "w2": w2.numpy(),
+            },
+            params={
+                "in_dims": in_dims,
+                "hidden_dims": hidden_dims,
+                "out_dims": out_dims,
+            },
+            expected_outputs={"out": out.numpy()},
+            metadata={"batch": batch, "seq": seq},
+        )
+
+    def generate_numpy_reference(self, config: Dict[str, Any]) -> TestConfig:
+        np.random.seed(self.seed)
+
+        batch = config["batch"]
+        seq = config["seq"]
+        in_dims = config["in_dims"]
+        hidden_dims = config["hidden_dims"]
+        out_dims = config["out_dims"]
+
+        # Input
+        x = np.random.randn(batch, seq, in_dims).astype(np.float32)
+
+        # Weight matrices for fused GeGLU
+        w1 = np.random.randn(in_dims, hidden_dims).astype(np.float32) * 0.02
+        w_gate = np.random.randn(in_dims, hidden_dims).astype(np.float32) * 0.02
+        w2 = np.random.randn(hidden_dims, out_dims).astype(np.float32) * 0.02
+
+        # GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        def gelu_tanh(x):
+            return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)))
+
+        # FusedGeGLU forward: w2 @ (gelu(x @ w_gate) * (x @ w1))
+        gate = gelu_tanh(x @ w_gate)
+        hidden = gate * (x @ w1)
+        out = hidden @ w2
+
+        return TestConfig(
+            name=config["name"],
+            inputs={
+                "x": x,
+                "w1": w1,
+                "w_gate": w_gate,
+                "w2": w2,
+            },
+            params={
+                "in_dims": in_dims,
+                "hidden_dims": hidden_dims,
+                "out_dims": out_dims,
+            },
+            expected_outputs={"out": out},
+            metadata={"batch": batch, "seq": seq},
+        )

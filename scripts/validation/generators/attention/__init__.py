@@ -5,6 +5,7 @@ from .efficient import GQAGenerator, MQAGenerator, SlidingWindowGenerator
 from .linear import LinearAttentionGenerator, PerformerGenerator, CosFormerGenerator
 from .sparse import BlockSparseGenerator, LongformerGenerator, BigBirdGenerator
 from .positional import ALiBiGenerator, RoPEGenerator, RoPENTKGenerator, RoPEYaRNGenerator
+from .fused import FusedRoPEAttentionGenerator
 
 __all__ = [
     "SDPAGenerator",
@@ -21,4 +22,5 @@ __all__ = [
     "RoPEGenerator",
     "RoPENTKGenerator",
     "RoPEYaRNGenerator",
+    "FusedRoPEAttentionGenerator",
 ]

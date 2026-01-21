@@ -49,6 +49,8 @@ class TrainingBenchmarks:
         results.extend(self.run_ema_benchmarks())
         results.extend(self.run_gradient_benchmarks())
         results.extend(self.run_scheduler_benchmarks())
+        results.extend(self.run_swa_benchmarks())
+        results.extend(self.run_lookahead_benchmarks())
         return results
 
     def run_ema_benchmarks(self) -> list[BenchmarkResult]:
@@ -402,5 +404,108 @@ class TrainingBenchmarks:
             "pct_start": 0.3,
             "type": "scheduler",
             "operation": "OneCycleLR",
+        }
+        return result
+
+    def run_swa_benchmarks(self) -> list[BenchmarkResult]:
+        """Run Stochastic Weight Averaging benchmarks."""
+        results = []
+
+        for param_count in self.sizes.param_counts[:4]:
+            result = self._benchmark_swa_update(param_count)
+            if result:
+                results.append(result)
+
+        return results
+
+    def run_lookahead_benchmarks(self) -> list[BenchmarkResult]:
+        """Run Lookahead optimizer wrapper benchmarks."""
+        results = []
+
+        for param_count in self.sizes.param_counts[:4]:
+            result = self._benchmark_lookahead_step(param_count)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_swa_update(self, param_count: int) -> Optional[BenchmarkResult]:
+        """Benchmark SWA averaging update."""
+        try:
+            from mlx_primitives.training import SWA
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        model = self._create_model(param_count)
+        swa = SWA(model, swa_start=0, swa_freq=1)
+
+        step = 0
+
+        def fn():
+            nonlocal step
+            # Simulate weight update
+            model.layer1.weight = mx.random.normal(model.layer1.weight.shape)
+            swa.update(step)
+            step += 1
+            return swa.averaged_params
+
+        name = f"swa_update_p{param_count}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "param_count": param_count,
+            "swa_start": 0,
+            "swa_freq": 1,
+            "type": "swa",
+            "operation": "update",
+        }
+        return result
+
+    def _benchmark_lookahead_step(self, param_count: int) -> Optional[BenchmarkResult]:
+        """Benchmark Lookahead slow weight update."""
+        try:
+            from mlx_primitives.training import Lookahead
+            import mlx.optimizers as optim
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        model = self._create_model(param_count)
+        base_optimizer = optim.SGD(learning_rate=0.01)
+        lookahead = Lookahead(base_optimizer, k=5, alpha=0.5)
+        lookahead.init_slow_weights(model)
+
+        step = 0
+
+        def fn():
+            nonlocal step
+            grads = {
+                "layer1": {"weight": mx.random.normal(model.layer1.weight.shape)},
+                "layer2": {"weight": mx.random.normal(model.layer2.weight.shape)},
+            }
+            lookahead.update(model, grads, step)
+            step += 1
+            return model.parameters()
+
+        name = f"lookahead_step_p{param_count}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "param_count": param_count,
+            "k": 5,
+            "alpha": 0.5,
+            "type": "lookahead",
+            "operation": "step",
         }
         return result

@@ -829,3 +829,231 @@ class TestAdaLayerNormParity:
             rtol=rtol, atol=atol,
             err_msg="AdaLayerNorm shift/scale mismatch"
         )
+
+
+# =============================================================================
+# QKNorm Parity Tests
+# =============================================================================
+
+class TestQKNormParity:
+    """QKNorm (Query-Key Normalization) parity tests.
+
+    QKNorm applies RMSNorm to queries and keys separately before attention.
+    This helps stabilize attention scores and improves training dynamics.
+    """
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.forward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium", "large"])
+    @pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
+    def test_forward_parity(self, size, dtype, skip_without_pytorch):
+        """Test QKNorm forward pass parity."""
+        # Skip bf16+large: bf16 accumulates significant precision errors
+        if dtype == "bf16" and size == "large":
+            pytest.skip("bf16+large tests precision limits, not algorithm correctness")
+
+        from mlx_primitives.layers import QKNorm
+
+        config = SIZE_CONFIGS[size]["attention"]
+        batch = config["batch"]
+        seq = config["seq"]
+        heads = config["heads"]
+        head_dim = config["head_dim"]
+        eps = 1e-6
+
+        np.random.seed(42)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # MLX QKNorm
+        qk_norm = QKNorm(head_dim, eps=eps)
+        mx.eval(qk_norm.parameters())
+        q_scale_np = np.array(qk_norm.q_scale)
+        k_scale_np = np.array(qk_norm.k_scale)
+
+        q_mlx = _convert_to_mlx(q_np, dtype)
+        k_mlx = _convert_to_mlx(k_np, dtype)
+        q_mlx_out, k_mlx_out = qk_norm(q_mlx, k_mlx)
+        mx.eval(q_mlx_out, k_mlx_out)
+
+        # PyTorch reference - RMSNorm in fp32 for numerical stability
+        q_torch = _convert_to_torch(q_np, dtype)
+        k_torch = _convert_to_torch(k_np, dtype)
+        q_scale_torch = torch.from_numpy(q_scale_np)
+        k_scale_torch = torch.from_numpy(k_scale_np)
+
+        # RMSNorm: x / sqrt(mean(x^2) + eps) * scale
+        q_fp32 = q_torch.float()
+        k_fp32 = k_torch.float()
+        q_rms = torch.sqrt(torch.mean(q_fp32 ** 2, dim=-1, keepdim=True) + eps)
+        k_rms = torch.sqrt(torch.mean(k_fp32 ** 2, dim=-1, keepdim=True) + eps)
+        q_torch_out = ((q_fp32 / q_rms) * q_scale_torch).to(q_torch.dtype)
+        k_torch_out = ((k_fp32 / k_rms) * k_scale_torch).to(k_torch.dtype)
+
+        rtol, atol = get_tolerance("normalization", "rmsnorm", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(q_mlx_out), _to_numpy(q_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg=f"QKNorm Q forward mismatch [{size}, {dtype}]"
+        )
+        np.testing.assert_allclose(
+            _to_numpy(k_mlx_out), _to_numpy(k_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg=f"QKNorm K forward mismatch [{size}, {dtype}]"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.backward_parity
+    @pytest.mark.parametrize("size", ["tiny", "small", "medium"])
+    def test_backward_parity(self, size, skip_without_pytorch):
+        """Test QKNorm backward pass parity."""
+        from mlx_primitives.layers import QKNorm
+
+        config = SIZE_CONFIGS[size]["attention"]
+        batch = config["batch"]
+        seq = config["seq"]
+        heads = config["heads"]
+        head_dim = config["head_dim"]
+        dtype = "fp32"
+        eps = 1e-6
+
+        np.random.seed(42)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # MLX backward
+        qk_norm = QKNorm(head_dim, eps=eps)
+        mx.eval(qk_norm.parameters())
+        q_scale_np = np.array(qk_norm.q_scale)
+        k_scale_np = np.array(qk_norm.k_scale)
+
+        def mlx_loss_fn(q, k):
+            q_out, k_out = qk_norm(q, k)
+            return mx.sum(q_out) + mx.sum(k_out)
+
+        q_mlx = mx.array(q_np)
+        k_mlx = mx.array(k_np)
+        grad_fn = mx.grad(mlx_loss_fn, argnums=(0, 1))
+        mlx_grad_q, mlx_grad_k = grad_fn(q_mlx, k_mlx)
+        mx.eval(mlx_grad_q, mlx_grad_k)
+
+        # PyTorch backward
+        q_torch = torch.from_numpy(q_np).requires_grad_(True)
+        k_torch = torch.from_numpy(k_np).requires_grad_(True)
+        q_scale_torch = torch.from_numpy(q_scale_np)
+        k_scale_torch = torch.from_numpy(k_scale_np)
+
+        q_rms = torch.sqrt(torch.mean(q_torch ** 2, dim=-1, keepdim=True) + eps)
+        k_rms = torch.sqrt(torch.mean(k_torch ** 2, dim=-1, keepdim=True) + eps)
+        q_torch_out = (q_torch / q_rms) * q_scale_torch
+        k_torch_out = (k_torch / k_rms) * k_scale_torch
+        (q_torch_out.sum() + k_torch_out.sum()).backward()
+
+        rtol, atol = get_gradient_tolerance("normalization", "rmsnorm", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad_q), q_torch.grad.numpy(),
+            rtol=rtol, atol=atol,
+            err_msg=f"QKNorm Q backward mismatch [{size}]"
+        )
+        np.testing.assert_allclose(
+            _to_numpy(mlx_grad_k), k_torch.grad.numpy(),
+            rtol=rtol, atol=atol,
+            err_msg=f"QKNorm K backward mismatch [{size}]"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.edge_case
+    def test_single_token(self, skip_without_pytorch):
+        """Test QKNorm with single token (decoding scenario)."""
+        from mlx_primitives.layers import QKNorm
+
+        batch, seq, heads, head_dim = 4, 1, 8, 64
+        dtype = "fp32"
+        eps = 1e-6
+
+        np.random.seed(42)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # MLX QKNorm
+        qk_norm = QKNorm(head_dim, eps=eps)
+        mx.eval(qk_norm.parameters())
+        q_scale_np = np.array(qk_norm.q_scale)
+        k_scale_np = np.array(qk_norm.k_scale)
+
+        q_mlx = _convert_to_mlx(q_np, dtype)
+        k_mlx = _convert_to_mlx(k_np, dtype)
+        q_mlx_out, k_mlx_out = qk_norm(q_mlx, k_mlx)
+        mx.eval(q_mlx_out, k_mlx_out)
+
+        # PyTorch reference
+        q_torch = _convert_to_torch(q_np, dtype)
+        k_torch = _convert_to_torch(k_np, dtype)
+        q_scale_torch = torch.from_numpy(q_scale_np)
+        k_scale_torch = torch.from_numpy(k_scale_np)
+
+        q_rms = torch.sqrt(torch.mean(q_torch ** 2, dim=-1, keepdim=True) + eps)
+        k_rms = torch.sqrt(torch.mean(k_torch ** 2, dim=-1, keepdim=True) + eps)
+        q_torch_out = (q_torch / q_rms) * q_scale_torch
+        k_torch_out = (k_torch / k_rms) * k_scale_torch
+
+        rtol, atol = get_tolerance("normalization", "rmsnorm", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(q_mlx_out), _to_numpy(q_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg="QKNorm single token Q mismatch"
+        )
+        np.testing.assert_allclose(
+            _to_numpy(k_mlx_out), _to_numpy(k_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg="QKNorm single token K mismatch"
+        )
+
+    @pytest.mark.parity_pytorch
+    @pytest.mark.edge_case
+    def test_different_qk_magnitudes(self, skip_without_pytorch):
+        """Test QKNorm with Q and K having different magnitudes."""
+        from mlx_primitives.layers import QKNorm
+
+        batch, seq, heads, head_dim = 2, 32, 8, 64
+        dtype = "fp32"
+        eps = 1e-6
+
+        np.random.seed(42)
+        # Q has small values, K has large values
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32) * 0.01
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32) * 100
+
+        # MLX QKNorm
+        qk_norm = QKNorm(head_dim, eps=eps)
+        mx.eval(qk_norm.parameters())
+        q_scale_np = np.array(qk_norm.q_scale)
+        k_scale_np = np.array(qk_norm.k_scale)
+
+        q_mlx = _convert_to_mlx(q_np, dtype)
+        k_mlx = _convert_to_mlx(k_np, dtype)
+        q_mlx_out, k_mlx_out = qk_norm(q_mlx, k_mlx)
+        mx.eval(q_mlx_out, k_mlx_out)
+
+        # PyTorch reference
+        q_torch = _convert_to_torch(q_np, dtype)
+        k_torch = _convert_to_torch(k_np, dtype)
+        q_scale_torch = torch.from_numpy(q_scale_np)
+        k_scale_torch = torch.from_numpy(k_scale_np)
+
+        q_rms = torch.sqrt(torch.mean(q_torch ** 2, dim=-1, keepdim=True) + eps)
+        k_rms = torch.sqrt(torch.mean(k_torch ** 2, dim=-1, keepdim=True) + eps)
+        q_torch_out = (q_torch / q_rms) * q_scale_torch
+        k_torch_out = (k_torch / k_rms) * k_scale_torch
+
+        rtol, atol = get_tolerance("normalization", "rmsnorm", dtype)
+        np.testing.assert_allclose(
+            _to_numpy(q_mlx_out), _to_numpy(q_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg="QKNorm different magnitudes Q mismatch"
+        )
+        np.testing.assert_allclose(
+            _to_numpy(k_mlx_out), _to_numpy(k_torch_out),
+            rtol=rtol, atol=atol,
+            err_msg="QKNorm different magnitudes K mismatch"
+        )

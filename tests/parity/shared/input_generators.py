@@ -21,6 +21,7 @@ SIZE_CONFIGS = {
         "scan": {"batch": 1, "seq": 64, "dim": 32},
         "cache": {"batch": 1, "seq": 64, "heads": 4, "head_dim": 32, "block_size": 16},
         "sampling": {"batch": 1, "vocab_size": 1000},
+        "ssm": {"batch": 1, "seq": 32, "dims": 64, "d_state": 8, "d_conv": 4, "expand": 2},
     },
     "small": {
         "attention": {"batch": 2, "seq": 256, "heads": 8, "head_dim": 64},
@@ -33,6 +34,7 @@ SIZE_CONFIGS = {
         "scan": {"batch": 4, "seq": 256, "dim": 64},
         "cache": {"batch": 2, "seq": 256, "heads": 8, "head_dim": 64, "block_size": 32},
         "sampling": {"batch": 4, "vocab_size": 10000},
+        "ssm": {"batch": 2, "seq": 64, "dims": 128, "d_state": 16, "d_conv": 4, "expand": 2},
     },
     "medium": {
         "attention": {"batch": 4, "seq": 1024, "heads": 16, "head_dim": 64},
@@ -45,6 +47,7 @@ SIZE_CONFIGS = {
         "scan": {"batch": 8, "seq": 1024, "dim": 128},
         "cache": {"batch": 4, "seq": 1024, "heads": 16, "head_dim": 64, "block_size": 64},
         "sampling": {"batch": 8, "vocab_size": 50000},
+        "ssm": {"batch": 4, "seq": 128, "dims": 256, "d_state": 16, "d_conv": 4, "expand": 2},
     },
     "large": {
         # Reduced from original to avoid OOM - still tests larger scale behavior
@@ -58,6 +61,7 @@ SIZE_CONFIGS = {
         "scan": {"batch": 4, "seq": 1024, "dim": 128},
         "cache": {"batch": 2, "seq": 1024, "heads": 16, "head_dim": 64, "block_size": 64},
         "sampling": {"batch": 4, "vocab_size": 50000},
+        "ssm": {"batch": 2, "seq": 256, "dims": 512, "d_state": 32, "d_conv": 4, "expand": 2},
     },
 }
 

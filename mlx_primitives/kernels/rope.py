@@ -1,7 +1,8 @@
 """Fast RoPE Metal kernel implementation.
 
 Provides fused rotary position embedding that avoids intermediate allocations
-from rotate_half and concatenation operations.
+from rotate_half and concatenation operations, with full VJP (backward pass)
+support for automatic differentiation.
 """
 
 from typing import Tuple, Optional
@@ -9,6 +10,7 @@ import mlx.core as mx
 
 # Cache compiled kernels
 _rope_kernel = None
+_rope_backward_kernel = None
 _rope_qk_kernel = None
 
 
@@ -79,6 +81,75 @@ def _get_rope_kernel():
         )
 
     return _rope_kernel
+
+
+def _get_rope_backward_kernel():
+    """Get or create the RoPE backward kernel.
+
+    RoPE backward math:
+        Forward: out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos
+        Backward (given dout):
+            dx1 = dout1*cos + dout2*sin
+            dx2 = -dout1*sin + dout2*cos
+    """
+    global _rope_backward_kernel
+
+    if _rope_backward_kernel is None:
+        source = """
+            uint idx = thread_position_in_grid.x;
+
+            uint batch_size = x_shape[0];
+            uint seq_len = x_shape[1];
+            uint num_heads = x_shape[2];
+            uint head_dim = x_shape[3];
+            uint half_dim = head_dim / 2;
+
+            uint total_pairs = batch_size * seq_len * num_heads * half_dim;
+            if (idx >= total_pairs) return;
+
+            // Decompose linear index to (batch, seq, head, dim_pair)
+            uint dim_pair = idx % half_dim;
+            uint rem = idx / half_dim;
+            uint head_idx = rem % num_heads;
+            rem = rem / num_heads;
+            uint seq_idx = rem % seq_len;
+            uint batch_idx = rem / seq_len;
+
+            uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
+                           seq_idx * (num_heads * head_dim) +
+                           head_idx * head_dim;
+
+            uint d1 = dim_pair;
+            uint d2 = dim_pair + half_dim;
+
+            // Get upstream gradients
+            float dy1 = dy[base_idx + d1];
+            float dy2 = dy[base_idx + d2];
+
+            // Get cos/sin from cache
+            uint cache_idx = seq_idx * half_dim + dim_pair;
+            float cos_val = cos_cache[cache_idx];
+            float sin_val = sin_cache[cache_idx];
+
+            // Compute gradients: inverse rotation
+            // dx1 = dy1*cos + dy2*sin
+            // dx2 = -dy1*sin + dy2*cos
+            float dx1 = dy1 * cos_val + dy2 * sin_val;
+            float dx2 = -dy1 * sin_val + dy2 * cos_val;
+
+            typedef decltype(dx[0] + dx[0]) OutT;
+            dx[base_idx + d1] = OutT(dx1);
+            dx[base_idx + d2] = OutT(dx2);
+        """
+
+        _rope_backward_kernel = mx.fast.metal_kernel(
+            name="rope_backward",
+            input_names=["x", "cos_cache", "sin_cache", "dy"],
+            output_names=["dx"],
+            source=source,
+        )
+
+    return _rope_backward_kernel
 
 
 def _get_rope_qk_kernel():
@@ -174,7 +245,8 @@ def precompute_rope_cache(
     half_dim = head_dim // 2
 
     # Compute inverse frequencies: theta_i = base^(-2i/dim)
-    inv_freq = 1.0 / (base ** (mx.arange(0, half_dim, dtype=mx.float32) / half_dim))
+    # Use base^(-x) instead of 1/(base^x) to match PyTorch numerical precision
+    inv_freq = base ** (-mx.arange(0, half_dim, dtype=mx.float32) / half_dim)
 
     # Position indices
     t = mx.arange(seq_len, dtype=mx.float32)
@@ -188,36 +260,30 @@ def precompute_rope_cache(
     return cos_cache, sin_cache
 
 
-def fast_rope(
+@mx.custom_function
+def _metal_rope_core(
     x: mx.array,
-    cos_cache: mx.array,
-    sin_cache: mx.array,
-    offset: int = 0,
+    cos_slice: mx.array,
+    sin_slice: mx.array,
 ) -> mx.array:
-    """Fast Metal-accelerated RoPE for single tensor.
+    """Metal kernel RoPE with VJP support.
+
+    This internal function is wrapped with @mx.custom_function to enable
+    automatic differentiation through the Metal kernel.
 
     Args:
         x: Input tensor of shape (batch, seq_len, num_heads, head_dim).
-        cos_cache: Precomputed cosines of shape (max_seq, head_dim // 2).
-        sin_cache: Precomputed sines of shape (max_seq, head_dim // 2).
-        offset: Position offset for KV cache decoding.
+        cos_slice: Sliced cosines of shape (seq_len, head_dim // 2).
+        sin_slice: Sliced sines of shape (seq_len, head_dim // 2).
 
     Returns:
         Rotated tensor of same shape as input.
     """
-    assert x.ndim == 4, "Input must be (batch, seq_len, num_heads, head_dim)"
     batch_size, seq_len, num_heads, head_dim = x.shape
-    assert head_dim % 2 == 0, "head_dim must be even"
-
     half_dim = head_dim // 2
-
-    # Slice cache to match sequence (with offset)
-    cos_slice = cos_cache[offset:offset + seq_len]
-    sin_slice = sin_cache[offset:offset + seq_len]
 
     kernel = _get_rope_kernel()
 
-    # Total dimension pairs to process
     total_pairs = batch_size * seq_len * num_heads * half_dim
 
     threadgroup_size = 256
@@ -235,6 +301,84 @@ def fast_rope(
     )
 
     return outputs[0]
+
+
+@_metal_rope_core.vjp
+def _metal_rope_core_vjp(
+    primals: Tuple[mx.array, mx.array, mx.array],
+    cotangent: mx.array,
+    output: mx.array,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """VJP (backward pass) for Metal RoPE.
+
+    RoPE backward math:
+        Forward: out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos
+        Backward (given dy):
+            dx1 = dy1*cos + dy2*sin
+            dx2 = -dy1*sin + dy2*cos
+        cos/sin caches are treated as constants (no gradients).
+    """
+    x, cos_slice, sin_slice = primals
+    dy = cotangent
+
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    half_dim = head_dim // 2
+
+    # Compute dx using Metal kernel
+    backward_kernel = _get_rope_backward_kernel()
+
+    total_pairs = batch_size * seq_len * num_heads * half_dim
+
+    threadgroup_size = 256
+    num_groups = (total_pairs + threadgroup_size - 1) // threadgroup_size
+    grid = (num_groups * threadgroup_size, 1, 1)
+    threadgroup = (threadgroup_size, 1, 1)
+
+    dx_outputs = backward_kernel(
+        inputs=[x, cos_slice, sin_slice, dy],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+        stream=mx.default_stream(mx.default_device()),
+    )
+    dx = dx_outputs[0]
+
+    # cos_slice and sin_slice are treated as constants (no gradients)
+    # Return zeros for their gradients
+    dcos = mx.zeros_like(cos_slice)
+    dsin = mx.zeros_like(sin_slice)
+
+    return dx, dcos, dsin
+
+
+def fast_rope(
+    x: mx.array,
+    cos_cache: mx.array,
+    sin_cache: mx.array,
+    offset: int = 0,
+) -> mx.array:
+    """Fast Metal-accelerated RoPE for single tensor with full gradient support.
+
+    Args:
+        x: Input tensor of shape (batch, seq_len, num_heads, head_dim).
+        cos_cache: Precomputed cosines of shape (max_seq, head_dim // 2).
+        sin_cache: Precomputed sines of shape (max_seq, head_dim // 2).
+        offset: Position offset for KV cache decoding.
+
+    Returns:
+        Rotated tensor of same shape as input.
+    """
+    assert x.ndim == 4, "Input must be (batch, seq_len, num_heads, head_dim)"
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    assert head_dim % 2 == 0, "head_dim must be even"
+
+    # Slice cache to match sequence (with offset)
+    cos_slice = cos_cache[offset:offset + seq_len]
+    sin_slice = sin_cache[offset:offset + seq_len]
+
+    # Use Metal kernel with VJP support
+    return _metal_rope_core(x, cos_slice, sin_slice)
 
 
 def fast_rope_qk(

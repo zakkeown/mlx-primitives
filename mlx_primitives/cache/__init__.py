@@ -60,6 +60,11 @@ from mlx_primitives.cache.speculative import (
     TreeSpeculation,
     speculative_verify,
 )
+from mlx_primitives.cache.simple_cache import (
+    SimpleKVCache,
+    SlidingWindowCache,
+    RotatingKVCache,
+)
 
 __all__ = [
     # Block allocation
@@ -91,4 +96,8 @@ __all__ = [
     "SpeculativeToken",
     "TreeSpeculation",
     "speculative_verify",
+    # Simple cache implementations
+    "SimpleKVCache",
+    "SlidingWindowCache",
+    "RotatingKVCache",
 ]

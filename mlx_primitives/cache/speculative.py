@@ -374,7 +374,7 @@ def speculative_verify(
         return 0, None
 
     for i in range(num_tokens):
-        draft_token = draft_tokens[i]
+        draft_token = int(draft_tokens[i])  # Ensure Python int for MLX indexing
         draft_logp = float(draft_log_probs[i])
         target_logp = float(target_log_probs[i, draft_token])
 

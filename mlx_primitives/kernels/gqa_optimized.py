@@ -182,14 +182,17 @@ def _get_gqa_kernel():
                             q_pos * (num_q_heads * head_dim) +
                             q_head_idx * head_dim;
 
+            // Get output type for explicit casting (required for bf16)
+            typedef decltype(out[0] + out[0]) OutT;
+
             if (sum_val > 0.0f) {{
                 float inv_sum = 1.0f / sum_val;
                 for (uint d = 0; d < head_dim; d++) {{
-                    out[out_base + d] = acc[d] * inv_sum;
+                    out[out_base + d] = OutT(acc[d] * inv_sum);
                 }}
             }} else {{
                 for (uint d = 0; d < head_dim; d++) {{
-                    out[out_base + d] = 0.0f;
+                    out[out_base + d] = OutT(0.0f);
                 }}
             }}
             """
@@ -362,14 +365,17 @@ def _get_gqa_kernel_tiled():
                                 global_q_idx * q_stride_seq +
                                 q_head_idx * q_stride_head;
 
+                // Get output type for explicit casting (required for bf16)
+                typedef decltype(out[0] + out[0]) OutT;
+
                 if (sum_val > 0.0f) {{
                     float inv_sum = 1.0f / sum_val;
                     for (uint d = 0; d < head_dim; d++) {{
-                        out[out_base + d] = acc[d] * inv_sum;
+                        out[out_base + d] = OutT(acc[d] * inv_sum);
                     }}
                 }} else {{
                     for (uint d = 0; d < head_dim; d++) {{
-                        out[out_base + d] = 0.0f;
+                        out[out_base + d] = OutT(0.0f);
                     }}
                 }}
             }}

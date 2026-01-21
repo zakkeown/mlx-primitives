@@ -9,6 +9,7 @@ from benchmarks.suites.cache import CacheBenchmarks
 from benchmarks.suites.generation import GenerationBenchmarks
 from benchmarks.suites.training import TrainingBenchmarks
 from benchmarks.suites.quantization import QuantizationBenchmarks
+from benchmarks.suites.memory import MemoryBenchmarks
 
 __all__ = [
     "AttentionBenchmarks",
@@ -20,4 +21,5 @@ __all__ = [
     "GenerationBenchmarks",
     "TrainingBenchmarks",
     "QuantizationBenchmarks",
+    "MemoryBenchmarks",
 ]

@@ -37,6 +37,7 @@ class CacheBenchmarks:
         results.extend(self.run_eviction_benchmarks())
         results.extend(self.run_quantized_kv_cache_benchmarks())
         results.extend(self.run_speculative_cache_benchmarks())
+        results.extend(self.run_kv_cache_variant_benchmarks())
         return results
 
     def run_kv_cache_benchmarks(self) -> list[BenchmarkResult]:
@@ -547,5 +548,197 @@ class CacheBenchmarks:
             "vocab_size": vocab_size,
             "type": "optimized",
             "operation": "speculative_verify",
+        }
+        return result
+
+    def run_kv_cache_variant_benchmarks(self) -> list[BenchmarkResult]:
+        """Run KV cache variant benchmarks (sliding window, rotating, compressed)."""
+        results = []
+
+        configs = [
+            (1, 32, 4, 64),    # (batch, window/buffer, heads, head_dim)
+            (4, 64, 8, 64),
+            (8, 128, 8, 128),
+        ]
+
+        for batch, window_size, num_heads, head_dim in configs:
+            # Sliding window cache
+            result = self._benchmark_sliding_window_cache(batch, window_size, num_heads, head_dim)
+            if result:
+                results.append(result)
+
+            # Rotating cache
+            result = self._benchmark_rotating_cache(batch, window_size, num_heads, head_dim)
+            if result:
+                results.append(result)
+
+            # Compressed cache (8-bit)
+            result = self._benchmark_compressed_cache(batch, window_size * 2, num_heads, head_dim, bits=8)
+            if result:
+                results.append(result)
+
+            # Compressed cache (4-bit)
+            result = self._benchmark_compressed_cache(batch, window_size * 2, num_heads, head_dim, bits=4)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_sliding_window_cache(
+        self,
+        batch_size: int,
+        window_size: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark sliding window cache update."""
+        try:
+            from mlx_primitives.advanced.kv_cache import SlidingWindowCache
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        cache = SlidingWindowCache(
+            num_layers=1,
+            max_batch_size=batch_size,
+            window_size=window_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=mx.float32,
+        )
+
+        # Single token update
+        k_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+        v_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+
+        def fn():
+            cache.update(0, k_new, v_new)
+            return cache.get(0)
+
+        name = f"sliding_window_cache_b{batch_size}_w{window_size}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "window_size": window_size,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "sliding_window",
+            "operation": "update",
+        }
+        return result
+
+    def _benchmark_rotating_cache(
+        self,
+        batch_size: int,
+        buffer_size: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark rotating (circular buffer) cache update."""
+        try:
+            from mlx_primitives.advanced.kv_cache import RotatingKVCache
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        cache = RotatingKVCache(
+            num_layers=1,
+            max_batch_size=batch_size,
+            buffer_size=buffer_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=mx.float32,
+        )
+
+        # Pre-fill to force wrap-around behavior
+        for _ in range(buffer_size + 5):
+            k = mx.random.normal((batch_size, num_heads, 1, head_dim))
+            v = mx.random.normal((batch_size, num_heads, 1, head_dim))
+            cache.update(0, k, v)
+
+        k_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+        v_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+
+        def fn():
+            cache.update(0, k_new, v_new)
+            return cache.get(0)
+
+        name = f"rotating_cache_b{batch_size}_buf{buffer_size}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "buffer_size": buffer_size,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "rotating",
+            "operation": "update",
+        }
+        return result
+
+    def _benchmark_compressed_cache(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        bits: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark compressed (quantized) cache update."""
+        try:
+            from mlx_primitives.advanced.kv_cache import CompressedKVCache
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        cache = CompressedKVCache(
+            num_layers=1,
+            max_batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            compression='quantize',
+            bits=bits,
+        )
+
+        # Pre-fill with some data
+        k_init = mx.random.normal((batch_size, num_heads, max_seq_len // 2, head_dim))
+        v_init = mx.random.normal((batch_size, num_heads, max_seq_len // 2, head_dim))
+        cache.update(0, k_init, v_init)
+
+        k_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+        v_new = mx.random.normal((batch_size, num_heads, 1, head_dim))
+
+        def fn():
+            cache.update(0, k_new, v_new)
+            return cache.get(0)
+
+        name = f"compressed_cache_b{batch_size}_s{max_seq_len}_{bits}bit"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "max_seq_len": max_seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "bits": bits,
+            "type": "compressed",
+            "operation": "update",
         }
         return result

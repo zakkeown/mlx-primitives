@@ -1,6 +1,6 @@
 """Activation function generators."""
 
-from .glu import SwiGLUGenerator, GeGLUGenerator, ReGLUGenerator, FusedSwiGLUGenerator
+from .glu import SwiGLUGenerator, GeGLUGenerator, ReGLUGenerator, FusedSwiGLUGenerator, FusedGeGLUGenerator
 from .gelu import GELUGenerator, GELUTanhGenerator, QuickGELUGenerator
 from .misc import (
     MishGenerator,
@@ -15,6 +15,7 @@ __all__ = [
     "GeGLUGenerator",
     "ReGLUGenerator",
     "FusedSwiGLUGenerator",
+    "FusedGeGLUGenerator",
     "GELUGenerator",
     "GELUTanhGenerator",
     "QuickGELUGenerator",
