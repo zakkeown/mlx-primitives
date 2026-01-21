@@ -63,6 +63,7 @@ def associative_scan(
     reverse: bool = False,
     inclusive: bool = True,
     use_metal: bool = True,
+    differentiable: bool = False,
 ) -> mx.array:
     """Parallel associative scan.
 
@@ -84,6 +85,8 @@ def associative_scan(
         inclusive: If True, include current element in result (default).
                   If False, compute exclusive scan (shifted by 1).
         use_metal: Use Metal kernel if available (default True).
+        differentiable: If True, use pure MLX operations that support gradients.
+                       Set to True when computing gradients (default False).
 
     Returns:
         Scanned output tensor of same shape as x.
@@ -118,13 +121,16 @@ def associative_scan(
         if A is not None:
             A = _reverse_along_axis(A, axis=axis)
 
+    # Force pure MLX operations when differentiable=True
+    effective_use_metal = use_metal and not differentiable
+
     # Dispatch based on operator
     if operator == "ssm":
         if A is None:
             raise ValueError("A is required for SSM scan (operator='ssm')")
-        result = _ssm_scan(x, A, axis, use_metal)
+        result = _ssm_scan(x, A, axis, effective_use_metal)
     elif operator in ("add", "mul"):
-        result = _simple_scan(x, operator, axis, inclusive, use_metal)
+        result = _simple_scan(x, operator, axis, inclusive, effective_use_metal)
     else:
         raise ValueError(f"Unknown operator: {operator}. Use 'add', 'mul', or 'ssm'.")
 
@@ -279,6 +285,7 @@ def selective_scan(
     C: mx.array,
     D: Optional[mx.array] = None,
     use_metal: bool = True,
+    differentiable: bool = False,
 ) -> mx.array:
     """Selective scan for Mamba-style SSMs.
 
@@ -295,6 +302,7 @@ def selective_scan(
         C: Output projection (batch, seq_len, d_state).
         D: Skip connection (d_inner,). Optional.
         use_metal: Use Metal kernels if available.
+        differentiable: If True, use pure MLX operations that support gradients.
 
     Returns:
         Output tensor y of shape (batch, seq_len, d_inner).
@@ -326,7 +334,8 @@ def selective_scan(
 
     # SSM scan: h[t] = A_bar[t] * h[t-1] + B_bar_x[t]
     h_flat = associative_scan(
-        B_bar_x_flat, operator="ssm", A=A_bar_flat, axis=1, use_metal=use_metal
+        B_bar_x_flat, operator="ssm", A=A_bar_flat, axis=1,
+        use_metal=use_metal, differentiable=differentiable
     )
 
     # Reshape back: (batch, d_inner, seq, d_state) -> (batch, seq, d_inner, d_state)

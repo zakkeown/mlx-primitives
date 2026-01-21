@@ -7,10 +7,14 @@ against MLX implementations across 50+ operations.
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import time
+
 try:
+    import numpy as np
     import jax
     import jax.numpy as jnp
     from jax import lax
+    from jax import nn as jnn
     HAS_JAX = True
     # Check for Metal backend
     HAS_JAX_METAL = any("METAL" in str(d).upper() for d in jax.devices())
@@ -20,6 +24,8 @@ except ImportError:
     jax = None
     jnp = None
     lax = None
+    jnn = None
+    np = None
 
 
 def jax_metal_available() -> bool:
@@ -49,6 +55,46 @@ class JAXMetalExtendedBenchmarks:
         """
         if not jax_metal_available():
             raise RuntimeError("JAX Metal backend is not available")
+
+    def _benchmark(
+        self,
+        fn,
+        iterations: int = 30,
+        warmup_iterations: int = 5,
+        name: str = "benchmark",
+    ) -> JAXBenchmarkResult:
+        """Run a benchmark with warmup and timing.
+
+        Args:
+            fn: Function to benchmark (should return a JAX array).
+            iterations: Number of timed iterations.
+            warmup_iterations: Number of warmup iterations.
+            name: Benchmark name.
+
+        Returns:
+            Benchmark result with timing statistics.
+        """
+        # Warmup
+        for _ in range(warmup_iterations):
+            result = fn()
+            result.block_until_ready()
+
+        # Timed iterations
+        times = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            result = fn()
+            result.block_until_ready()
+            times.append(time.perf_counter() - start)
+
+        return JAXBenchmarkResult(
+            name=name,
+            mean_time=np.mean(times),
+            std_time=np.std(times) if len(times) > 1 else 0.0,
+            min_time=np.min(times),
+            max_time=np.max(times),
+            iterations=len(times),
+        )
 
     # ========== Attention Operations ==========
 
@@ -202,7 +248,25 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark SwiGLU activation."""
-        raise NotImplementedError("Stub: benchmark_swiglu")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+        W_gate = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+        W_up = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+
+        @jax.jit
+        def swiglu_fn(x, W_gate, W_up):
+            gate = jax.nn.silu(x @ W_gate)
+            up = x @ W_up
+            return gate * up
+
+        # Compile once
+        _ = swiglu_fn(x, W_gate, W_up)
+
+        def fn():
+            return swiglu_fn(x, W_gate, W_up)
+
+        name = f"jax_swiglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_geglu(
         self,
@@ -213,7 +277,25 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark GeGLU activation."""
-        raise NotImplementedError("Stub: benchmark_geglu")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+        W_gate = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+        W_up = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+
+        @jax.jit
+        def geglu_fn(x, W_gate, W_up):
+            gate = jax.nn.gelu(x @ W_gate, approximate=False)
+            up = x @ W_up
+            return gate * up
+
+        # Compile once
+        _ = geglu_fn(x, W_gate, W_up)
+
+        def fn():
+            return geglu_fn(x, W_gate, W_up)
+
+        name = f"jax_geglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_reglu(
         self,
@@ -224,7 +306,25 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark ReGLU activation."""
-        raise NotImplementedError("Stub: benchmark_reglu")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+        W_gate = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+        W_up = jax.random.normal(key, (hidden_dim, hidden_dim)) * 0.02
+
+        @jax.jit
+        def reglu_fn(x, W_gate, W_up):
+            gate = jax.nn.relu(x @ W_gate)
+            up = x @ W_up
+            return gate * up
+
+        # Compile once
+        _ = reglu_fn(x, W_gate, W_up)
+
+        def fn():
+            return reglu_fn(x, W_gate, W_up)
+
+        name = f"jax_reglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_quick_gelu(
         self,
@@ -235,7 +335,21 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark QuickGELU activation."""
-        raise NotImplementedError("Stub: benchmark_quick_gelu")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def quick_gelu_fn(x):
+            return x * jax.nn.sigmoid(1.702 * x)
+
+        # Compile once
+        _ = quick_gelu_fn(x)
+
+        def fn():
+            return quick_gelu_fn(x)
+
+        name = f"jax_quick_gelu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_gelu_tanh(
         self,
@@ -246,7 +360,21 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark GELU with tanh approximation."""
-        raise NotImplementedError("Stub: benchmark_gelu_tanh")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def gelu_tanh_fn(x):
+            return jax.nn.gelu(x, approximate=True)
+
+        # Compile once
+        _ = gelu_tanh_fn(x)
+
+        def fn():
+            return gelu_tanh_fn(x)
+
+        name = f"jax_gelu_tanh_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_mish(
         self,
@@ -257,7 +385,22 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark Mish activation."""
-        raise NotImplementedError("Stub: benchmark_mish")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def mish_fn(x):
+            # mish(x) = x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))
+            return x * jnp.tanh(jax.nn.softplus(x))
+
+        # Compile once
+        _ = mish_fn(x)
+
+        def fn():
+            return mish_fn(x)
+
+        name = f"jax_mish_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_squared_relu(
         self,
@@ -268,7 +411,21 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark Squared ReLU activation."""
-        raise NotImplementedError("Stub: benchmark_squared_relu")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def squared_relu_fn(x):
+            return jax.nn.relu(x) ** 2
+
+        # Compile once
+        _ = squared_relu_fn(x)
+
+        def fn():
+            return squared_relu_fn(x)
+
+        name = f"jax_squared_relu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_hard_swish(
         self,
@@ -279,7 +436,21 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark HardSwish activation."""
-        raise NotImplementedError("Stub: benchmark_hard_swish")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def hard_swish_fn(x):
+            return x * jnp.clip(x + 3, 0, 6) / 6
+
+        # Compile once
+        _ = hard_swish_fn(x)
+
+        def fn():
+            return hard_swish_fn(x)
+
+        name = f"jax_hard_swish_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_hard_sigmoid(
         self,
@@ -290,7 +461,21 @@ class JAXMetalExtendedBenchmarks:
         iterations: int = 100,
     ) -> JAXBenchmarkResult:
         """Benchmark HardSigmoid activation."""
-        raise NotImplementedError("Stub: benchmark_hard_sigmoid")
+        key = jax.random.PRNGKey(42)
+        x = jax.random.normal(key, (batch_size, seq_length, hidden_dim))
+
+        @jax.jit
+        def hard_sigmoid_fn(x):
+            return jnp.clip(x + 3, 0, 6) / 6
+
+        # Compile once
+        _ = hard_sigmoid_fn(x)
+
+        def fn():
+            return hard_sigmoid_fn(x)
+
+        name = f"jax_hard_sigmoid_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     # ========== Normalization Operations ==========
 

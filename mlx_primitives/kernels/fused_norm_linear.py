@@ -224,6 +224,62 @@ def _get_rmsnorm_kernel() -> mx.fast.metal_kernel:
     return _rmsnorm_kernel
 
 
+@mx.custom_function
+def _fused_rmsnorm_linear_with_vjp(x, norm_weight, linear_weight, linear_bias, eps):
+    """Fused RMSNorm + Linear with custom VJP for gradient support."""
+    return _metal_fused_rmsnorm_linear(x, norm_weight, linear_weight, linear_bias, eps)
+
+
+@_fused_rmsnorm_linear_with_vjp.vjp
+def _fused_rmsnorm_linear_vjp(primals, cotangent, output):
+    """VJP for fused RMSNorm + Linear."""
+    x, norm_weight, linear_weight, linear_bias, eps = primals
+
+    # Recompute forward using reference (autodiff-compatible)
+    hidden_dim = x.shape[-1]
+
+    # RMSNorm forward
+    rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
+    inv_rms = 1.0 / rms
+    norm_x = x * inv_rms * norm_weight
+
+    # Gradient through linear: d_norm_x = cotangent @ linear_weight
+    d_norm_x = cotangent @ linear_weight
+
+    # Gradient through normalization
+    # norm_x = x * inv_rms * norm_weight
+    # d_x = d_norm_x * inv_rms * norm_weight + x * d_inv_rms * norm_weight
+    # d_inv_rms = -rms^(-2) * d_rms
+    # d_rms = 0.5 * rms^(-1) * d_mean_sq
+    # d_mean_sq = (2/hidden_dim) * x * (sum over last axis of: d_norm_x * x * inv_rms * norm_weight)
+
+    # Compute d_x using the chain rule
+    d_norm_x_weighted = d_norm_x * norm_weight
+    d_x_direct = d_norm_x_weighted * inv_rms
+
+    # Gradient through inv_rms
+    sum_term = mx.sum(d_norm_x_weighted * x, axis=-1, keepdims=True)
+    d_x_rms = -x * inv_rms ** 3 * sum_term / hidden_dim
+
+    d_x = d_x_direct + d_x_rms
+
+    # Gradient w.r.t. norm_weight: sum over batch/seq of d_norm_x * (x * inv_rms)
+    d_norm_weight = mx.sum(d_norm_x * x * inv_rms, axis=(0, 1))
+
+    # Gradient w.r.t. linear_weight: cotangent.T @ norm_x
+    cotangent_flat = cotangent.reshape(-1, cotangent.shape[-1])
+    norm_x_flat = norm_x.reshape(-1, norm_x.shape[-1])
+    d_linear_weight = cotangent_flat.T @ norm_x_flat
+
+    # Gradient w.r.t. linear_bias: sum of cotangent (if bias exists)
+    if linear_bias is not None:
+        d_linear_bias = mx.sum(cotangent, axis=(0, 1))
+    else:
+        d_linear_bias = None
+
+    return d_x, d_norm_weight, d_linear_weight, d_linear_bias, None
+
+
 def fused_rmsnorm_linear(
     x: mx.array,
     norm_weight: mx.array,
@@ -235,6 +291,7 @@ def fused_rmsnorm_linear(
     """Fused RMSNorm followed by Linear projection.
 
     Computes: Linear(RMSNorm(x)) in a single kernel pass.
+    Supports gradients via custom VJP.
 
     This is equivalent to:
         norm_x = x / sqrt(mean(x^2) + eps) * norm_weight
@@ -280,7 +337,7 @@ def fused_rmsnorm_linear(
         return _reference_rmsnorm_linear(x, norm_weight, linear_weight, linear_bias, eps)
 
     try:
-        return _metal_fused_rmsnorm_linear(
+        return _fused_rmsnorm_linear_with_vjp(
             x, norm_weight, linear_weight, linear_bias, eps
         )
     except RuntimeError as e:

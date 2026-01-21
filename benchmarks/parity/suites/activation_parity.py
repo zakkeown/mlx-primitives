@@ -178,7 +178,7 @@ class ActivationParityBenchmarks:
                 result.block_until_ready()
             times.append(time.perf_counter() - start)
 
-        return BenchmarkResult(
+        benchmark_result = BenchmarkResult(
             name=name,
             mean_time=np.mean(times),
             std_time=np.std(times) if len(times) > 1 else 0.0,
@@ -187,6 +187,12 @@ class ActivationParityBenchmarks:
             iterations=len(times),
             metadata={"framework": "jax"},
         )
+
+        # Clear JAX JIT cache to prevent memory accumulation from
+        # @jax.jit decorated closures created in each benchmark method
+        jax.clear_caches()
+
+        return benchmark_result
 
     # =========================================================================
     # GLU Variants

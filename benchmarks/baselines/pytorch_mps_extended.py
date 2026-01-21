@@ -8,6 +8,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from benchmarks.baselines.pytorch_mps import PyTorchMPSBenchmarks, PyTorchBenchmarkResult
 
+try:
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
+    F = None
+    np = None
+
 
 class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
     """Extended PyTorch MPS benchmarks covering all 50+ operations."""
@@ -151,7 +160,19 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark SwiGLU activation."""
-        raise NotImplementedError("Stub: benchmark_swiglu")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+        W_gate = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+        W_up = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+
+        def fn():
+            with torch.no_grad():
+                gate = F.silu(x @ W_gate)
+                up = x @ W_up
+                return gate * up
+
+        name = f"pytorch_swiglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_geglu(
         self,
@@ -162,7 +183,19 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark GeGLU activation."""
-        raise NotImplementedError("Stub: benchmark_geglu")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+        W_gate = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+        W_up = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+
+        def fn():
+            with torch.no_grad():
+                gate = F.gelu(x @ W_gate, approximate="none")
+                up = x @ W_up
+                return gate * up
+
+        name = f"pytorch_geglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_reglu(
         self,
@@ -173,7 +206,19 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark ReGLU activation."""
-        raise NotImplementedError("Stub: benchmark_reglu")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+        W_gate = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+        W_up = torch.randn(hidden_dim, hidden_dim, device=self.device) * 0.02
+
+        def fn():
+            with torch.no_grad():
+                gate = F.relu(x @ W_gate)
+                up = x @ W_up
+                return gate * up
+
+        name = f"pytorch_reglu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_quick_gelu(
         self,
@@ -184,7 +229,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark QuickGELU activation."""
-        raise NotImplementedError("Stub: benchmark_quick_gelu")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return x * torch.sigmoid(1.702 * x)
+
+        name = f"pytorch_quick_gelu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_gelu_tanh(
         self,
@@ -195,7 +248,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark GELU with tanh approximation."""
-        raise NotImplementedError("Stub: benchmark_gelu_tanh")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return F.gelu(x, approximate="tanh")
+
+        name = f"pytorch_gelu_tanh_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_mish(
         self,
@@ -206,7 +267,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark Mish activation."""
-        raise NotImplementedError("Stub: benchmark_mish")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return F.mish(x)
+
+        name = f"pytorch_mish_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_squared_relu(
         self,
@@ -217,7 +286,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark Squared ReLU activation."""
-        raise NotImplementedError("Stub: benchmark_squared_relu")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return F.relu(x) ** 2
+
+        name = f"pytorch_squared_relu_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_hard_swish(
         self,
@@ -228,7 +305,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark HardSwish activation."""
-        raise NotImplementedError("Stub: benchmark_hard_swish")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return F.hardswish(x)
+
+        name = f"pytorch_hard_swish_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     def benchmark_hard_sigmoid(
         self,
@@ -239,7 +324,15 @@ class PyTorchMPSExtendedBenchmarks(PyTorchMPSBenchmarks):
         iterations: int = 100,
     ) -> PyTorchBenchmarkResult:
         """Benchmark HardSigmoid activation."""
-        raise NotImplementedError("Stub: benchmark_hard_sigmoid")
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, seq_length, hidden_dim, device=self.device)
+
+        def fn():
+            with torch.no_grad():
+                return F.hardsigmoid(x)
+
+        name = f"pytorch_hard_sigmoid_b{batch_size}_s{seq_length}_d{hidden_dim}"
+        return self._benchmark(fn, iterations=iterations, warmup_iterations=warmup, name=name)
 
     # ========== Normalization Operations ==========
 

@@ -82,10 +82,12 @@ class TestRMSNormParity:
         mlx_out = rmsnorm(x_mlx)
 
         # PyTorch reference: y = x / sqrt(mean(x^2) + eps) * weight
+        # Compute in fp32 for numerical stability like MLX implementation
         x_torch = _convert_to_torch(x_np, dtype)
-        weight_torch = torch.from_numpy(weight_np).to(x_torch.dtype)
-        rms = torch.sqrt(torch.mean(x_torch ** 2, dim=-1, keepdim=True) + eps)
-        torch_out = (x_torch / rms) * weight_torch
+        x_fp32 = x_torch.float()
+        weight_fp32 = torch.from_numpy(weight_np)  # Keep in fp32
+        rms = torch.sqrt(torch.mean(x_fp32 ** 2, dim=-1, keepdim=True) + eps)
+        torch_out = ((x_fp32 / rms) * weight_fp32).to(x_torch.dtype)
 
         rtol, atol = get_tolerance("normalization", "rmsnorm", dtype)
         np.testing.assert_allclose(
@@ -690,25 +692,27 @@ class TestAdaLayerNormParity:
         cond_mlx = _convert_to_mlx(cond_np, dtype)
         mlx_out = adaln(x_mlx, cond_mlx)
 
-        # PyTorch reference
+        # PyTorch reference - compute in fp32 like MLX implementation for numerical stability
         x_torch = _convert_to_torch(x_np, dtype)
         cond_torch = _convert_to_torch(cond_np, dtype)
-        proj_weight_torch = torch.from_numpy(proj_weight_np).to(x_torch.dtype)
-        proj_bias_torch = torch.from_numpy(proj_bias_np).to(x_torch.dtype)
+        proj_weight_torch = torch.from_numpy(proj_weight_np)  # Keep in fp32
+        proj_bias_torch = torch.from_numpy(proj_bias_np)  # Keep in fp32
 
-        # LayerNorm without affine
-        mean = x_torch.mean(dim=-1, keepdim=True)
-        var = x_torch.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x_torch - mean) / torch.sqrt(var + eps)
+        # LayerNorm without affine - compute in fp32 for numerical stability
+        x_fp32 = x_torch.float()
+        mean = x_fp32.mean(dim=-1, keepdim=True)
+        var = x_fp32.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x_fp32 - mean) / torch.sqrt(var + eps)
 
-        # Get scale/shift from conditioning
-        scale_shift = F.linear(cond_torch, proj_weight_torch, proj_bias_torch)
+        # Get scale/shift from conditioning (compute in fp32)
+        cond_fp32 = cond_torch.float()
+        scale_shift = F.linear(cond_fp32, proj_weight_torch, proj_bias_torch)
         scale, shift = scale_shift.chunk(2, dim=-1)
 
-        # Apply adaptive normalization
+        # Apply adaptive normalization in fp32, then cast back
         scale = scale.unsqueeze(1)  # (batch, 1, dims)
         shift = shift.unsqueeze(1)
-        torch_out = x_norm * (1 + scale) + shift
+        torch_out = (x_norm * (1 + scale) + shift).to(x_torch.dtype)
 
         rtol, atol = get_tolerance("normalization", "adalayernorm", dtype)
         np.testing.assert_allclose(

@@ -168,7 +168,8 @@ class TestGeGLUParity:
         w2_jax = jnp.array(w2_np.T)
         w_gate_jax = jnp.array(w_gate_np.T)
 
-        gate = jnn.gelu(x_jax @ w_gate_jax)
+        # MLX uses exact GELU, not the tanh approximation (JAX default is approximate=True)
+        gate = jnn.gelu(x_jax @ w_gate_jax, approximate=False)
         up = x_jax @ w1_jax
         jax_out = (gate * up) @ w2_jax
 

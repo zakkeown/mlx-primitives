@@ -109,6 +109,7 @@ def selective_gather(
     x: mx.array,
     indices: mx.array,
     use_metal: bool = True,
+    differentiable: bool = False,
 ) -> mx.array:
     """Gather selected rows from input tensor.
 
@@ -120,6 +121,7 @@ def selective_gather(
         x: Input tensor of shape (n_tokens, dim) or (n_tokens, ...).
         indices: 1D array of indices to gather, shape (capacity,).
         use_metal: Use Metal kernel if available.
+        differentiable: If True, use pure MLX operations that support gradients.
 
     Returns:
         Gathered tensor of shape (capacity, dim) or (capacity, ...).
@@ -133,8 +135,8 @@ def selective_gather(
     if indices.ndim != 1:
         raise ValueError(f"indices must be 1D, got {indices.ndim}D")
 
-    # For simple cases or when Metal not available, use indexing
-    if not use_metal or not _HAS_METAL or x.ndim > 2:
+    # For simple cases, when Metal not available, or when differentiable, use indexing
+    if not use_metal or not _HAS_METAL or x.ndim > 2 or differentiable:
         return x[indices]
 
     # Ensure 2D input
@@ -183,6 +185,7 @@ def selective_scatter_add(
     indices: mx.array,
     weights: mx.array,
     use_metal: bool = True,
+    differentiable: bool = False,
 ) -> mx.array:
     """Scatter-add values into output tensor with routing weights.
 
@@ -199,6 +202,7 @@ def selective_scatter_add(
         indices: Where to scatter each value, shape (capacity,).
         weights: Routing weights for each value, shape (capacity,).
         use_metal: Use Metal kernel if available.
+        differentiable: If True, use pure MLX operations that support gradients.
 
     Returns:
         The modified output tensor.
@@ -219,8 +223,8 @@ def selective_scatter_add(
     capacity = indices.shape[0]
     n_tokens, dim = output.shape
 
-    # For simple cases or fallback
-    if not use_metal or not _HAS_METAL or values.ndim > 2:
+    # For simple cases, fallback, or when differentiable (Metal kernels don't support VJP)
+    if not use_metal or not _HAS_METAL or values.ndim > 2 or differentiable:
         # Fully vectorized MLX implementation - no GPU sync
         # Use broadcasting to scatter-add without explicit loops
         #

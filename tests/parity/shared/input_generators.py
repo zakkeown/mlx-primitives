@@ -47,16 +47,17 @@ SIZE_CONFIGS = {
         "sampling": {"batch": 8, "vocab_size": 50000},
     },
     "large": {
-        "attention": {"batch": 8, "seq": 4096, "heads": 32, "head_dim": 128},
-        "activation": {"batch": 16, "seq": 4096, "dim": 4096},
-        "normalization": {"batch": 16, "seq": 4096, "hidden": 4096},
-        "quantization": {"m": 4096, "n": 4096, "k": 4096},
-        "moe": {"batch": 8, "seq": 2048, "dim": 2048, "experts": 32, "top_k": 2},
-        "pooling": {"batch": 16, "channels": 256, "height": 128, "width": 128},
-        "embedding": {"batch": 16, "seq": 2048, "vocab_size": 100000, "dim": 1024},
-        "scan": {"batch": 16, "seq": 4096, "dim": 256},
-        "cache": {"batch": 8, "seq": 4096, "heads": 32, "head_dim": 128, "block_size": 128},
-        "sampling": {"batch": 16, "vocab_size": 100000},
+        # Reduced from original to avoid OOM - still tests larger scale behavior
+        "attention": {"batch": 2, "seq": 1024, "heads": 16, "head_dim": 64},
+        "activation": {"batch": 4, "seq": 1024, "dim": 2048},
+        "normalization": {"batch": 4, "seq": 1024, "hidden": 2048},
+        "quantization": {"m": 1024, "n": 1024, "k": 1024},
+        "moe": {"batch": 2, "seq": 512, "dim": 1024, "experts": 16, "top_k": 2},
+        "pooling": {"batch": 4, "channels": 128, "height": 64, "width": 64},
+        "embedding": {"batch": 4, "seq": 512, "vocab_size": 50000, "dim": 512},
+        "scan": {"batch": 4, "seq": 1024, "dim": 128},
+        "cache": {"batch": 2, "seq": 1024, "heads": 16, "head_dim": 64, "block_size": 64},
+        "sampling": {"batch": 4, "vocab_size": 50000},
     },
 }
 

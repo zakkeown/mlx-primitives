@@ -172,15 +172,17 @@ def _get_fused_rope_attention_kernel():
                 }
             }
 
-            // Write normalized output
+            // Write normalized output (with explicit type conversion for bf16)
+            typedef decltype(out[0] + out[0]) OutT;
             if (sum_val > 0.0f) {
                 float inv_sum = 1.0f / sum_val;
                 for (uint d = 0; d < head_dim; d++) {
-                    out[q_base + d] = acc[d] * inv_sum;
+                    float val = acc[d] * inv_sum;
+                    out[q_base + d] = OutT(val);
                 }
             } else {
                 for (uint d = 0; d < head_dim; d++) {
-                    out[q_base + d] = 0.0f;
+                    out[q_base + d] = OutT(0.0f);
                 }
             }
         """
@@ -306,15 +308,17 @@ def _get_fused_rope_attention_kernel_cached():
                 }
             }
 
-            // Write output
+            // Write output (with explicit type conversion for bf16)
+            typedef decltype(out[0] + out[0]) OutT;
             if (sum_val > 0.0f) {
                 float inv_sum = 1.0f / sum_val;
                 for (uint d = 0; d < head_dim; d++) {
-                    out[q_base + d] = acc[d] * inv_sum;
+                    float val = acc[d] * inv_sum;
+                    out[q_base + d] = OutT(val);
                 }
             } else {
                 for (uint d = 0; d < head_dim; d++) {
-                    out[q_base + d] = 0.0f;
+                    out[q_base + d] = OutT(0.0f);
                 }
             }
         """
@@ -519,7 +523,8 @@ def _get_fused_rope_attention_kernel_tiled():
                 threadgroup_barrier(mem_flags::mem_threadgroup);  // Before next tile load
             }
 
-            // === Write output ===
+            // === Write output (with explicit type conversion for bf16) ===
+            typedef decltype(out[0] + out[0]) OutT;
             if (valid_q) {
                 uint out_base = batch_idx * q_stride_batch +
                                 global_q_idx * q_stride_seq +
@@ -528,11 +533,12 @@ def _get_fused_rope_attention_kernel_tiled():
                 if (sum_val > 0.0f) {
                     float inv_sum = 1.0f / sum_val;
                     for (uint d = 0; d < head_dim; d++) {
-                        out[out_base + d] = acc[d] * inv_sum;
+                        float val = acc[d] * inv_sum;
+                        out[out_base + d] = OutT(val);
                     }
                 } else {
                     for (uint d = 0; d < head_dim; d++) {
-                        out[out_base + d] = 0.0f;
+                        out[out_base + d] = OutT(0.0f);
                     }
                 }
             }
@@ -785,6 +791,136 @@ def _reference_rope_attention(
     )
 
 
+def _metal_fused_rope_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    cos_cache: Optional[mx.array],
+    sin_cache: Optional[mx.array],
+    rope_base: float,
+    q_offset: int,
+    kv_offset: int,
+    causal: bool,
+) -> mx.array:
+    """Metal-accelerated fused RoPE + attention (no VJP support)."""
+    return fast_fused_rope_attention(
+        q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal
+    )
+
+
+def _autodiff_rope_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    rope_base: float = 10000.0,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    causal: bool = False,
+) -> mx.array:
+    """Autodiff-compatible RoPE + attention using standard MLX ops.
+
+    Used for gradient computation in VJP.
+    """
+    batch_size, seq_q, num_heads, head_dim = q.shape
+    _, seq_kv, _, _ = k.shape
+    half_dim = head_dim // 2
+
+    # Compute max position needed
+    max_pos = max(seq_q + q_offset, seq_kv + kv_offset)
+
+    # Compute RoPE cache inline (for autodiff compatibility)
+    inv_freq = 1.0 / (rope_base ** (mx.arange(0, half_dim, dtype=mx.float32) / half_dim))
+    t = mx.arange(max_pos, dtype=mx.float32)
+    freqs = mx.outer(t, inv_freq)
+    cos_cache = mx.cos(freqs).astype(q.dtype)
+    sin_cache = mx.sin(freqs).astype(q.dtype)
+
+    # Apply RoPE to Q
+    cos_q = cos_cache[q_offset:q_offset + seq_q][None, :, None, :]
+    sin_q = sin_cache[q_offset:q_offset + seq_q][None, :, None, :]
+    q1, q2 = q[..., :half_dim], q[..., half_dim:]
+    q_rot = mx.concatenate([q1 * cos_q - q2 * sin_q, q1 * sin_q + q2 * cos_q], axis=-1)
+
+    # Apply RoPE to K
+    cos_k = cos_cache[kv_offset:kv_offset + seq_kv][None, :, None, :]
+    sin_k = sin_cache[kv_offset:kv_offset + seq_kv][None, :, None, :]
+    k1, k2 = k[..., :half_dim], k[..., half_dim:]
+    k_rot = mx.concatenate([k1 * cos_k - k2 * sin_k, k1 * sin_k + k2 * cos_k], axis=-1)
+
+    # Attention: (batch, seq, heads, dim) -> (batch, heads, seq, dim)
+    q_t = mx.transpose(q_rot, (0, 2, 1, 3))
+    k_t = mx.transpose(k_rot, (0, 2, 1, 3))
+    v_t = mx.transpose(v, (0, 2, 1, 3))
+
+    # Compute attention scores
+    scores = mx.matmul(q_t, mx.transpose(k_t, (0, 1, 3, 2))) * scale
+
+    # Apply causal mask
+    if causal:
+        seq_len_q = q_t.shape[2]
+        seq_len_kv = k_t.shape[2]
+        mask = mx.triu(mx.full((seq_len_q, seq_len_kv), float("-inf")), k=1)
+        scores = scores + mask
+
+    # Softmax and weighted sum
+    weights = mx.softmax(scores, axis=-1)
+    out = mx.matmul(weights, v_t)
+
+    # Transpose back: (batch, heads, seq, dim) -> (batch, seq, heads, dim)
+    return mx.transpose(out, (0, 2, 1, 3))
+
+
+@mx.custom_function
+def _fused_rope_attention_with_vjp(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    cos_cache: Optional[mx.array],
+    sin_cache: Optional[mx.array],
+    rope_base: float,
+    q_offset: int,
+    kv_offset: int,
+    causal: bool,
+) -> mx.array:
+    """Fused RoPE + attention with custom VJP for gradient support."""
+    # Use Metal kernel for forward pass (fast)
+    if _USE_METAL_KERNELS:
+        try:
+            return _metal_fused_rope_attention(
+                q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal
+            )
+        except Exception:
+            pass
+    # Fallback to autodiff version
+    return _autodiff_rope_attention(q, k, v, scale, rope_base, q_offset, kv_offset, causal)
+
+
+@_fused_rope_attention_with_vjp.vjp
+def _fused_rope_attention_vjp(primals, cotangent, output):
+    """VJP for fused RoPE + attention.
+
+    Uses the autodiff-compatible reference implementation for gradient computation.
+    Only Q, K, V receive gradients; other parameters are scalars/configs.
+    """
+    q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal = primals
+
+    # Use value_and_grad on the autodiff-compatible implementation
+    def forward_fn(q_, k_, v_):
+        out = _autodiff_rope_attention(q_, k_, v_, scale, rope_base, q_offset, kv_offset, causal)
+        # Sum weighted by cotangent to get scalar for grad
+        return mx.sum(out * cotangent)
+
+    # Compute gradients w.r.t. q, k, v
+    _, grads = mx.value_and_grad(forward_fn, argnums=(0, 1, 2))(q, k, v)
+    dq, dk, dv = grads
+
+    # Return gradients for all primals (None for non-array parameters)
+    return dq, dk, dv, None, None, None, None, None, None, None
+
+
 def fused_rope_attention(
     q: mx.array,
     k: mx.array,
@@ -801,7 +937,7 @@ def fused_rope_attention(
     """Fused RoPE + Flash Attention with automatic fallback.
 
     Uses Metal kernel when available, falls back to separate RoPE + attention
-    otherwise.
+    otherwise. Supports gradients via custom VJP.
 
     Args:
         q: Query tensor of shape (batch, seq_q, num_heads, head_dim).
@@ -823,14 +959,12 @@ def fused_rope_attention(
         scale = 1.0 / math.sqrt(q.shape[-1])
 
     if use_metal and _USE_METAL_KERNELS:
-        try:
-            return fast_fused_rope_attention(
-                q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal
-            )
-        except Exception:
-            pass
+        # Use VJP-enabled wrapper for gradient support
+        return _fused_rope_attention_with_vjp(
+            q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal
+        )
 
-    # Fallback to separate operations
+    # Fallback to separate operations (already autodiff-compatible)
     return _reference_rope_attention(
         q, k, v, scale, rope_base, q_offset, kv_offset, causal
     )

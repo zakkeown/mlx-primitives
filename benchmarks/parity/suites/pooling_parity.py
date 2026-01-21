@@ -227,7 +227,14 @@ class PoolingParityBenchmarks:
         # PyTorch benchmark
         pytorch_result = None
         if HAS_PYTORCH and self.config.include_pytorch:
-            x_torch = torch.from_numpy(x_np).to("mps")
+            # Try MPS first, fall back to CPU if MPS doesn't support this config
+            try:
+                x_torch = torch.from_numpy(x_np).to("mps")
+                # Test if MPS supports this operation
+                _ = F.adaptive_avg_pool1d(x_torch, output_size)
+            except RuntimeError:
+                # MPS doesn't support non-divisible sizes, use CPU
+                x_torch = torch.from_numpy(x_np)
 
             def pytorch_fn():
                 return F.adaptive_avg_pool1d(x_torch, output_size)
@@ -278,7 +285,16 @@ class PoolingParityBenchmarks:
         # PyTorch benchmark
         pytorch_result = None
         if HAS_PYTORCH and self.config.include_pytorch:
-            x_torch = torch.from_numpy(x_np).to("mps")
+            # Try MPS first, fall back to CPU if MPS doesn't support this config
+            try:
+                x_torch = torch.from_numpy(x_np).to("mps")
+                # Test if MPS supports this operation
+                _ = F.adaptive_avg_pool2d(x_torch, output_size)
+                device = "mps"
+            except RuntimeError:
+                # MPS doesn't support non-divisible sizes, use CPU
+                x_torch = torch.from_numpy(x_np)
+                device = "cpu"
 
             def pytorch_fn():
                 return F.adaptive_avg_pool2d(x_torch, output_size)
@@ -330,7 +346,14 @@ class PoolingParityBenchmarks:
         # PyTorch benchmark
         pytorch_result = None
         if HAS_PYTORCH and self.config.include_pytorch:
-            x_torch = torch.from_numpy(x_np).to("mps")
+            # Try MPS first, fall back to CPU if MPS doesn't support this config
+            try:
+                x_torch = torch.from_numpy(x_np).to("mps")
+                # Test if MPS supports this operation
+                _ = F.adaptive_max_pool1d(x_torch, output_size)
+            except RuntimeError:
+                # MPS doesn't support non-divisible sizes, use CPU
+                x_torch = torch.from_numpy(x_np)
 
             def pytorch_fn():
                 return F.adaptive_max_pool1d(x_torch, output_size)
@@ -381,7 +404,14 @@ class PoolingParityBenchmarks:
         # PyTorch benchmark
         pytorch_result = None
         if HAS_PYTORCH and self.config.include_pytorch:
-            x_torch = torch.from_numpy(x_np).to("mps")
+            # Try MPS first, fall back to CPU if MPS doesn't support this config
+            try:
+                x_torch = torch.from_numpy(x_np).to("mps")
+                # Test if MPS supports this operation
+                _ = F.adaptive_max_pool2d(x_torch, output_size)
+            except RuntimeError:
+                # MPS doesn't support non-divisible sizes, use CPU
+                x_torch = torch.from_numpy(x_np)
 
             def pytorch_fn():
                 return F.adaptive_max_pool2d(x_torch, output_size)

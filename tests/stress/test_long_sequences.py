@@ -71,8 +71,10 @@ class TestLongSequenceScan:
         ))
         np_out = np_ssm_scan(A_np, x_np)
 
-        # Very relaxed tolerance for extremely long sequences
-        np.testing.assert_allclose(mlx_out, np_out, rtol=0.15, atol=0.15)
+        # Tightened tolerance: 15% was too loose and could hide bugs
+        # O(log n * eps) for n=32768 gives ~15 * 1e-7 = 1.5e-6 theoretical error
+        # Using 2% to catch algorithmic bugs while allowing precision drift
+        np.testing.assert_allclose(mlx_out, np_out, rtol=2e-2, atol=2e-2)
 
     @pytest.mark.stress
     @pytest.mark.slow
@@ -98,7 +100,8 @@ class TestLongSequenceScan:
 
         # Check that results are reasonable (not NaN/Inf)
         assert np.all(np.isfinite(mlx_out)), "MLX output contains NaN or Inf"
-        np.testing.assert_allclose(mlx_out, np_out, rtol=0.1, atol=0.1)
+        # Tightened from 10% to 2%: varying decay should not cause large errors
+        np.testing.assert_allclose(mlx_out, np_out, rtol=2e-2, atol=2e-2)
 
 
 class TestLongSequenceAttention:
@@ -205,7 +208,8 @@ class TestBatchedLongSequences:
         ))
         np_out = np_ssm_scan(A_np, x_np)
 
-        np.testing.assert_allclose(mlx_out, np_out, rtol=5e-2, atol=5e-2)
+        # Tightened from 5% to 2%: batched SSM should maintain precision
+        np.testing.assert_allclose(mlx_out, np_out, rtol=2e-2, atol=2e-2)
 
 
 class TestRepeatedOperations:

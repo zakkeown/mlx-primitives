@@ -128,6 +128,53 @@ def _get_fused_geglu_kernel() -> mx.fast.metal_kernel:
     return _fused_geglu_kernel
 
 
+@mx.custom_function
+def _fused_swiglu_with_vjp(x, W_gate, W_up):
+    """Fused SwiGLU with custom VJP for gradient support."""
+    return _metal_fused_swiglu(x, W_gate, W_up)
+
+
+@_fused_swiglu_with_vjp.vjp
+def _fused_swiglu_vjp(primals, cotangent, output):
+    """VJP for fused SwiGLU - uses reference implementation for gradients."""
+    x, W_gate, W_up = primals
+
+    # Recompute forward using reference (autodiff-compatible)
+    gate = x @ W_gate.T
+    up = x @ W_up.T
+    # silu(gate) = gate * sigmoid(gate)
+    sigmoid_gate = mx.sigmoid(gate)
+    silu_gate = gate * sigmoid_gate
+
+    # Gradient of silu_gate * up w.r.t. inputs
+    # d/d(silu_gate) = up * cotangent
+    # d/d(up) = silu_gate * cotangent
+    d_silu_gate = up * cotangent
+    d_up = silu_gate * cotangent
+
+    # Gradient through SiLU: d(silu)/d(gate)
+    # silu(x) = x * sigmoid(x)
+    # d(silu)/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+    #            = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+    d_silu_d_gate = sigmoid_gate * (1 + gate * (1 - sigmoid_gate))
+    d_gate = d_silu_gate * d_silu_d_gate
+
+    # Gradient w.r.t. x: d_gate @ W_gate + d_up @ W_up
+    dx = d_gate @ W_gate + d_up @ W_up
+
+    # Gradient w.r.t. W_gate: d_gate.T @ x (summed over batch/seq)
+    # Shape: (out_features, in_features)
+    d_gate_flat = d_gate.reshape(-1, d_gate.shape[-1])
+    x_flat = x.reshape(-1, x.shape[-1])
+    dW_gate = d_gate_flat.T @ x_flat
+
+    # Gradient w.r.t. W_up: d_up.T @ x
+    d_up_flat = d_up.reshape(-1, d_up.shape[-1])
+    dW_up = d_up_flat.T @ x_flat
+
+    return dx, dW_gate, dW_up
+
+
 def fused_swiglu(
     x: mx.array,
     W_gate: mx.array,
@@ -141,6 +188,7 @@ def fused_swiglu(
     Where silu(x) = x * sigmoid(x)
 
     This is used in LLaMA, Mistral, and other modern LLMs.
+    Supports gradients via custom VJP.
 
     Args:
         x: Input tensor of shape (batch, seq_len, in_features).
@@ -173,7 +221,7 @@ def fused_swiglu(
         return _reference_swiglu(x, W_gate, W_up)
 
     try:
-        return _metal_fused_swiglu(x, W_gate, W_up)
+        return _fused_swiglu_with_vjp(x, W_gate, W_up)
     except RuntimeError as e:
         # Catch Metal kernel errors, but let programming bugs propagate
         from mlx_primitives.utils.logging import log_fallback
@@ -255,12 +303,59 @@ def fused_geglu(
         return _reference_geglu(x, W_gate, W_up)
 
     try:
-        return _metal_fused_geglu(x, W_gate, W_up)
+        return _fused_geglu_with_vjp(x, W_gate, W_up)
     except RuntimeError as e:
         # Catch Metal kernel errors, but let programming bugs propagate
         from mlx_primitives.utils.logging import log_fallback
         log_fallback("fused_geglu", e)
         return _reference_geglu(x, W_gate, W_up)
+
+
+@mx.custom_function
+def _fused_geglu_with_vjp(x, W_gate, W_up):
+    """Fused GeGLU with custom VJP for gradient support."""
+    return _metal_fused_geglu(x, W_gate, W_up)
+
+
+@_fused_geglu_with_vjp.vjp
+def _fused_geglu_vjp(primals, cotangent, output):
+    """VJP for fused GeGLU - uses reference implementation for gradients."""
+    x, W_gate, W_up = primals
+
+    # Recompute forward using reference (autodiff-compatible)
+    gate = x @ W_gate.T
+    up = x @ W_up.T
+    gelu_gate = 0.5 * gate * (1 + mx.tanh(GELU_SQRT_2_OVER_PI * (gate + GELU_TANH_COEFF * gate ** 3)))
+
+    # Gradient of gelu_gate * up w.r.t. inputs
+    # d/d(gelu_gate) = up * cotangent
+    # d/d(up) = gelu_gate * cotangent
+    d_gelu_gate = up * cotangent
+    d_up = gelu_gate * cotangent
+
+    # Gradient through GELU: d(gelu)/d(gate)
+    # gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    inner = GELU_SQRT_2_OVER_PI * (gate + GELU_TANH_COEFF * gate ** 3)
+    tanh_inner = mx.tanh(inner)
+    sech2_inner = 1 - tanh_inner ** 2
+    d_inner = GELU_SQRT_2_OVER_PI * (1 + 3 * GELU_TANH_COEFF * gate ** 2)
+    d_gelu_d_gate = 0.5 * (1 + tanh_inner) + 0.5 * gate * sech2_inner * d_inner
+    d_gate = d_gelu_gate * d_gelu_d_gate
+
+    # Gradient w.r.t. x: d_gate @ W_gate + d_up @ W_up
+    dx = d_gate @ W_gate + d_up @ W_up
+
+    # Gradient w.r.t. W_gate: d_gate.T @ x (summed over batch/seq)
+    # Shape: (out_features, in_features)
+    d_gate_flat = d_gate.reshape(-1, d_gate.shape[-1])
+    x_flat = x.reshape(-1, x.shape[-1])
+    dW_gate = d_gate_flat.T @ x_flat
+
+    # Gradient w.r.t. W_up: d_up.T @ x
+    d_up_flat = d_up.reshape(-1, d_up.shape[-1])
+    dW_up = d_up_flat.T @ x_flat
+
+    return dx, dW_gate, dW_up
 
 
 def _metal_fused_geglu(

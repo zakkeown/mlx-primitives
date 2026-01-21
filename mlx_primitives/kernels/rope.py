@@ -62,8 +62,13 @@ def _get_rope_kernel():
             float sin_val = sin_cache[cache_idx];
 
             // Apply rotation: out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos
-            out[base_idx + d1] = x1 * cos_val - x2 * sin_val;
-            out[base_idx + d2] = x1 * sin_val + x2 * cos_val;
+            float r1 = x1 * cos_val - x2 * sin_val;
+            float r2 = x1 * sin_val + x2 * cos_val;
+            // Use explicit type conversion for bf16 compatibility
+            // decltype(out[0] + out[0]) gives value type (not reference)
+            typedef decltype(out[0] + out[0]) OutT;
+            out[base_idx + d1] = OutT(r1);
+            out[base_idx + d2] = OutT(r2);
         """
 
         _rope_kernel = mx.fast.metal_kernel(
@@ -124,13 +129,19 @@ def _get_rope_qk_kernel():
             float cos_val = cos_cache[cache_idx];
             float sin_val = sin_cache[cache_idx];
 
-            // Apply rotation to Q
-            q_out[base_idx + d1] = q1 * cos_val - q2 * sin_val;
-            q_out[base_idx + d2] = q1 * sin_val + q2 * cos_val;
+            // Apply rotation to Q (with explicit type conversion for bf16)
+            float q_r1 = q1 * cos_val - q2 * sin_val;
+            float q_r2 = q1 * sin_val + q2 * cos_val;
+            typedef decltype(q_out[0] + q_out[0]) QOutT;
+            q_out[base_idx + d1] = QOutT(q_r1);
+            q_out[base_idx + d2] = QOutT(q_r2);
 
-            // Apply rotation to K
-            k_out[base_idx + d1] = k1 * cos_val - k2 * sin_val;
-            k_out[base_idx + d2] = k1 * sin_val + k2 * cos_val;
+            // Apply rotation to K (with explicit type conversion for bf16)
+            float k_r1 = k1 * cos_val - k2 * sin_val;
+            float k_r2 = k1 * sin_val + k2 * cos_val;
+            typedef decltype(k_out[0] + k_out[0]) KOutT;
+            k_out[base_idx + d1] = KOutT(k_r1);
+            k_out[base_idx + d2] = KOutT(k_r2);
         """
 
         _rope_qk_kernel = mx.fast.metal_kernel(
