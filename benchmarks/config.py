@@ -196,6 +196,35 @@ class MoESizes:
 
 
 @dataclass
+class PoolingSizes:
+    """Common pooling sizes for benchmarking.
+
+    Attributes:
+        batch_sizes: Batch sizes to test.
+        channel_counts: Number of channels to test.
+        spatial_sizes: Spatial dimensions (height/width) to test.
+        output_sizes_1d: Output sizes for 1D adaptive pooling.
+        output_sizes_2d: Output sizes for 2D adaptive pooling.
+        gem_p_values: Power values for GeM pooling.
+        spp_levels: Pyramid levels for spatial pyramid pooling.
+    """
+
+    batch_sizes: Tuple[int, ...] = (1, 4, 8, 16)
+    channel_counts: Tuple[int, ...] = (64, 128, 256, 512)
+    spatial_sizes: Tuple[int, ...] = (32, 64, 128, 224)
+    output_sizes_1d: Tuple[int, ...] = (1, 4, 8, 16)
+    output_sizes_2d: Tuple[Tuple[int, int], ...] = ((1, 1), (4, 4), (7, 7))
+    gem_p_values: Tuple[float, ...] = (1.0, 2.0, 3.0, 5.0)
+    spp_levels: Tuple[Tuple[int, ...], ...] = ((1,), (1, 2), (1, 2, 4), (1, 2, 4, 8))
+
+    # Named configurations: (batch, channels, height, width)
+    small: Tuple[int, ...] = (4, 64, 32, 32)
+    medium: Tuple[int, ...] = (8, 128, 64, 64)
+    large: Tuple[int, ...] = (16, 256, 128, 128)
+    resnet_style: Tuple[int, ...] = (1, 2048, 7, 7)  # Final conv layer of ResNet
+
+
+@dataclass
 class CacheSizes:
     """Common KV cache sizes for benchmarking.
 

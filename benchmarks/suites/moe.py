@@ -36,6 +36,7 @@ class MoEBenchmarks:
         results.extend(self.run_router_benchmarks())
         results.extend(self.run_moe_layer_benchmarks())
         results.extend(self.run_backward_benchmarks())
+        results.extend(self.run_gather_scatter_benchmarks())
         return results
 
     def run_router_benchmarks(self) -> list[BenchmarkResult]:
@@ -319,5 +320,126 @@ class MoEBenchmarks:
             "top_k": top_k,
             "type": "backward",
             "layer": "MoELayer",
+        }
+        return result
+
+    def run_gather_scatter_benchmarks(self) -> list[BenchmarkResult]:
+        """Run gather/scatter benchmarks for MoE dispatch."""
+        results = []
+
+        configs = [
+            (4, 512, 256, 8),    # (batch, seq, hidden, num_experts)
+            (4, 1024, 512, 8),
+            (8, 512, 256, 16),
+            (8, 1024, 512, 16),
+        ]
+
+        for batch, seq, hidden, experts in configs:
+            # Selective gather
+            result = self._benchmark_selective_gather(batch, seq, hidden, experts)
+            if result:
+                results.append(result)
+
+            # Selective scatter add
+            result = self._benchmark_selective_scatter_add(batch, seq, hidden, experts)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_selective_gather(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        num_experts: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark selective_gather for MoE token dispatch."""
+        try:
+            from mlx_primitives.primitives.gather_scatter import selective_gather
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        # Flatten tokens: (batch, seq, hidden) -> (n_tokens, hidden)
+        n_tokens = batch_size * seq_len
+        x = mx.random.normal((n_tokens, hidden_dim))
+
+        # Simulate MoE routing: select a subset of tokens (capacity per expert)
+        # Typically capacity = (n_tokens / num_experts) * capacity_factor
+        capacity = n_tokens // num_experts
+        indices = mx.random.randint(0, n_tokens, shape=(capacity,))
+
+        def fn():
+            return selective_gather(x, indices)
+
+        name = f"selective_gather_b{batch_size}_s{seq_len}_h{hidden_dim}_e{num_experts}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "num_experts": num_experts,
+            "n_tokens": n_tokens,
+            "capacity": capacity,
+            "type": "optimized",
+            "operation": "selective_gather",
+        }
+        return result
+
+    def _benchmark_selective_scatter_add(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        num_experts: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark selective_scatter_add for MoE output combination."""
+        try:
+            from mlx_primitives.primitives.gather_scatter import selective_scatter_add
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        # Flatten tokens: (batch, seq) -> n_tokens
+        n_tokens = batch_size * seq_len
+        # Capacity per expert (tokens routed to each expert)
+        capacity = n_tokens // num_experts
+
+        # Output accumulator: shape (n_tokens, hidden_dim)
+        output = mx.zeros((n_tokens, hidden_dim))
+        # Expert outputs to scatter: shape (capacity, hidden_dim)
+        values = mx.random.normal((capacity, hidden_dim))
+        # Where to scatter each value: 1D indices
+        indices = mx.random.randint(0, n_tokens, shape=(capacity,))
+        # Routing weights for each value
+        weights = mx.random.uniform(shape=(capacity,))
+
+        def fn():
+            return selective_scatter_add(output, values, indices, weights)
+
+        name = f"selective_scatter_add_b{batch_size}_s{seq_len}_h{hidden_dim}_e{num_experts}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "num_experts": num_experts,
+            "n_tokens": n_tokens,
+            "capacity": capacity,
+            "type": "optimized",
+            "operation": "selective_scatter_add",
         }
         return result

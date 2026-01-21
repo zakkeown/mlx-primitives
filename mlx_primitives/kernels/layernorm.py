@@ -110,6 +110,25 @@ def _get_layernorm_affine_kernel():
     return _layernorm_affine_kernel
 
 
+def _reference_layernorm(
+    x: mx.array,
+    gamma: Optional[mx.array] = None,
+    beta: Optional[mx.array] = None,
+    eps: float = 1e-6,
+) -> mx.array:
+    """Reference implementation using MLX ops."""
+    mean = mx.mean(x, axis=-1, keepdims=True)
+    var = mx.var(x, axis=-1, keepdims=True)
+    normalized = (x - mean) / mx.sqrt(var + eps)
+
+    if gamma is not None:
+        normalized = normalized * gamma
+    if beta is not None:
+        normalized = normalized + beta
+
+    return normalized
+
+
 def fast_layernorm(
     x: mx.array,
     gamma: Optional[mx.array] = None,
@@ -135,6 +154,14 @@ def fast_layernorm(
         x = x[None, :, :]
 
     batch_size, seq_len, hidden_dim = x.shape
+
+    # Metal kernel overhead not amortized at small batch sizes or short sequences
+    # (see RCA report - benchmark showed 0.82x-0.86x slowdown for b=4, s=512)
+    # For small workloads, MLX's fused ops are faster than custom Metal kernels
+    if batch_size <= 2 or (batch_size <= 4 and seq_len <= 512):
+        result = _reference_layernorm(x, gamma, beta, eps)
+        return result[0] if was_2d else result
+
     total_rows = batch_size * seq_len
 
     # One thread per row

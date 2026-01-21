@@ -2,10 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Python Environment
+
+MLX 0.30.x requires Python 3.12+. A Python 3.13 virtual environment is available:
+
+```bash
+# Activate Python 3.13 venv (required for MLX 0.30.x)
+source .venv313/bin/activate
+
+# Verify versions
+python --version    # Should show 3.13.x
+python -c "import mlx; print(mlx.__version__)"  # Should show 0.30.x
+```
+
 ## Build and Development Commands
 
 ```bash
-# Install for development
+# Install for development (use .venv313 for MLX 0.30.x compatibility)
 pip install -e ".[dev]"
 
 # Run all tests
@@ -23,8 +36,12 @@ pytest tests/ -m "not benchmark and not slow"
 # Run with coverage
 pytest tests/ --cov=mlx_primitives --cov-report=html
 
-# Run benchmarks
+# Run benchmarks (pytest)
 pytest tests/ -m benchmark --benchmark-json=benchmark.json
+
+# Run benchmark suite (custom runner with speedup comparison)
+python -m benchmarks.runner --suite all -o benchmark_results/results.json
+python -m benchmarks.runner --suite attention  # Specific suite
 
 # Linting and formatting
 black .                                    # Format code

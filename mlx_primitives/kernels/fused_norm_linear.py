@@ -274,8 +274,9 @@ def fused_rmsnorm_linear(
             f"linear_weight dim {linear_weight.shape[1]} != hidden_dim {hidden_dim}"
         )
 
-    # For small tensors or when Metal not available, use separate ops
-    if not should_use_metal(seq_len, use_metal):
+    # For small tensors, small batch sizes, or when Metal not available, use separate ops
+    # Metal kernel overhead is not amortized at batch_size <= 2 (see RCA report)
+    if batch_size <= 2 or not should_use_metal(seq_len, use_metal):
         return _reference_rmsnorm_linear(x, norm_weight, linear_weight, linear_bias, eps)
 
     try:
@@ -403,8 +404,9 @@ def rmsnorm(
     Returns:
         Normalized tensor of same shape as input.
     """
-    # Metal kernel requires 3D input
-    if x.ndim != 3 or not should_use_metal(x.shape[1], use_metal):
+    # Metal kernel requires 3D input and has overhead not amortized at small batch sizes
+    # (see RCA report - batch_size <= 2 is slower with Metal kernel)
+    if x.ndim != 3 or x.shape[0] <= 2 or not should_use_metal(x.shape[1], use_metal):
         return _reference_rmsnorm(x, weight, eps)
 
     try:

@@ -34,7 +34,8 @@ class LayerBenchmarks:
         """
         results = []
         results.extend(self.run_normalization_benchmarks())
-        results.extend(self.run_activation_benchmarks())
+        results.extend(self.run_ffn_benchmarks())  # SwiGLU, GeGLU (full FFN layers)
+        results.extend(self.run_activation_benchmarks())  # Mish, GELU (element-wise)
         results.extend(self.run_pooling_benchmarks())
         results.extend(self.run_embedding_benchmarks())
         return results
@@ -66,31 +67,80 @@ class LayerBenchmarks:
 
         return results
 
-    def run_activation_benchmarks(self) -> list[BenchmarkResult]:
-        """Run activation function benchmarks."""
+    def run_ffn_benchmarks(self) -> list[BenchmarkResult]:
+        """Run FFN (feed-forward network) layer benchmarks.
+
+        SwiGLU and GeGLU are full FFN layers with 3 linear projections,
+        not simple element-wise activations. They have O(seq * hidden * 4*hidden)
+        compute cost from matrix multiplications.
+        """
         results = []
 
         for batch_size in self.sizes.batch_sizes[:3]:
             for hidden_dim in self.sizes.hidden_dims[:4]:
                 seq_len = 512
 
-                # SwiGLU
+                # SwiGLU FFN (3 linear projections: W_gate, W_up, W_down)
                 result = self._benchmark_swiglu(batch_size, seq_len, hidden_dim)
                 if result:
                     results.append(result)
 
-                # GeGLU
+                # GeGLU FFN (3 linear projections: W_gate, W_up, W_down)
                 result = self._benchmark_geglu(batch_size, seq_len, hidden_dim)
                 if result:
                     results.append(result)
 
-                # Mish
+        return results
+
+    def run_activation_benchmarks(self) -> list[BenchmarkResult]:
+        """Run element-wise activation function benchmarks.
+
+        These are pure element-wise operations with O(n) compute cost,
+        as opposed to FFN layers which have O(n * d) matrix multiplication cost.
+        """
+        results = []
+
+        for batch_size in self.sizes.batch_sizes[:3]:
+            for hidden_dim in self.sizes.hidden_dims[:4]:
+                seq_len = 512
+
+                # Mish (element-wise)
                 result = self._benchmark_mish(batch_size, seq_len, hidden_dim)
                 if result:
                     results.append(result)
 
-                # GELU variants
+                # GELU variants (element-wise)
                 result = self._benchmark_gelu_tanh(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # SiLU (element-wise)
+                result = self._benchmark_silu(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # QuickGELU (element-wise)
+                result = self._benchmark_quick_gelu(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # Squared ReLU (element-wise)
+                result = self._benchmark_squared_relu(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # Swish (element-wise)
+                result = self._benchmark_swish(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # Hard Swish (element-wise)
+                result = self._benchmark_hard_swish(batch_size, seq_len, hidden_dim)
+                if result:
+                    results.append(result)
+
+                # Hard Sigmoid (element-wise)
+                result = self._benchmark_hard_sigmoid(batch_size, seq_len, hidden_dim)
                 if result:
                     results.append(result)
 
@@ -283,7 +333,8 @@ class LayerBenchmarks:
             "batch_size": batch_size,
             "seq_len": seq_len,
             "hidden_dim": hidden_dim,
-            "type": "activation",
+            "intermediate_dim": hidden_dim * 4,
+            "type": "ffn_layer",
             "layer": "SwiGLU",
         }
         return result
@@ -319,7 +370,8 @@ class LayerBenchmarks:
             "batch_size": batch_size,
             "seq_len": seq_len,
             "hidden_dim": hidden_dim,
-            "type": "activation",
+            "intermediate_dim": hidden_dim * 4,
+            "type": "ffn_layer",
             "layer": "GeGLU",
         }
         return result
@@ -389,6 +441,205 @@ class LayerBenchmarks:
             "hidden_dim": hidden_dim,
             "type": "activation",
             "layer": "GELUTanh",
+        }
+        return result
+
+    def _benchmark_silu(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark SiLU activation."""
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return nn.silu(x)
+
+        name = f"silu_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "SiLU",
+        }
+        return result
+
+    def _benchmark_quick_gelu(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark QuickGELU activation."""
+        try:
+            from mlx_primitives.layers import quick_gelu
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return quick_gelu(x)
+
+        name = f"quick_gelu_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "QuickGELU",
+        }
+        return result
+
+    def _benchmark_squared_relu(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark Squared ReLU activation."""
+        try:
+            from mlx_primitives.layers import squared_relu
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return squared_relu(x)
+
+        name = f"squared_relu_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "SquaredReLU",
+        }
+        return result
+
+    def _benchmark_swish(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark Swish activation."""
+        try:
+            from mlx_primitives.layers import swish
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return swish(x, beta=1.0)
+
+        name = f"swish_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "Swish",
+        }
+        return result
+
+    def _benchmark_hard_swish(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark Hard Swish activation."""
+        try:
+            from mlx_primitives.layers import hard_swish
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return hard_swish(x)
+
+        name = f"hard_swish_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "HardSwish",
+        }
+        return result
+
+    def _benchmark_hard_sigmoid(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark Hard Sigmoid activation."""
+        try:
+            from mlx_primitives.layers import hard_sigmoid
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+
+        def fn():
+            return hard_sigmoid(x)
+
+        name = f"hard_sigmoid_b{batch_size}_s{seq_len}_d{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "type": "activation",
+            "layer": "HardSigmoid",
         }
         return result
 

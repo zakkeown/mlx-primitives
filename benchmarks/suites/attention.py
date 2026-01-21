@@ -63,6 +63,11 @@ class AttentionBenchmarks:
         results.extend(self.run_alibi_benchmarks())
         results.extend(self.run_rope_benchmarks())
 
+        # Additional attention variants
+        results.extend(self.run_linear_attention_benchmarks())
+        results.extend(self.run_sparse_attention_benchmarks())
+        results.extend(self.run_chunked_attention_benchmarks())
+
         return results
 
     def _benchmark_naive_attention(
@@ -136,10 +141,11 @@ class AttentionBenchmarks:
 
         mx.random.seed(self.config.seed)
 
-        # Create input tensors
-        query = mx.random.normal((batch_size, num_heads, seq_len, head_dim))
-        key = mx.random.normal((batch_size, num_heads, seq_len, head_dim))
-        value = mx.random.normal((batch_size, num_heads, seq_len, head_dim))
+        # Create input tensors in the format flash_attention expects: (batch, seq, heads, dim)
+        # Note: This differs from naive_attention which expects (batch, heads, seq, dim)
+        query = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
+        key = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
+        value = mx.random.normal((batch_size, seq_len, num_heads, head_dim))
 
         def fn():
             return flash_attention(query, key, value)
@@ -487,3 +493,281 @@ class AttentionBenchmarks:
                 results.append(flash_result)
 
         return results
+
+    def run_linear_attention_benchmarks(self) -> list[BenchmarkResult]:
+        """Run linear attention (O(n)) benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (2, 2048, 8, 64),
+            (4, 1024, 8, 64),
+        ]
+
+        for batch, seq, heads, dim in configs:
+            # LinearAttention
+            result = self._benchmark_linear_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+            # PerformerAttention
+            result = self._benchmark_performer_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_linear_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark LinearAttention (O(n) complexity)."""
+        try:
+            from mlx_primitives.attention.linear import LinearAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        attn = LinearAttention(
+            dims=num_heads * head_dim,
+            num_heads=num_heads,
+        )
+        x = mx.random.normal((batch_size, seq_len, num_heads * head_dim))
+
+        def fn():
+            return attn(x)
+
+        name = f"linear_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "linear_attention",
+        }
+        return result
+
+    def _benchmark_performer_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark PerformerAttention (FAVOR+)."""
+        try:
+            from mlx_primitives.attention.linear import PerformerAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        attn = PerformerAttention(
+            dims=num_heads * head_dim,
+            num_heads=num_heads,
+            num_features=head_dim,
+        )
+        x = mx.random.normal((batch_size, seq_len, num_heads * head_dim))
+
+        def fn():
+            return attn(x)
+
+        name = f"performer_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "performer_attention",
+        }
+        return result
+
+    def run_sparse_attention_benchmarks(self) -> list[BenchmarkResult]:
+        """Run sparse attention benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 8, 64),
+            (2, 1024, 8, 64),
+            (2, 2048, 8, 64),
+        ]
+
+        for batch, seq, heads, dim in configs:
+            # BlockSparseAttention
+            result = self._benchmark_block_sparse_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+            # LongformerAttention
+            result = self._benchmark_longformer_attention(batch, seq, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_block_sparse_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark BlockSparseAttention."""
+        try:
+            from mlx_primitives.attention.sparse import BlockSparseAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        block_size = 64
+        dims = num_heads * head_dim
+        attn = BlockSparseAttention(
+            dims=dims,
+            num_heads=num_heads,
+            block_size=block_size,
+        )
+        x = mx.random.normal((batch_size, seq_len, dims))
+
+        def fn():
+            return attn(x)
+
+        name = f"block_sparse_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "block_size": block_size,
+            "type": "optimized",
+            "operation": "block_sparse_attention",
+        }
+        return result
+
+    def _benchmark_longformer_attention(
+        self,
+        batch_size: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark LongformerAttention."""
+        try:
+            from mlx_primitives.attention.sparse import LongformerAttention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        window_size = 128
+        dims = num_heads * head_dim
+        attn = LongformerAttention(
+            dims=dims,
+            num_heads=num_heads,
+            window_size=window_size,
+        )
+        x = mx.random.normal((batch_size, seq_len, dims))
+
+        def fn():
+            return attn(x)
+
+        name = f"longformer_attn_b{batch_size}_s{seq_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "window_size": window_size,
+            "type": "optimized",
+            "operation": "longformer_attention",
+        }
+        return result
+
+    def run_chunked_attention_benchmarks(self) -> list[BenchmarkResult]:
+        """Run chunked cross-attention benchmarks."""
+        results = []
+
+        configs = [
+            (2, 512, 2048, 8, 64),   # (batch, q_len, kv_len, heads, dim)
+            (2, 256, 4096, 8, 64),
+            (4, 512, 1024, 8, 64),
+        ]
+
+        for batch, q_len, kv_len, heads, dim in configs:
+            result = self._benchmark_chunked_cross_attention(batch, q_len, kv_len, heads, dim)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_chunked_cross_attention(
+        self,
+        batch_size: int,
+        q_len: int,
+        kv_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark chunked cross-attention for long KV sequences."""
+        try:
+            from mlx_primitives.attention.chunked import chunked_cross_attention
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        q = mx.random.normal((batch_size, q_len, num_heads, head_dim))
+        k = mx.random.normal((batch_size, kv_len, num_heads, head_dim))
+        v = mx.random.normal((batch_size, kv_len, num_heads, head_dim))
+
+        def fn():
+            return chunked_cross_attention(q, k, v, chunk_size=256)
+
+        name = f"chunked_cross_attn_b{batch_size}_q{q_len}_kv{kv_len}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "q_len": q_len,
+            "kv_len": kv_len,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "type": "optimized",
+            "operation": "chunked_cross_attention",
+        }
+        return result

@@ -177,6 +177,9 @@ class QuantizedLinear(nn.Module):
         self.weight_scale: Optional[mx.array] = None
         self.weight_zero_point: Optional[mx.array] = None
 
+        # Cache for dequantized weights (populated on first forward pass)
+        self._weight_cache: Optional[mx.array] = None
+
         if bias:
             self.bias = mx.zeros((out_features,))
         else:
@@ -184,12 +187,19 @@ class QuantizedLinear(nn.Module):
 
     def quantize_weights(self) -> None:
         """Quantize the weights."""
+        # Clear cache since weights are changing
+        self._weight_cache = None
+
         self.weight_q, self.weight_scale, self.weight_zero_point = quantize_tensor(
             self._weight_float,
             num_bits=self.num_bits,
             per_channel=self.per_channel,
         )
         self._quantized = True
+
+    def clear_cache(self) -> None:
+        """Clear the dequantized weight cache."""
+        self._weight_cache = None
 
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass with quantized weights.
@@ -212,12 +222,14 @@ class QuantizedLinear(nn.Module):
             )
             weight = self._weight_float
         else:
-            # Dequantize weights
-            weight = dequantize_tensor(
-                self.weight_q,
-                self.weight_scale,
-                self.weight_zero_point,
-            )
+            # Use cached dequantized weights for performance
+            if self._weight_cache is None:
+                self._weight_cache = dequantize_tensor(
+                    self.weight_q,
+                    self.weight_scale,
+                    self.weight_zero_point,
+                )
+            weight = self._weight_cache
 
         # Matrix multiply
         y = x @ weight.T
@@ -546,12 +558,19 @@ class Int4Linear(nn.Module):
         else:
             self.bias = None
 
+        # Cache for dequantized weights (populated on first forward pass)
+        # This avoids expensive dequantization on every call
+        self._weight_cache: Optional[mx.array] = None
+
     def pack_weights(self, weight: mx.array) -> None:
         """Pack float weights into int4 (vectorized).
 
         Args:
             weight: Float weight tensor (out_features, in_features).
         """
+        # Clear the cache since weights are changing
+        self._weight_cache = None
+
         out_features, in_features = weight.shape
 
         # Pad in_features to be divisible by group_size
@@ -622,6 +641,14 @@ class Int4Linear(nn.Module):
 
         return unpacked * scale_expanded
 
+    def clear_cache(self) -> None:
+        """Clear the dequantized weight cache.
+
+        Call this if you need to force re-dequantization (e.g., after modifying
+        packed weights or scales). Usually not needed in normal usage.
+        """
+        self._weight_cache = None
+
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass.
 
@@ -642,11 +669,13 @@ class Int4Linear(nn.Module):
                 f"got {x.shape[-1]} (shape: {x.shape})"
             )
 
-        # Unpack and dequantize weights
-        weight = self.unpack_weights()
+        # Use cached dequantized weights for performance
+        # Dequantize only on first call, then reuse
+        if self._weight_cache is None:
+            self._weight_cache = self.unpack_weights()
 
         # Matrix multiply
-        y = x @ weight.T
+        y = x @ self._weight_cache.T
 
         if self.bias is not None:
             y = y + self.bias
@@ -752,12 +781,18 @@ class QLoRALinear(nn.Module):
 
         self._quantized = False
 
+        # Cache for dequantized base weights (populated on first forward)
+        self._base_weight_cache: Optional[mx.array] = None
+
     def quantize_base(self, weight: mx.array) -> None:
         """Quantize base weights to NF4 (vectorized).
 
         Args:
             weight: Float weight tensor (out_features, in_features).
         """
+        # Clear cache since weights are changing
+        self._base_weight_cache = None
+
         out_features, in_features = weight.shape
 
         # Pad in_features to be divisible by group_size
@@ -817,6 +852,10 @@ class QLoRALinear(nn.Module):
 
         return unpacked * scale_expanded
 
+    def clear_cache(self) -> None:
+        """Clear the dequantized base weight cache."""
+        self._base_weight_cache = None
+
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass with quantized base and LoRA adapters.
 
@@ -837,9 +876,11 @@ class QLoRALinear(nn.Module):
                 f"got {x.shape[-1]} (shape: {x.shape})"
             )
 
-        # Dequantize base weights
+        # Use cached dequantized base weights for performance
         if self._quantized:
-            base_weight = self._dequantize_base()
+            if self._base_weight_cache is None:
+                self._base_weight_cache = self._dequantize_base()
+            base_weight = self._base_weight_cache
         else:
             base_weight = mx.zeros((self.out_features, self.in_features))
 

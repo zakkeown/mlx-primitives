@@ -72,6 +72,11 @@ def _get_geglu_kernel():
     return _geglu_kernel
 
 
+def _reference_swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    """Reference implementation using MLX ops."""
+    return mx.sigmoid(gate) * gate * up
+
+
 def fast_swiglu(gate: mx.array, up: mx.array) -> mx.array:
     """Fast Metal-accelerated SwiGLU.
 
@@ -86,8 +91,14 @@ def fast_swiglu(gate: mx.array, up: mx.array) -> mx.array:
     """
     assert gate.shape == up.shape, "gate and up must have same shape"
 
-    kernel = _get_swiglu_kernel()
     size = gate.size
+
+    # Metal kernel overhead not amortized for small tensors (see RCA report)
+    # Benchmark showed 0.89x at 2M elements, 1.28x at 8M elements
+    if size < 4_000_000:
+        return _reference_swiglu(gate, up)
+
+    kernel = _get_swiglu_kernel()
 
     # Flatten for kernel
     gate_flat = gate.reshape(-1)

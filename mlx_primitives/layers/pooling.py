@@ -41,19 +41,23 @@ class AdaptiveAvgPool1d(nn.Module):
         if input_size == self.output_size:
             return x
 
-        # Calculate kernel size and stride
-        stride = input_size // self.output_size
-        kernel_size = input_size - (self.output_size - 1) * stride
+        # Use fp32 accumulation for numerical stability (matches PyTorch behavior)
+        orig_dtype = x.dtype
+        if x.dtype in (mx.float16, mx.bfloat16):
+            x = x.astype(mx.float32)
 
-        # Manually implement average pooling with computed parameters
+        # PyTorch adaptive pooling algorithm:
+        # start[i] = floor(i * input_size / output_size)
+        # end[i] = ceil((i + 1) * input_size / output_size)
         outputs = []
         for i in range(self.output_size):
-            start = i * stride
-            end = start + kernel_size
+            start = (i * input_size) // self.output_size
+            end = ((i + 1) * input_size + self.output_size - 1) // self.output_size
             pooled = mx.mean(x[..., start:end], axis=-1, keepdims=True)
             outputs.append(pooled)
 
-        return mx.concatenate(outputs, axis=-1)
+        result = mx.concatenate(outputs, axis=-1)
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class AdaptiveAvgPool2d(nn.Module):
@@ -85,25 +89,27 @@ class AdaptiveAvgPool2d(nn.Module):
         if in_h == out_h and in_w == out_w:
             return x
 
+        # Use fp32 accumulation for numerical stability (matches PyTorch behavior)
+        orig_dtype = x.dtype
+        if x.dtype in (mx.float16, mx.bfloat16):
+            x = x.astype(mx.float32)
+
         # Global average pooling special case
         if out_h == 1 and out_w == 1:
-            return mx.mean(x, axis=(2, 3), keepdims=True)
+            result = mx.mean(x, axis=(2, 3), keepdims=True)
+            return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
-        # Calculate strides
-        stride_h = in_h // out_h
-        stride_w = in_w // out_w
-        kernel_h = in_h - (out_h - 1) * stride_h
-        kernel_w = in_w - (out_w - 1) * stride_w
-
-        # Pool each output position
+        # PyTorch adaptive pooling algorithm:
+        # start[i] = floor(i * input_size / output_size)
+        # end[i] = ceil((i + 1) * input_size / output_size)
         outputs = []
         for i in range(out_h):
             row_outputs = []
-            start_h = i * stride_h
-            end_h = start_h + kernel_h
+            start_h = (i * in_h) // out_h
+            end_h = ((i + 1) * in_h + out_h - 1) // out_h
             for j in range(out_w):
-                start_w = j * stride_w
-                end_w = start_w + kernel_w
+                start_w = (j * in_w) // out_w
+                end_w = ((j + 1) * in_w + out_w - 1) // out_w
                 pooled = mx.mean(
                     x[:, :, start_h:end_h, start_w:end_w],
                     axis=(2, 3),
@@ -112,7 +118,8 @@ class AdaptiveAvgPool2d(nn.Module):
                 row_outputs.append(pooled)
             outputs.append(mx.concatenate(row_outputs, axis=3))
 
-        return mx.concatenate(outputs, axis=2)
+        result = mx.concatenate(outputs, axis=2)
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class AdaptiveMaxPool1d(nn.Module):
@@ -139,13 +146,13 @@ class AdaptiveMaxPool1d(nn.Module):
         if input_size == self.output_size:
             return x
 
-        stride = input_size // self.output_size
-        kernel_size = input_size - (self.output_size - 1) * stride
-
+        # PyTorch adaptive pooling algorithm:
+        # start[i] = floor(i * input_size / output_size)
+        # end[i] = ceil((i + 1) * input_size / output_size)
         outputs = []
         for i in range(self.output_size):
-            start = i * stride
-            end = start + kernel_size
+            start = (i * input_size) // self.output_size
+            end = ((i + 1) * input_size + self.output_size - 1) // self.output_size
             pooled = mx.max(x[..., start:end], axis=-1, keepdims=True)
             outputs.append(pooled)
 
@@ -183,19 +190,17 @@ class AdaptiveMaxPool2d(nn.Module):
         if out_h == 1 and out_w == 1:
             return mx.max(x, axis=(2, 3), keepdims=True)
 
-        stride_h = in_h // out_h
-        stride_w = in_w // out_w
-        kernel_h = in_h - (out_h - 1) * stride_h
-        kernel_w = in_w - (out_w - 1) * stride_w
-
+        # PyTorch adaptive pooling algorithm:
+        # start[i] = floor(i * input_size / output_size)
+        # end[i] = ceil((i + 1) * input_size / output_size)
         outputs = []
         for i in range(out_h):
             row_outputs = []
-            start_h = i * stride_h
-            end_h = start_h + kernel_h
+            start_h = (i * in_h) // out_h
+            end_h = ((i + 1) * in_h + out_h - 1) // out_h
             for j in range(out_w):
-                start_w = j * stride_w
-                end_w = start_w + kernel_w
+                start_w = (j * in_w) // out_w
+                end_w = ((j + 1) * in_w + out_w - 1) // out_w
                 pooled = mx.max(
                     x[:, :, start_h:end_h, start_w:end_w],
                     axis=(2, 3),
@@ -298,13 +303,20 @@ class GeM(nn.Module):
         # x: (batch, channels, height, width)
         p = self.p if self.learnable else self._p
 
+        # Use fp32 accumulation for numerical stability (matches PyTorch behavior)
+        orig_dtype = x.dtype
+        if x.dtype in (mx.float16, mx.bfloat16):
+            x = x.astype(mx.float32)
+
         # Clamp to avoid numerical issues
         x = mx.clip(x, a_min=self.eps, a_max=None)
 
         # Compute generalized mean
         x_pow = mx.power(x, p)
         mean_pow = mx.mean(x_pow, axis=(2, 3), keepdims=True)
-        return mx.power(mean_pow, 1.0 / p)
+        result = mx.power(mean_pow, 1.0 / p)
+
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class SpatialPyramidPooling(nn.Module):

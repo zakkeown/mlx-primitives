@@ -10,11 +10,13 @@ This is the key missing primitive for efficient SSM (State Space Model)
 implementations like Mamba on MLX.
 
 Performance Notes:
-    - For seq_len > MIN_SEQ_FOR_METAL (default 8): Uses parallel Metal kernel
-      with O(log n) complexity via SIMD warp-level intrinsics.
-    - For seq_len <= MIN_SEQ_FOR_METAL: Uses MLX builtins (cumsum/cumprod) or
+    - For 8 < seq_len <= 1024: Uses parallel Metal kernel with O(log n) complexity
+      via SIMD warp-level intrinsics.
+    - For seq_len <= 8 (MIN_SEQ_FOR_METAL): Uses MLX builtins (cumsum/cumprod) or
       sequential fallback. Still GPU-accelerated but O(n).
-    - For seq_len > 1024: Falls back to sequential (multi-block not yet implemented).
+    - For seq_len > 1024 (MAX_SEQ_FOR_METAL_SCAN): Falls back to MLX builtins.
+      Multi-block algorithm has significant overhead (3 kernel launches, memory
+      round-trips) making native ops faster.
 
     Configure threshold via MLX_PRIMITIVES_MIN_SEQ_FOR_METAL environment variable.
 """
@@ -24,7 +26,7 @@ from typing import Literal, Optional
 
 import mlx.core as mx
 
-from mlx_primitives.constants import MIN_SEQ_FOR_METAL
+from mlx_primitives.constants import MAX_SEQ_FOR_METAL_SCAN, MIN_SEQ_FOR_METAL
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
@@ -145,10 +147,13 @@ def _simple_scan(
     if axis < 0:
         axis = x.ndim + axis
 
-    # For short sequences or when Metal not available, use MLX builtins
+    # For short sequences, long sequences, or when Metal not available, use MLX builtins
+    # Long sequences (> MAX_SEQ_FOR_METAL_SCAN) use multi-block algorithm which has
+    # significant overhead (3 kernel launches, memory round-trips) making it slower
+    # than native MLX ops
     seq_len = x.shape[axis]
     threshold = _get_min_seq_for_metal()
-    if not use_metal or not _HAS_METAL or seq_len <= threshold:
+    if not use_metal or not _HAS_METAL or seq_len <= threshold or seq_len > MAX_SEQ_FOR_METAL_SCAN:
         if operator == "add":
             return mx.cumsum(x, axis=axis)
         else:

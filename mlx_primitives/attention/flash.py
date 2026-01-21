@@ -58,6 +58,7 @@ def flash_attention(
     use_metal: bool = True,
     dropout_p: float = 0.0,
     training: bool = True,
+    layout: str = "BSHD",
 ) -> mx.array:
     """Flash Attention - O(n) memory attention via tiled online softmax.
 
@@ -66,9 +67,9 @@ def flash_attention(
     queries and keys/values in tiles, using online softmax to accumulate results.
 
     Args:
-        q: Query tensor of shape (batch, seq_len, num_heads, head_dim).
-        k: Key tensor of shape (batch, seq_len, num_heads, head_dim).
-        v: Value tensor of shape (batch, seq_len, num_heads, head_dim).
+        q: Query tensor of shape depending on layout parameter.
+        k: Key tensor of shape depending on layout parameter.
+        v: Value tensor of shape depending on layout parameter.
         scale: Attention scale factor. Defaults to 1/sqrt(head_dim).
         causal: If True, apply causal masking (queries can only attend to
             earlier positions).
@@ -78,25 +79,28 @@ def flash_attention(
         dropout_p: Dropout probability on attention weights. Default 0.0 (no dropout).
             When dropout_p > 0, falls back to reference implementation.
         training: If False, dropout is not applied. Default True.
+        layout: Tensor layout format. Options:
+            - "BSHD": (batch, seq_len, num_heads, head_dim) - default
+            - "BHSD": (batch, num_heads, seq_len, head_dim) - no transpose overhead
 
     Returns:
-        Output tensor of shape (batch, seq_len, num_heads, head_dim).
+        Output tensor of same shape as input (matching layout parameter).
 
     Example:
-        >>> # Standard usage
+        >>> # Standard usage (BSHD layout)
         >>> q = mx.random.normal((2, 1024, 8, 64))
         >>> k = mx.random.normal((2, 1024, 8, 64))
         >>> v = mx.random.normal((2, 1024, 8, 64))
         >>> out = flash_attention(q, k, v, causal=True)
         >>>
+        >>> # BHSD layout (no transpose overhead - faster for short sequences)
+        >>> q = mx.random.normal((2, 8, 1024, 64))  # (batch, heads, seq, dim)
+        >>> k = mx.random.normal((2, 8, 1024, 64))
+        >>> v = mx.random.normal((2, 8, 1024, 64))
+        >>> out = flash_attention(q, k, v, causal=True, layout="BHSD")
+        >>>
         >>> # With dropout (training)
         >>> out = flash_attention(q, k, v, causal=True, dropout_p=0.1)
-        >>>
-        >>> # Equivalent to (but more memory efficient than):
-        >>> scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(64)
-        >>> # ... apply causal mask ...
-        >>> weights = mx.softmax(scores, axis=-1)
-        >>> out_standard = weights @ v
 
     Note:
         For best performance, block sizes should be tuned based on:
@@ -109,10 +113,40 @@ def flash_attention(
 
         When dropout_p > 0 and training=True, falls back to the reference
         implementation since dropout requires materializing attention weights.
+
+        For short sequences (seq_len <= 512) with BSHD layout, transpose overhead
+        may dominate. Use layout="BHSD" or mx.fast.scaled_dot_product_attention
+        directly for maximum performance.
     """
     if q.ndim != 4:
-        raise ValueError(f"Expected 4D tensors (batch, seq, heads, dim), got {q.ndim}D")
+        raise ValueError(f"Expected 4D tensors, got {q.ndim}D")
 
+    if layout not in ("BSHD", "BHSD"):
+        raise ValueError(f"layout must be 'BSHD' or 'BHSD', got '{layout}'")
+
+    # Handle BHSD layout - call SDPA directly without transpose overhead
+    if layout == "BHSD":
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        if scale is None:
+            scale = 1.0 / math.sqrt(head_dim)
+
+        # BHSD layout matches SDPA's expected format - no transpose needed
+        if _HAS_SDPA and use_metal:
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v,
+                scale=scale,
+                mask="causal" if causal else None,
+            )
+        else:
+            # Fallback to standard attention for BHSD
+            scores = (q @ k.transpose(0, 1, 3, 2)) * scale
+            if causal:
+                mask = mx.tril(mx.ones((seq_len, seq_len)))
+                scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
+            weights = mx.softmax(scores, axis=-1)
+            return weights @ v
+
+    # BSHD layout (default) - extract dimensions
     batch_size, seq_len, num_heads, head_dim = q.shape
 
     if scale is None:
@@ -124,6 +158,13 @@ def flash_attention(
         return _reference_flash_attention_with_dropout(
             q, k, v, scale, causal, dropout_p
         )
+
+    # For very short sequences or small batch+sequence combos, use reference attention
+    # which now uses SDPA when available. This avoids the overhead of the tiled Python
+    # implementation or custom Metal kernel for sizes where O(n²) memory is acceptable.
+    # The reference path is kept for correctness testing and SDPA-unavailable fallback.
+    if seq_len <= 256 or (batch_size <= 4 and seq_len <= 512):
+        return _reference_flash_attention(q, k, v, scale, causal)
 
     # Priority 1: Use MLX's built-in SDPA when available
     # This is the most optimized path, using MLX's native implementation
@@ -399,16 +440,30 @@ def _reference_flash_attention(
     scale: Optional[float],
     causal: bool,
 ) -> mx.array:
-    """Reference implementation using standard O(n²) attention.
+    """Reference implementation using MLX's optimized SDPA when available.
 
-    Used for testing correctness of Flash Attention.
+    Falls back to standard O(n²) attention if SDPA is unavailable.
+    Used for small sequence lengths where O(n²) memory is acceptable.
     """
     batch, seq, heads, dim = q.shape
 
     if scale is None:
         scale = 1.0 / math.sqrt(dim)
 
-    # Transpose for matmul: (batch, heads, seq, dim)
+    # Use MLX SDPA when available - same transposes but optimized kernel
+    if _HAS_SDPA:
+        q_sdpa = mx.transpose(q, (0, 2, 1, 3))
+        k_sdpa = mx.transpose(k, (0, 2, 1, 3))
+        v_sdpa = mx.transpose(v, (0, 2, 1, 3))
+
+        out = mx.fast.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            scale=scale,
+            mask="causal" if causal else None,
+        )
+        return mx.transpose(out, (0, 2, 1, 3))
+
+    # Manual fallback for systems without SDPA
     q_t = q.transpose(0, 2, 1, 3)
     k_t = k.transpose(0, 2, 1, 3)
     v_t = v.transpose(0, 2, 1, 3)

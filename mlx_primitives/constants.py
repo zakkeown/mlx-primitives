@@ -93,6 +93,15 @@ DEFAULT_L2_CACHE_MB = 8.0
 # Lowered from 32 to 8 to use Metal for more SSM workloads
 MIN_SEQ_FOR_METAL = 8
 
+# Maximum sequence length for Metal associative scan (single-block limit)
+# Multi-block algorithm at seq_len > 1024 has significant overhead due to:
+# - 3 kernel launches instead of 1 (phase1, phase2, phase3)
+# - Memory round-trips between phases
+# - Inefficient warp utilization for small block counts
+# Benchmark shows: seq=2048 is 14-45x slower than native cumsum
+# For seq_len > this threshold, fall back to native MLX ops
+MAX_SEQ_FOR_METAL_SCAN = 1024
+
 # Sequence length threshold for SSM sequential fallback warning
 # When using sequential SSM scan, warn if sequence length exceeds this
 SSM_SEQUENTIAL_WARNING_THRESHOLD = 256

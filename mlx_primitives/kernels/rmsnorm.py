@@ -105,6 +105,12 @@ def _get_rmsnorm_residual_kernel():
     return _rmsnorm_residual_kernel
 
 
+def _reference_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+    """Reference implementation using MLX ops (used when Metal overhead isn't worth it)."""
+    rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x / rms * weight
+
+
 def fast_rmsnorm(
     x: mx.array,
     weight: mx.array,
@@ -127,6 +133,13 @@ def fast_rmsnorm(
 
     batch_size, seq_len, hidden_dim = x.shape
     total_rows = batch_size * seq_len
+
+    # Metal kernel overhead not amortized at small batch sizes or short sequences
+    # (see RCA report - benchmark showed 0.27x-0.78x slowdown for these cases)
+    # For small workloads, MLX's fused ops are faster than custom Metal kernels
+    if batch_size <= 2 or (batch_size <= 4 and seq_len <= 512):
+        result = _reference_rmsnorm(x, weight, eps)
+        return result[0] if was_2d else result
 
     kernel = _get_rmsnorm_kernel()
 

@@ -47,10 +47,14 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones((dims,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Compute RMS along last dimension
+        # Compute RMS along last dimension in fp32 for numerical stability
         # rms = sqrt(mean(x^2) + eps)
-        rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return (x / rms) * self.weight
+        orig_dtype = x.dtype
+        x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+        rms = mx.sqrt(mx.mean(x_fp32 * x_fp32, axis=-1, keepdims=True) + self.eps)
+        # Normalize in fp32 then cast back
+        result = (x_fp32 / rms) * self.weight.astype(mx.float32)
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class GroupNorm(nn.Module):
@@ -103,6 +107,7 @@ class GroupNorm(nn.Module):
         # x shape: (N, C, *) where * is any number of spatial dimensions
         # or (N, *, C) for channels-last
         original_shape = x.shape
+        orig_dtype = x.dtype
 
         # Assume channels-first for now: (N, C, H, W) or (N, C, L)
         batch_size = x.shape[0]
@@ -112,22 +117,23 @@ class GroupNorm(nn.Module):
         group_size = num_channels // self.num_groups
         x = x.reshape(batch_size, self.num_groups, group_size, -1)
 
-        # Normalize within each group
-        mean = mx.mean(x, axis=(2, 3), keepdims=True)
-        var = mx.var(x, axis=(2, 3), keepdims=True)
-        x = (x - mean) / mx.sqrt(var + self.eps)
+        # Compute mean/var in fp32 for numerical stability
+        x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+        mean = mx.mean(x_fp32, axis=(2, 3), keepdims=True)
+        var = mx.var(x_fp32, axis=(2, 3), keepdims=True)
+        x_fp32 = (x_fp32 - mean) / mx.sqrt(var + self.eps)
 
         # Reshape back
-        x = x.reshape(original_shape)
+        x_fp32 = x_fp32.reshape(original_shape)
 
-        # Apply affine transform
+        # Apply affine transform in fp32, then cast back
         if self.affine:
             # Reshape weight/bias for broadcasting
-            weight = self.weight.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-            bias = self.bias.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-            x = x * weight + bias
+            weight = self.weight.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+            bias = self.bias.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+            x_fp32 = x_fp32 * weight + bias
 
-        return x
+        return x_fp32.astype(orig_dtype) if orig_dtype != mx.float32 else x_fp32
 
 
 class InstanceNorm(nn.Module):
@@ -170,27 +176,29 @@ class InstanceNorm(nn.Module):
         # x shape: (N, C, *) - normalize over spatial dimensions
         # Keep N and C, normalize over rest
         original_shape = x.shape
+        orig_dtype = x.dtype
         batch_size = x.shape[0]
         num_channels = x.shape[1]
 
         # Reshape to (N, C, -1) to flatten spatial dims
         x = x.reshape(batch_size, num_channels, -1)
 
-        # Normalize over spatial dimension
-        mean = mx.mean(x, axis=2, keepdims=True)
-        var = mx.var(x, axis=2, keepdims=True)
-        x = (x - mean) / mx.sqrt(var + self.eps)
+        # Compute mean/var in fp32 for numerical stability
+        x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+        mean = mx.mean(x_fp32, axis=2, keepdims=True)
+        var = mx.var(x_fp32, axis=2, keepdims=True)
+        x_fp32 = (x_fp32 - mean) / mx.sqrt(var + self.eps)
 
         # Reshape back
-        x = x.reshape(original_shape)
+        x_fp32 = x_fp32.reshape(original_shape)
 
-        # Apply affine transform
+        # Apply affine transform in fp32, then cast back
         if self.affine:
-            weight = self.weight.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-            bias = self.bias.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-            x = x * weight + bias
+            weight = self.weight.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+            bias = self.bias.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+            x_fp32 = x_fp32 * weight + bias
 
-        return x
+        return x_fp32.astype(orig_dtype) if orig_dtype != mx.float32 else x_fp32
 
 
 class AdaLayerNorm(nn.Module):
@@ -228,14 +236,17 @@ class AdaLayerNorm(nn.Module):
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         # x: (batch, seq, dims) or (batch, dims)
         # cond: (batch, cond_dims)
+        orig_dtype = x.dtype
 
-        # Standard layer normalization (without affine)
-        mean = mx.mean(x, axis=-1, keepdims=True)
-        var = mx.var(x, axis=-1, keepdims=True)
-        x_norm = (x - mean) / mx.sqrt(var + self.eps)
+        # Compute mean/var in fp32 for numerical stability
+        x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+        mean = mx.mean(x_fp32, axis=-1, keepdims=True)
+        var = mx.var(x_fp32, axis=-1, keepdims=True)
+        x_norm = (x_fp32 - mean) / mx.sqrt(var + self.eps)
 
-        # Get scale and shift from conditioning
-        scale_shift = self.proj(cond)  # (batch, dims * 2)
+        # Get scale and shift from conditioning (compute in fp32)
+        cond_fp32 = cond.astype(mx.float32) if cond.dtype != mx.float32 else cond
+        scale_shift = self.proj(cond_fp32)  # (batch, dims * 2)
         scale, shift = mx.split(scale_shift, 2, axis=-1)
 
         # Reshape for broadcasting
@@ -243,8 +254,9 @@ class AdaLayerNorm(nn.Module):
             scale = scale[:, None, :]  # (batch, 1, dims)
             shift = shift[:, None, :]
 
-        # Apply adaptive normalization
-        return x_norm * (1 + scale) + shift
+        # Apply adaptive normalization in fp32, then cast back
+        result = x_norm * (1 + scale) + shift
+        return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 class QKNorm(nn.Module):
@@ -281,12 +293,15 @@ class QKNorm(nn.Module):
         q: mx.array,
         k: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        # RMSNorm on last dimension
-        def rms_norm(x: mx.array, scale: mx.array) -> mx.array:
-            rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-            return (x / rms) * scale
+        # RMSNorm on last dimension with fp32 accumulation
+        def rms_norm_fp32(x: mx.array, scale: mx.array) -> mx.array:
+            orig_dtype = x.dtype
+            x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+            rms = mx.sqrt(mx.mean(x_fp32 * x_fp32, axis=-1, keepdims=True) + self.eps)
+            result = (x_fp32 / rms) * scale.astype(mx.float32)
+            return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
-        return rms_norm(q, self.q_scale), rms_norm(k, self.k_scale)
+        return rms_norm_fp32(q, self.q_scale), rms_norm_fp32(k, self.k_scale)
 
 
 def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
@@ -300,8 +315,11 @@ def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
     Returns:
         Normalized tensor.
     """
-    rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
-    return (x / rms) * weight
+    orig_dtype = x.dtype
+    x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+    rms = mx.sqrt(mx.mean(x_fp32 * x_fp32, axis=-1, keepdims=True) + eps)
+    result = (x_fp32 / rms) * weight.astype(mx.float32)
+    return result.astype(orig_dtype) if orig_dtype != mx.float32 else result
 
 
 def group_norm(
@@ -324,21 +342,25 @@ def group_norm(
         Normalized tensor.
     """
     original_shape = x.shape
+    orig_dtype = x.dtype
     batch_size = x.shape[0]
     num_channels = x.shape[1]
     group_size = num_channels // num_groups
 
     x = x.reshape(batch_size, num_groups, group_size, -1)
-    mean = mx.mean(x, axis=(2, 3), keepdims=True)
-    var = mx.var(x, axis=(2, 3), keepdims=True)
-    x = (x - mean) / mx.sqrt(var + eps)
-    x = x.reshape(original_shape)
+
+    # Compute mean/var in fp32 for numerical stability
+    x_fp32 = x.astype(mx.float32) if orig_dtype != mx.float32 else x
+    mean = mx.mean(x_fp32, axis=(2, 3), keepdims=True)
+    var = mx.var(x_fp32, axis=(2, 3), keepdims=True)
+    x_fp32 = (x_fp32 - mean) / mx.sqrt(var + eps)
+    x_fp32 = x_fp32.reshape(original_shape)
 
     if weight is not None:
-        weight = weight.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-        x = x * weight
+        weight_fp32 = weight.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+        x_fp32 = x_fp32 * weight_fp32
     if bias is not None:
-        bias = bias.reshape(1, -1, *([1] * (len(original_shape) - 2)))
-        x = x + bias
+        bias_fp32 = bias.astype(mx.float32).reshape(1, -1, *([1] * (len(original_shape) - 2)))
+        x_fp32 = x_fp32 + bias_fp32
 
-    return x
+    return x_fp32.astype(orig_dtype) if orig_dtype != mx.float32 else x_fp32

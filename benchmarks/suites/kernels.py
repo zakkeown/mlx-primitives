@@ -55,6 +55,9 @@ class KernelBenchmarks:
         # Run fused add + norm benchmarks
         results.extend(self.run_fused_add_norm_benchmarks())
 
+        # Run fused RMSNorm + linear benchmarks
+        results.extend(self.run_fused_norm_linear_benchmarks())
+
         return results
 
     def run_normalization_benchmarks(
@@ -561,5 +564,105 @@ class KernelBenchmarks:
             "hidden_dim": hidden_dim,
             "type": "optimized",
             "operation": "fused_add_rmsnorm",
+        }
+        return result
+
+    def run_fused_norm_linear_benchmarks(self) -> list[BenchmarkResult]:
+        """Run fused RMSNorm + linear benchmarks."""
+        results = []
+
+        sizes = [
+            (4, 512, 1024, 4096),   # (batch, seq, hidden, ffn_dim)
+            (4, 1024, 2048, 8192),
+            (8, 2048, 4096, 16384),
+        ]
+
+        for batch, seq, hidden, ffn in sizes:
+            # Fused RMSNorm + Linear
+            result = self._benchmark_fused_rmsnorm_linear(batch, seq, hidden, ffn)
+            if result:
+                results.append(result)
+
+            # Baseline: separate RMSNorm + Linear
+            result = self._benchmark_separate_rmsnorm_linear(batch, seq, hidden, ffn)
+            if result:
+                results.append(result)
+
+        return results
+
+    def _benchmark_fused_rmsnorm_linear(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        out_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark fused RMSNorm + linear projection."""
+        try:
+            from mlx_primitives.kernels.fused_norm_linear import fused_rmsnorm_linear
+        except ImportError:
+            return None
+
+        mx.random.seed(self.config.seed)
+
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+        norm_weight = mx.ones((hidden_dim,))
+        linear_weight = mx.random.normal((out_dim, hidden_dim))
+
+        def fn():
+            return fused_rmsnorm_linear(x, norm_weight, linear_weight)
+
+        name = f"fused_rmsnorm_linear_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "out_dim": out_dim,
+            "type": "optimized",
+            "operation": "fused_rmsnorm_linear",
+        }
+        return result
+
+    def _benchmark_separate_rmsnorm_linear(
+        self,
+        batch_size: int,
+        seq_len: int,
+        hidden_dim: int,
+        out_dim: int,
+    ) -> Optional[BenchmarkResult]:
+        """Benchmark separate RMSNorm + linear (baseline)."""
+        mx.random.seed(self.config.seed)
+
+        x = mx.random.normal((batch_size, seq_len, hidden_dim))
+        norm_weight = mx.ones((hidden_dim,))
+        linear_weight = mx.random.normal((out_dim, hidden_dim))
+
+        def fn():
+            # RMSNorm
+            rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+            normed = (x / rms) * norm_weight
+            # Linear
+            return normed @ linear_weight.T
+
+        name = f"separate_rmsnorm_linear_b{batch_size}_s{seq_len}_h{hidden_dim}"
+        result = benchmark_fn(
+            fn,
+            iterations=self.config.benchmark_iterations,
+            warmup_iterations=self.config.warmup_iterations,
+            name=name,
+        )
+        result.metadata = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "out_dim": out_dim,
+            "type": "baseline",
+            "operation": "separate_rmsnorm_linear",
         }
         return result

@@ -119,7 +119,7 @@ class ScanBenchmarks:
             Benchmark result if associative scan is available, None otherwise.
         """
         try:
-            from mlx_primitives.scan.associative import associative_scan
+            from mlx_primitives.primitives.scan import associative_scan
         except ImportError:
             print(f"  Warning: associative_scan not available, skipping optimized benchmark")
             return None
@@ -131,7 +131,7 @@ class ScanBenchmarks:
 
         def fn():
             # Use add operator for cumsum equivalent
-            return associative_scan(x, op="add", axis=1)
+            return associative_scan(x, operator="add", axis=1)
 
         # Benchmark (includes warmup)
         name = f"assoc_scan_s{seq_len}_d{feature_dim}"
@@ -197,7 +197,7 @@ class ScanBenchmarks:
             Benchmark result if available, None otherwise.
         """
         try:
-            from mlx_primitives.scan.associative import associative_scan
+            from mlx_primitives.primitives.scan import associative_scan
         except ImportError:
             print(f"  Warning: associative_scan not available, skipping SSM benchmark")
             return None
@@ -212,7 +212,7 @@ class ScanBenchmarks:
 
         def fn():
             # SSM scan combines state transitions
-            return associative_scan(A * B, op="add", axis=1)
+            return associative_scan(A * B, operator="add", axis=1)
 
         # Benchmark (includes warmup)
         name = f"ssm_scan_s{seq_len}_d{state_dim}"
@@ -505,11 +505,11 @@ class ScanBenchmarks:
             Benchmark result if available, None otherwise.
         """
         try:
-            from mlx_primitives.scan.associative import parallel_associative_scan
+            from mlx_primitives.primitives.scan import parallel_associative_scan
         except ImportError:
             # Fall back to standard associative scan
             try:
-                from mlx_primitives.scan.associative import associative_scan
+                from mlx_primitives.primitives.scan import associative_scan
                 parallel_associative_scan = lambda x, op, axis: associative_scan(x, op=op, axis=axis)
             except ImportError:
                 return None
@@ -519,7 +519,7 @@ class ScanBenchmarks:
         x = mx.random.normal((batch_size, seq_len, feature_dim))
 
         def fn():
-            return parallel_associative_scan(x, op="add", axis=1)
+            return parallel_associative_scan(x, operator="add", axis=1)
 
         name = f"parallel_scan_b{batch_size}_s{seq_len}_d{feature_dim}"
         result = benchmark_fn(
