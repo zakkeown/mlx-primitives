@@ -99,7 +99,7 @@ def mlx_to_numpy_dtype(dtype: mx.Dtype) -> np.dtype:
         >>> mlx_to_numpy_dtype(mx.int32)
         dtype('int32')
     """
-    return _NUMPY_TO_MLX.get(dtype, np.dtype(np.float32))
+    return _MLX_TO_NUMPY.get(dtype, np.dtype(np.float32))
 
 
 def numpy_to_mlx_dtype(dtype: np.dtype) -> mx.Dtype:

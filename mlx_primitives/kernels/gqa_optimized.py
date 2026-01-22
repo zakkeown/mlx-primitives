@@ -56,16 +56,21 @@ def _mlx_fast_gqa(
     Returns:
         Output tensor (batch, seq_q, num_q_heads, head_dim).
     """
-    # Defensive assertions for internal function (debug mode only)
-    assert q.ndim == 4, f"_mlx_fast_gqa: Q must be 4D, got {q.ndim}D"
-    assert k.ndim == 4, f"_mlx_fast_gqa: K must be 4D, got {k.ndim}D"
-    assert v.ndim == 4, f"_mlx_fast_gqa: V must be 4D, got {v.ndim}D"
-    assert q.shape[0] == k.shape[0] == v.shape[0], (
-        f"_mlx_fast_gqa: Batch size mismatch: Q={q.shape[0]}, K={k.shape[0]}, V={v.shape[0]}"
-    )
-    assert k.shape[1] == v.shape[1], (
-        f"_mlx_fast_gqa: KV seq_len mismatch: K={k.shape[1]}, V={v.shape[1]}"
-    )
+    # Input validation (always runs, even with -O flag)
+    if q.ndim != 4:
+        raise ValueError(f"_mlx_fast_gqa: Q must be 4D, got {q.ndim}D")
+    if k.ndim != 4:
+        raise ValueError(f"_mlx_fast_gqa: K must be 4D, got {k.ndim}D")
+    if v.ndim != 4:
+        raise ValueError(f"_mlx_fast_gqa: V must be 4D, got {v.ndim}D")
+    if not (q.shape[0] == k.shape[0] == v.shape[0]):
+        raise ValueError(
+            f"_mlx_fast_gqa: Batch size mismatch: Q={q.shape[0]}, K={k.shape[0]}, V={v.shape[0]}"
+        )
+    if k.shape[1] != v.shape[1]:
+        raise ValueError(
+            f"_mlx_fast_gqa: KV seq_len mismatch: K={k.shape[1]}, V={v.shape[1]}"
+        )
 
     # MLX SDPA expects (batch, heads, seq, dim) layout
     q_t = q.transpose(0, 2, 1, 3)  # (batch, q_heads, seq_q, dim)

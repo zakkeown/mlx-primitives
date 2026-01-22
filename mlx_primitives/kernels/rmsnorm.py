@@ -16,11 +16,15 @@ from mlx_primitives.utils import log_fallback
 logger = logging.getLogger(__name__)
 
 
-def _get_rmsnorm_kernel():
-    """Get or create the RMSNorm kernel."""
+def _get_rmsnorm_kernel(eps: float = 1e-6):
+    """Get or create the RMSNorm kernel with specified eps.
+
+    Args:
+        eps: Small constant for numerical stability.
+    """
     # Simple element-wise kernel - each thread handles one row
     # MLX auto-provides x_shape, x_strides, x_ndim when referenced
-    source = """
+    source = f"""
         // Get row index from grid position
         uint row_idx = thread_position_in_grid.x;
 
@@ -36,28 +40,29 @@ def _get_rmsnorm_kernel():
 
         // Compute sum of squares
         float sum_sq = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float val = x[row_offset + i];
             sum_sq += val * val;
-        }
+        }}
 
         // Compute RMS inverse
-        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + {eps}f);
 
         // Get output type for explicit casting (required for bf16)
         typedef decltype(out[0] + out[0]) OutT;
 
         // Normalize and scale
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float val = x[row_offset + i];
             out[row_offset + i] = OutT(val * rms_inv * weight[i]);
-        }
+        }}
     """
 
+    kernel_name = f"rmsnorm_forward_eps{eps}"
     return get_kernel(
-        "rmsnorm_forward",
+        kernel_name,
         lambda: mx.fast.metal_kernel(
-            name="rmsnorm_forward",
+            name=kernel_name,
             input_names=["x", "weight"],
             output_names=["out"],
             source=source,
@@ -65,10 +70,13 @@ def _get_rmsnorm_kernel():
     )
 
 
-def _get_rmsnorm_backward_kernel():
-    """Get or create the RMSNorm backward kernel.
+def _get_rmsnorm_backward_kernel(eps: float = 1e-6):
+    """Get or create the RMSNorm backward kernel with specified eps.
 
     Computes gradients for x and weight given upstream gradient dy.
+
+    Args:
+        eps: Small constant for numerical stability.
 
     RMSNorm backward math:
         Let rms = sqrt(mean(x^2) + eps)
@@ -78,7 +86,7 @@ def _get_rmsnorm_backward_kernel():
         - dweight = sum(dy * x / rms, axis=(0,1))
         - dx = (dy * weight / rms) - x * sum(dy * weight * x, axis=-1) / (rms^3 * hidden_dim)
     """
-    source = """
+    source = f"""
         uint row_idx = thread_position_in_grid.x;
 
         uint batch_size = x_shape[0];
@@ -92,29 +100,29 @@ def _get_rmsnorm_backward_kernel():
 
         // Recompute RMS (could cache but memory vs compute tradeoff)
         float sum_sq = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float val = x[row_offset + i];
             sum_sq += val * val;
-        }
+        }}
         float variance = sum_sq / float(hidden_dim);
-        float rms = metal::sqrt(variance + 1e-6f);
+        float rms = metal::sqrt(variance + {eps}f);
         float rms_inv = 1.0f / rms;
         float rms_inv3 = rms_inv * rms_inv * rms_inv;
 
         // Compute sum(dy * weight * x) for this row
         float dot_sum = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float dy_val = dy[row_offset + i];
             float x_val = x[row_offset + i];
             float w_val = weight[i];
             dot_sum += dy_val * w_val * x_val;
-        }
+        }}
         float scale = dot_sum * rms_inv3 / float(hidden_dim);
 
         typedef decltype(dx[0] + dx[0]) OutT;
 
         // Compute dx for each element
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float dy_val = dy[row_offset + i];
             float x_val = x[row_offset + i];
             float w_val = weight[i];
@@ -122,13 +130,14 @@ def _get_rmsnorm_backward_kernel():
             // dx = dy * weight / rms - x * scale
             float grad = dy_val * w_val * rms_inv - x_val * scale;
             dx[row_offset + i] = OutT(grad);
-        }
+        }}
     """
 
+    kernel_name = f"rmsnorm_backward_eps{eps}"
     return get_kernel(
-        "rmsnorm_backward",
+        kernel_name,
         lambda: mx.fast.metal_kernel(
-            name="rmsnorm_backward",
+            name=kernel_name,
             input_names=["x", "weight", "dy"],
             output_names=["dx"],
             source=source,
@@ -136,9 +145,13 @@ def _get_rmsnorm_backward_kernel():
     )
 
 
-def _get_rmsnorm_residual_kernel():
-    """Get or create the fused RMSNorm + residual kernel."""
-    source = """
+def _get_rmsnorm_residual_kernel(eps: float = 1e-6):
+    """Get or create the fused RMSNorm + residual kernel with specified eps.
+
+    Args:
+        eps: Small constant for numerical stability.
+    """
+    source = f"""
         uint row_idx = thread_position_in_grid.x;
 
         uint batch_size = x_shape[0];
@@ -152,27 +165,28 @@ def _get_rmsnorm_residual_kernel():
 
         // Compute sum of squares of (x + residual)
         float sum_sq = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float val = x[row_offset + i] + residual[row_offset + i];
             sum_sq += val * val;
-        }
+        }}
 
-        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + {eps}f);
 
         // Get output type for explicit casting (required for bf16)
         typedef decltype(out[0] + out[0]) OutT;
 
         // Normalize and scale
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float val = x[row_offset + i] + residual[row_offset + i];
             out[row_offset + i] = OutT(val * rms_inv * weight[i]);
-        }
+        }}
     """
 
+    kernel_name = f"rmsnorm_residual_eps{eps}"
     return get_kernel(
-        "rmsnorm_residual",
+        kernel_name,
         lambda: mx.fast.metal_kernel(
-            name="rmsnorm_residual",
+            name=kernel_name,
             input_names=["x", "residual", "weight"],
             output_names=["out"],
             source=source,
@@ -193,16 +207,13 @@ def _reference_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return normalized * weight
 
 
-@mx.custom_function
-def _metal_rmsnorm_3d(x: mx.array, weight: mx.array) -> mx.array:
-    """Metal kernel RMSNorm for 3D input with VJP support.
-
-    This internal function is wrapped with @mx.custom_function to enable
-    automatic differentiation through the Metal kernel.
+def _metal_rmsnorm_3d_impl(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
+    """Metal kernel RMSNorm implementation for 3D input.
 
     Args:
         x: Input tensor of shape (batch, seq_len, hidden_dim).
         weight: Learnable scale parameter of shape (hidden_dim,).
+        eps: Small constant for numerical stability.
 
     Returns:
         Normalized tensor of the same shape as input.
@@ -210,7 +221,7 @@ def _metal_rmsnorm_3d(x: mx.array, weight: mx.array) -> mx.array:
     batch_size, seq_len, hidden_dim = x.shape
     total_rows = batch_size * seq_len
 
-    kernel = _get_rmsnorm_kernel()
+    kernel = _get_rmsnorm_kernel(eps)
 
     threadgroup_size = min(256, total_rows)
     num_groups = (total_rows + threadgroup_size - 1) // threadgroup_size
@@ -228,13 +239,30 @@ def _metal_rmsnorm_3d(x: mx.array, weight: mx.array) -> mx.array:
     return outputs[0]
 
 
+@mx.custom_function
+def _metal_rmsnorm_3d(x: mx.array, weight: mx.array) -> mx.array:
+    """Metal kernel RMSNorm for 3D input with VJP support (default eps=1e-6).
+
+    This internal function is wrapped with @mx.custom_function to enable
+    automatic differentiation through the Metal kernel.
+
+    Args:
+        x: Input tensor of shape (batch, seq_len, hidden_dim).
+        weight: Learnable scale parameter of shape (hidden_dim,).
+
+    Returns:
+        Normalized tensor of the same shape as input.
+    """
+    return _metal_rmsnorm_3d_impl(x, weight, eps=1e-6)
+
+
 @_metal_rmsnorm_3d.vjp
 def _metal_rmsnorm_3d_vjp(
     primals: Tuple[mx.array, mx.array],
     cotangent: mx.array,
     output: mx.array,
 ) -> Tuple[mx.array, mx.array]:
-    """VJP (backward pass) for Metal RMSNorm.
+    """VJP (backward pass) for Metal RMSNorm (default eps=1e-6).
 
     Computes gradients for x and weight given upstream gradient (cotangent).
 
@@ -246,6 +274,7 @@ def _metal_rmsnorm_3d_vjp(
         - dweight = sum(dy * x / rms, axis=(0,1))
         - dx = (dy * weight / rms) - x * sum(dy * weight * x, axis=-1) / (rms^3 * hidden_dim)
     """
+    eps = 1e-6
     x, weight = primals
     dy = cotangent
 
@@ -253,7 +282,7 @@ def _metal_rmsnorm_3d_vjp(
     total_rows = batch_size * seq_len
 
     # Compute dx using Metal kernel
-    backward_kernel = _get_rmsnorm_backward_kernel()
+    backward_kernel = _get_rmsnorm_backward_kernel(eps)
 
     threadgroup_size = min(256, total_rows)
     num_groups = (total_rows + threadgroup_size - 1) // threadgroup_size
@@ -272,7 +301,7 @@ def _metal_rmsnorm_3d_vjp(
     # Compute dweight: sum(dy * normalized, axis=(0, 1))
     # We need to recompute normalized = x / rms
     x_fp32 = x.astype(mx.float32)
-    rms = mx.sqrt(mx.mean(x_fp32 * x_fp32, axis=-1, keepdims=True) + 1e-6)
+    rms = mx.sqrt(mx.mean(x_fp32 * x_fp32, axis=-1, keepdims=True) + eps)
     normalized = (x_fp32 / rms).astype(x.dtype)
     dweight = mx.sum(dy * normalized, axis=(0, 1))
 
@@ -308,8 +337,12 @@ def fast_rmsnorm(
         result = _reference_rmsnorm(x, weight, eps)
         return result[0] if was_2d else result
 
-    # Use Metal kernel with VJP support
-    result = _metal_rmsnorm_3d(x, weight)
+    # Use Metal kernel with VJP support for default eps
+    # For non-default eps, use the implementation directly (no VJP support)
+    if eps == 1e-6:
+        result = _metal_rmsnorm_3d(x, weight)
+    else:
+        result = _metal_rmsnorm_3d_impl(x, weight, eps)
 
     if was_2d:
         result = result[0]
@@ -346,7 +379,7 @@ def fast_rmsnorm_residual(
     batch_size, seq_len, hidden_dim = x.shape
     total_rows = batch_size * seq_len
 
-    kernel = _get_rmsnorm_residual_kernel()
+    kernel = _get_rmsnorm_residual_kernel(eps)
 
     threadgroup_size = min(256, total_rows)
     num_groups = (total_rows + threadgroup_size - 1) // threadgroup_size

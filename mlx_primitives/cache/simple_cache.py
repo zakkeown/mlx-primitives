@@ -62,8 +62,7 @@ class SimpleKVCache:
         self._k_cache = mx.zeros(cache_shape, dtype=dtype)
         self._v_cache = mx.zeros(cache_shape, dtype=dtype)
 
-        # Track current length for each batch element
-        self._lengths = mx.zeros((batch_size,), dtype=mx.int32)
+        # Track current length
         self._current_len = 0
 
     @property

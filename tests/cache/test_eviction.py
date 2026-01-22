@@ -1,5 +1,6 @@
 """Tests for cache eviction policies."""
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -32,9 +33,11 @@ class TestLRUEvictionPolicy:
     def test_lru_select_multiple(self) -> None:
         """Test selecting multiple for eviction."""
         policy = LRUEvictionPolicy()
-        for i in range(5):
-            policy.on_create(i)
-            time.sleep(0.001)  # Ensure different timestamps
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            for i in range(5):
+                mock_time.return_value = float(i)
+                policy.on_create(i)
 
         to_evict = policy.select_for_eviction([0, 1, 2, 3, 4], 3)
         assert len(to_evict) == 3
@@ -54,19 +57,23 @@ class TestLRUEvictionPolicy:
     def test_lru_access_updates_priority(self) -> None:
         """Test that accessing updates priority."""
         policy = LRUEvictionPolicy()
-        policy.on_create(1)
-        time.sleep(0.001)
-        policy.on_create(2)
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            mock_time.return_value = 1.0
+            policy.on_create(1)
+            mock_time.return_value = 2.0
+            policy.on_create(2)
 
-        # Initially, 1 has lower priority (older)
-        p1_before = policy.get_priority(1)
-        p2_before = policy.get_priority(2)
-        assert p1_before < p2_before
+            # Initially, 1 has lower priority (older)
+            p1_before = policy.get_priority(1)
+            p2_before = policy.get_priority(2)
+            assert p1_before < p2_before
 
-        # Access 1, making it more recent
-        policy.on_access(1)
-        p1_after = policy.get_priority(1)
-        assert p1_after > p2_before
+            # Access 1, making it more recent
+            mock_time.return_value = 3.0
+            policy.on_access(1)
+            p1_after = policy.get_priority(1)
+            assert p1_after > p2_before
 
     def test_lru_empty_candidates(self) -> None:
         """Test with empty candidate list."""
@@ -92,9 +99,12 @@ class TestFIFOEvictionPolicy:
     def test_fifo_ignores_access(self) -> None:
         """Test that FIFO ignores access order."""
         policy = FIFOEvictionPolicy()
-        policy.on_create(1)
-        time.sleep(0.001)
-        policy.on_create(2)
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            mock_time.return_value = 1.0
+            policy.on_create(1)
+            mock_time.return_value = 2.0
+            policy.on_create(2)
 
         # Access 1 - should not change eviction order
         policy.on_access(1)
@@ -105,9 +115,11 @@ class TestFIFOEvictionPolicy:
     def test_fifo_creation_order(self) -> None:
         """Test FIFO maintains creation order."""
         policy = FIFOEvictionPolicy()
-        for i in range(5):
-            policy.on_create(i)
-            time.sleep(0.001)
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            for i in range(5):
+                mock_time.return_value = float(i)
+                policy.on_create(i)
 
         to_evict = policy.select_for_eviction([0, 1, 2, 3, 4], 3)
         assert to_evict == [0, 1, 2]
@@ -126,9 +138,12 @@ class TestFIFOEvictionPolicy:
     def test_fifo_priority(self) -> None:
         """Test FIFO priority based on creation time."""
         policy = FIFOEvictionPolicy()
-        policy.on_create(1)
-        time.sleep(0.001)
-        policy.on_create(2)
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            mock_time.return_value = 1.0
+            policy.on_create(1)
+            mock_time.return_value = 2.0
+            policy.on_create(2)
 
         assert policy.get_priority(1) < policy.get_priority(2)
 
@@ -212,14 +227,18 @@ class TestCompositeEvictionPolicy:
         fifo = FIFOEvictionPolicy()
         composite = CompositeEvictionPolicy([(lru, 0.5), (fifo, 0.5)])
 
-        composite.on_create(1)
-        time.sleep(0.001)
-        composite.on_create(2)
-        time.sleep(0.001)
-        composite.on_create(3)
+        # Use mock time to ensure deterministic timestamps
+        with patch("time.time") as mock_time:
+            mock_time.return_value = 1.0
+            composite.on_create(1)
+            mock_time.return_value = 2.0
+            composite.on_create(2)
+            mock_time.return_value = 3.0
+            composite.on_create(3)
 
-        # Access 1 to make it recent in LRU
-        composite.on_access(1)
+            # Access 1 to make it recent in LRU
+            mock_time.return_value = 4.0
+            composite.on_access(1)
 
         to_evict = composite.select_for_eviction([1, 2, 3], 1)
         # 1 is old in FIFO but recent in LRU

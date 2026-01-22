@@ -5,12 +5,15 @@ Each node knows how to emit Metal code.
 """
 
 from __future__ import annotations
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union, Any
 
 from mlx_primitives.dsl.types import DType, MetalDType, float32, int32, uint32
+
+_logger = logging.getLogger(__name__)
 
 
 class IRType(Enum):
@@ -234,7 +237,7 @@ class IRCall(IRNode):
             try:
                 return int(arg.emit())
             except ValueError:
-                pass
+                _logger.debug("Could not parse axis from %s, defaulting to x (0)", arg.emit())
         return 0  # Default to x axis
 
 

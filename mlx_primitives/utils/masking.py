@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-# Standard attention mask value (negative infinity for softmax masking)
-ATTENTION_MASK_VALUE = float("-inf")
+from mlx_primitives.constants import ATTENTION_MASK_VALUE
 
 
 def create_causal_mask(

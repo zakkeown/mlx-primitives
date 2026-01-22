@@ -14,10 +14,14 @@ from mlx_primitives.kernels._registry import get_kernel
 logger = logging.getLogger(__name__)
 
 
-def _get_layernorm_kernel():
-    """Get or create the LayerNorm kernel (no affine params)."""
+def _get_layernorm_kernel(eps: float = 1e-6):
+    """Get or create the LayerNorm kernel (no affine params).
+
+    Args:
+        eps: Small constant for numerical stability.
+    """
     # Each thread handles one row, computes mean+var in 2 passes
-    source = """
+    source = f"""
         uint row_idx = thread_position_in_grid.x;
 
         uint batch_size = x_shape[0];
@@ -31,29 +35,30 @@ def _get_layernorm_kernel():
 
         // Pass 1: Compute mean
         float sum = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             sum += x[row_offset + i];
-        }
+        }}
         float mean = sum / float(hidden_dim);
 
         // Pass 2: Compute variance
         float sum_sq = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float diff = x[row_offset + i] - mean;
             sum_sq += diff * diff;
-        }
-        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        }}
+        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + {eps}f);
 
         // Pass 3: Normalize
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             out[row_offset + i] = (x[row_offset + i] - mean) * var_inv;
-        }
+        }}
     """
 
+    kernel_name = f"layernorm_forward_eps{eps}"
     return get_kernel(
-        "layernorm_forward",
+        kernel_name,
         lambda: mx.fast.metal_kernel(
-            name="layernorm_forward",
+            name=kernel_name,
             input_names=["x"],
             output_names=["out"],
             source=source,
@@ -61,9 +66,13 @@ def _get_layernorm_kernel():
     )
 
 
-def _get_layernorm_affine_kernel():
-    """Get or create the LayerNorm kernel with affine params (gamma, beta)."""
-    source = """
+def _get_layernorm_affine_kernel(eps: float = 1e-6):
+    """Get or create the LayerNorm kernel with affine params (gamma, beta).
+
+    Args:
+        eps: Small constant for numerical stability.
+    """
+    source = f"""
         uint row_idx = thread_position_in_grid.x;
 
         uint batch_size = x_shape[0];
@@ -77,30 +86,31 @@ def _get_layernorm_affine_kernel():
 
         // Pass 1: Compute mean
         float sum = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             sum += x[row_offset + i];
-        }
+        }}
         float mean = sum / float(hidden_dim);
 
         // Pass 2: Compute variance
         float sum_sq = 0.0f;
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float diff = x[row_offset + i] - mean;
             sum_sq += diff * diff;
-        }
-        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        }}
+        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + {eps}f);
 
         // Pass 3: Normalize with affine transform
-        for (uint i = 0; i < hidden_dim; i++) {
+        for (uint i = 0; i < hidden_dim; i++) {{
             float normalized = (x[row_offset + i] - mean) * var_inv;
             out[row_offset + i] = normalized * gamma[i] + beta[i];
-        }
+        }}
     """
 
+    kernel_name = f"layernorm_affine_forward_eps{eps}"
     return get_kernel(
-        "layernorm_affine_forward",
+        kernel_name,
         lambda: mx.fast.metal_kernel(
-            name="layernorm_affine_forward",
+            name=kernel_name,
             input_names=["x", "gamma", "beta"],
             output_names=["out"],
             source=source,
@@ -169,7 +179,7 @@ def fast_layernorm(
     threadgroup = (threadgroup_size, 1, 1)
 
     if gamma is not None and beta is not None:
-        kernel = _get_layernorm_affine_kernel()
+        kernel = _get_layernorm_affine_kernel(eps)
         outputs = kernel(
             inputs=[x, gamma, beta],
             grid=grid,
@@ -179,7 +189,7 @@ def fast_layernorm(
             stream=mx.default_stream(mx.default_device()),
         )
     else:
-        kernel = _get_layernorm_kernel()
+        kernel = _get_layernorm_kernel(eps)
         outputs = kernel(
             inputs=[x],
             grid=grid,

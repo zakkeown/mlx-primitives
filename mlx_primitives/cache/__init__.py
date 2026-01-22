@@ -192,7 +192,14 @@ def create_kv_cache(
     """
     # Normalize cache_type to enum
     if isinstance(cache_type, str):
-        cache_type = CacheType(cache_type.lower())
+        try:
+            cache_type = CacheType(cache_type.lower())
+        except ValueError:
+            valid_types = [ct.value for ct in CacheType]
+            raise ValueError(
+                f"Unknown cache type: {cache_type}. "
+                f"Valid types are: {', '.join(valid_types)}"
+            )
 
     if cache_type == CacheType.SIMPLE:
         if batch_size is None or max_seq_len is None:
@@ -266,7 +273,11 @@ def create_kv_cache(
         )
 
     else:
-        raise ValueError(f"Unknown cache type: {cache_type}")
+        valid_types = [ct.value for ct in CacheType]
+        raise ValueError(
+            f"Unknown cache type: {cache_type}. "
+            f"Valid types are: {', '.join(valid_types)}"
+        )
 
 
 __all__ = [

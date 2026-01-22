@@ -77,7 +77,7 @@ def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
         uint kv_base = batch_idx * _seq_len * qkv_stride + head_idx * _head_dim;
 
         // First pass: find max score
-        float max_score = -1e38f;
+        float max_score = MASK_VALf;
         for (uint kv_pos = kv_start; kv_pos < kv_end; kv_pos++) {
             uint k_offset = kv_base + kv_pos * qkv_stride;
             float score = 0.0f;
@@ -116,7 +116,7 @@ def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
         for (uint d = 0; d < _head_dim; d++) {
             O[q_offset + d] = acc[d] * inv_sum;
         }
-        """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
+        """.replace("MASK_VAL", str(ATTENTION_MASK_VALUE)).replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
 
     return get_kernel(
         "sliding_window_attention",

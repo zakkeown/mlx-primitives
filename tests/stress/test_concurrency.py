@@ -5,9 +5,26 @@ These tests verify that:
 2. Kernel caching works correctly under concurrent access
 3. Results are consistent regardless of execution order
 
-NOTE: MLX may not be thread-safe for concurrent kernel execution.
-These tests use a mutex to serialize operations while still testing
-that results are correct when called from multiple threads.
+IMPORTANT: What these tests DO and DON'T test
+=============================================
+These tests verify the thread-safety of the Python wrapper code and kernel
+caching mechanisms, NOT true concurrent GPU kernel execution. All MLX
+operations are serialized through a global mutex (_mlx_mutex) because MLX
+may not be thread-safe for concurrent kernel execution on the GPU.
+
+What IS tested:
+- Thread-safety of Python-level data structures (kernel cache, registries)
+- Correctness of results when the same operations are called from multiple threads
+- No race conditions in the Python wrapper code
+- Kernel compilation and caching under multi-threaded access patterns
+
+What is NOT tested:
+- True concurrent GPU kernel execution
+- GPU-level parallelism or race conditions
+- Performance under actual concurrent GPU workloads
+
+For true concurrency testing, consider using separate processes with their
+own MLX contexts, or wait for future MLX versions with explicit threading support.
 """
 
 import concurrent.futures

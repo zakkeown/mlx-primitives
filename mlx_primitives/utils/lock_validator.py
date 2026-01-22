@@ -103,6 +103,21 @@ class LockOrderValidator:
             return []
         return list(cls._thread_local.held)
 
+    @classmethod
+    def clear_thread_state(cls) -> None:
+        """Clear all lock tracking state for the current thread.
+
+        This should be called when a thread is done with lock-protected
+        operations, especially in long-running threads, to prevent potential
+        memory leaks from accumulated tracking state.
+
+        Example:
+            # At the end of a worker thread's lifecycle:
+            LockOrderValidator.clear_thread_state()
+        """
+        if hasattr(cls._thread_local, "held"):
+            cls._thread_local.held.clear()
+
 
 @contextmanager
 def ordered_lock(

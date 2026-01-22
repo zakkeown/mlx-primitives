@@ -177,14 +177,14 @@ output, aux_loss = moe(x)  # aux_loss for load balancing
 ## KV Cache (Submodule)
 
 ```python
-from mlx_primitives.cache import KVCache
+from mlx_primitives.cache import SimpleKVCache
 
 # Create cache
-cache = KVCache(
+cache = SimpleKVCache(
     batch_size=1,
-    max_seq_len=2048,
     num_heads=12,
     head_dim=64,
+    max_seq_len=2048,
 )
 
 # Use during generation
@@ -197,20 +197,24 @@ for step in range(max_tokens):
 ## Generation Engine (Submodule)
 
 ```python
-from mlx_primitives.generation import GenerationEngine
+from mlx_primitives.generation import GenerationEngine, EngineConfig
+
+# Define your model's forward function
+def model_forward(input_ids, attention_mask):
+    return model(input_ids, attention_mask)
 
 # Create generation engine
 engine = GenerationEngine(
-    model=my_model,
-    tokenizer=my_tokenizer,
+    model_forward_fn=model_forward,
+    config=EngineConfig(vocab_size=32000, eos_token_id=2),
 )
 
-# Generate text
-output = engine.generate(
-    prompt="Hello, world!",
-    max_tokens=100,
-    temperature=0.7,
-)
+# Submit generation requests
+req = engine.submit(input_ids, max_new_tokens=100)
+
+# Generate tokens with streaming
+for step_output in engine.generate_stream():
+    print(step_output)
 ```
 
 ## Hardware Detection (Submodule)
