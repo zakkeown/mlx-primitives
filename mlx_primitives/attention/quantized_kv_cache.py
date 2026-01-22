@@ -175,10 +175,10 @@ class QuantizedKVCache:
         """
         batch_size, new_seq, num_heads, head_dim = k_new.shape
 
-        assert num_heads == self.num_heads, \
-            f"num_heads mismatch: expected {self.num_heads}, got {num_heads}"
-        assert head_dim == self.head_dim, \
-            f"head_dim mismatch: expected {self.head_dim}, got {head_dim}"
+        if num_heads != self.num_heads:
+            raise ValueError(f"num_heads mismatch: expected {self.num_heads}, got {num_heads}")
+        if head_dim != self.head_dim:
+            raise ValueError(f"head_dim mismatch: expected {self.head_dim}, got {head_dim}")
 
         # Quantize new tokens
         k_quant, k_scale, k_zero = self._quantize_tensor(k_new)

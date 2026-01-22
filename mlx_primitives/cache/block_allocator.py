@@ -11,6 +11,8 @@ from typing import List, Optional, Set, Tuple
 import mlx.core as mx
 
 from mlx_primitives.constants import DEFAULT_L2_CACHE_MB
+from mlx_primitives.utils.dtypes import get_dtype_size
+from mlx_primitives.utils.lock_validator import ordered_lock
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,7 @@ class BlockConfig:
     @property
     def block_bytes(self) -> int:
         """Memory per block (K + V combined)."""
-        dtype_size = _get_dtype_size(self.dtype)
+        dtype_size = get_dtype_size(self.dtype)
         return 2 * self.block_size * self.num_heads * self.head_dim * dtype_size
 
     @property
@@ -45,30 +47,6 @@ class BlockConfig:
         """Shape of a single K or V block: (block_size, num_heads, head_dim)."""
         return (self.block_size, self.num_heads, self.head_dim)
 
-
-def _get_dtype_size(dtype: mx.Dtype) -> int:
-    """Get size in bytes for a given dtype.
-
-    Args:
-        dtype: MLX data type.
-
-    Returns:
-        Size in bytes per element.
-    """
-    dtype_sizes = {
-        mx.float16: 2,
-        mx.bfloat16: 2,
-        mx.float32: 4,
-        mx.int8: 1,
-        mx.uint8: 1,
-        mx.int16: 2,
-        mx.uint16: 2,
-        mx.int32: 4,
-        mx.uint32: 4,
-        mx.int64: 8,
-        mx.uint64: 8,
-    }
-    return dtype_sizes.get(dtype, 4)  # Default to 4 bytes if unknown
 
 
 class BlockAllocator:
@@ -141,19 +119,19 @@ class BlockAllocator:
     @property
     def num_free_blocks(self) -> int:
         """Number of available blocks."""
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             return len(self._free_blocks)
 
     @property
     def num_allocated_blocks(self) -> int:
         """Number of blocks currently in use."""
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             return len(self._allocated_blocks)
 
     @property
     def memory_usage_bytes(self) -> int:
         """Total memory used by allocated blocks."""
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             return len(self._allocated_blocks) * self._config.block_bytes
 
     @property
@@ -173,7 +151,7 @@ class BlockAllocator:
         Raises:
             RuntimeError: If not enough blocks are available.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             if count > len(self._free_blocks):
                 raise RuntimeError(
                     f"Cannot allocate {count} blocks, only {len(self._free_blocks)} available"
@@ -215,7 +193,7 @@ class BlockAllocator:
         Raises:
             ValueError: If any block_id is out of bounds.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             for block_id in block_ids:
                 self._validate_block_id(block_id, "free")
 
@@ -238,7 +216,7 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._validate_block_id(block_id, "increment_ref")
             if block_id in self._allocated_blocks:
                 self._ref_counts[block_id] += 1
@@ -255,7 +233,7 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._validate_block_id(block_id, "get_ref_count")
             return self._ref_counts[block_id]
 
@@ -275,7 +253,7 @@ class BlockAllocator:
             ValueError: If block_id is out of bounds.
             RuntimeError: If no blocks available for copy.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._validate_block_id(block_id, "copy_on_write")
 
             if not self._enable_cow:
@@ -292,6 +270,10 @@ class BlockAllocator:
             # Copy data
             self._k_pool[new_block_id] = self._k_pool[block_id]
             self._v_pool[new_block_id] = self._v_pool[block_id]
+
+            # Ensure copy completes before releasing lock to prevent race condition
+            # where another thread reads the new block before data is written
+            mx.eval(self._k_pool[new_block_id], self._v_pool[new_block_id])
 
             # Decrement ref count on original
             self._ref_counts[block_id] -= 1
@@ -310,7 +292,7 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._validate_block_id(block_id, "get_block_data")
             return self._k_pool[block_id], self._v_pool[block_id]
 
@@ -334,7 +316,7 @@ class BlockAllocator:
         Raises:
             ValueError: If block_id is out of bounds.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._validate_block_id(block_id, "set_block_data")
             if length is None:
                 length = k.shape[0]
@@ -358,7 +340,7 @@ class BlockAllocator:
 
     def clear(self) -> None:
         """Reset all blocks to free state."""
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             self._free_blocks = set(range(self._num_blocks))
             self._allocated_blocks.clear()
             self._ref_counts = [0] * self._num_blocks
@@ -369,7 +351,7 @@ class BlockAllocator:
         Returns:
             Dictionary with allocation statistics.
         """
-        with self._lock:
+        with ordered_lock("BlockAllocator", self._lock):
             return {
                 "num_blocks": self._num_blocks,
                 "num_free": len(self._free_blocks),
@@ -381,6 +363,19 @@ class BlockAllocator:
                 else 0.0,
                 "cow_enabled": self._enable_cow,
             }
+
+    def __del__(self) -> None:
+        """Clean up resources when allocator is garbage collected.
+
+        Explicitly clears internal references to help the garbage collector
+        release the memory pools promptly.
+        """
+        # Clear pool references - helps GC release memory faster
+        self._k_pool = None
+        self._v_pool = None
+        self._free_blocks = None
+        self._allocated_blocks = None
+        self._ref_counts = None
 
 
 def get_optimal_block_size(
@@ -411,8 +406,15 @@ def get_optimal_block_size(
 
             chip_info = get_chip_info()
             l2_cache_mb = float(chip_info.l2_cache_mb)
-        except Exception:
+        except (ImportError, AttributeError, RuntimeError) as e:
             # Fallback to default if hardware detection fails
+            from mlx_primitives.utils.logging import log_fallback
+
+            log_fallback(
+                "hardware detection",
+                e,
+                f"using default L2 cache: {DEFAULT_L2_CACHE_MB}MB",
+            )
             l2_cache_mb = DEFAULT_L2_CACHE_MB
 
     dtype_size = 2 if dtype in (mx.float16, mx.bfloat16) else 4

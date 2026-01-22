@@ -21,8 +21,7 @@ Example:
 """
 
 import math
-import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 
@@ -32,19 +31,22 @@ from mlx_primitives.attention._online_softmax import (
 )
 from mlx_primitives.constants import (
     ATTENTION_MASK_VALUE,
+    FLASH_MAX_SEQ_FOR_REFERENCE,
+    FLASH_MIN_SEQ_FOR_METAL,
+    FLASH_SMALL_BATCH_SEQ_THRESHOLD,
+    FLASH_SMALL_BATCH_THRESHOLD,
+    Layout,
     METAL_ATTENTION_MAX_HEAD_DIM,
     METAL_SOFTMAX_EPSILON,
 )
+from mlx_primitives.kernels._registry import get_kernel
+from mlx_primitives.utils.masking import create_causal_mask
 
 # Check if Metal kernels are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
 # Check if MLX's optimized SDPA is available (preferred over custom kernels)
 _HAS_SDPA = hasattr(mx.fast, "scaled_dot_product_attention")
-
-# Kernel cache with thread safety
-_flash_attention_kernel: Optional[mx.fast.metal_kernel] = None
-_flash_kernel_lock = threading.Lock()
 
 
 def flash_attention(
@@ -58,7 +60,7 @@ def flash_attention(
     use_metal: bool = True,
     dropout_p: float = 0.0,
     training: bool = True,
-    layout: str = "BSHD",
+    layout: Union[str, Layout] = Layout.BSHD,
 ) -> mx.array:
     """Flash Attention - O(n) memory attention via tiled online softmax.
 
@@ -120,12 +122,54 @@ def flash_attention(
     """
     if q.ndim != 4:
         raise ValueError(f"Expected 4D tensors, got {q.ndim}D")
+    if k.ndim != 4:
+        raise ValueError(f"Expected K to be 4D tensor, got {k.ndim}D")
+    if v.ndim != 4:
+        raise ValueError(f"Expected V to be 4D tensor, got {v.ndim}D")
 
-    if layout not in ("BSHD", "BHSD"):
-        raise ValueError(f"layout must be 'BSHD' or 'BHSD', got '{layout}'")
+    # Normalize layout to enum (accepts both string and Layout enum)
+    if isinstance(layout, str) and layout not in (Layout.BSHD.value, Layout.BHSD.value):
+        raise ValueError(
+            f"layout must be Layout.BSHD or Layout.BHSD (or 'BSHD'/'BHSD'), got '{layout}'"
+        )
+    layout = Layout(layout) if isinstance(layout, str) else layout
+
+    # Validate Q/K/V shape compatibility based on layout
+    if layout == Layout.BSHD:
+        q_batch, q_seq, q_heads, q_dim = q.shape
+        k_batch, k_seq, k_heads, k_dim = k.shape
+        v_batch, v_seq, v_heads, v_dim = v.shape
+    else:  # BHSD
+        q_batch, q_heads, q_seq, q_dim = q.shape
+        k_batch, k_heads, k_seq, k_dim = k.shape
+        v_batch, v_heads, v_seq, v_dim = v.shape
+
+    if q_batch != k_batch or q_batch != v_batch:
+        raise ValueError(
+            f"Batch size mismatch: Q={q_batch}, K={k_batch}, V={v_batch}"
+        )
+    if q_heads != k_heads or q_heads != v_heads:
+        raise ValueError(
+            f"Number of heads mismatch: Q={q_heads}, K={k_heads}, V={v_heads}"
+        )
+    if q_dim != k_dim:
+        raise ValueError(
+            f"Head dimension mismatch between Q and K: Q={q_dim}, K={k_dim}"
+        )
+    if k_seq != v_seq:
+        raise ValueError(
+            f"Sequence length mismatch between K and V: K={k_seq}, V={v_seq}"
+        )
+
+    # Validate dtype consistency to prevent silent numerical instability
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError(
+            f"Q/K/V dtype mismatch: Q={q.dtype}, K={k.dtype}, V={v.dtype}. "
+            "All tensors must have the same dtype to ensure numerical stability."
+        )
 
     # Handle BHSD layout - call SDPA directly without transpose overhead
-    if layout == "BHSD":
+    if layout == Layout.BHSD:
         batch_size, num_heads, seq_len, head_dim = q.shape
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
@@ -141,8 +185,9 @@ def flash_attention(
             # Fallback to standard attention for BHSD
             scores = (q @ k.transpose(0, 1, 3, 2)) * scale
             if causal:
-                mask = mx.tril(mx.ones((seq_len, seq_len)))
-                scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
+                # Use centralized causal mask utility for consistency
+                mask = create_causal_mask(seq_len, seq_len, dtype=scores.dtype)
+                scores = scores + mask[None, None, :, :]
             weights = mx.softmax(scores, axis=-1)
             return weights @ v
 
@@ -163,7 +208,10 @@ def flash_attention(
     # which now uses SDPA when available. This avoids the overhead of the tiled Python
     # implementation or custom Metal kernel for sizes where O(n²) memory is acceptable.
     # The reference path is kept for correctness testing and SDPA-unavailable fallback.
-    if seq_len <= 256 or (batch_size <= 4 and seq_len <= 512):
+    if seq_len <= FLASH_MAX_SEQ_FOR_REFERENCE or (
+        batch_size <= FLASH_SMALL_BATCH_THRESHOLD
+        and seq_len <= FLASH_SMALL_BATCH_SEQ_THRESHOLD
+    ):
         return _reference_flash_attention(q, k, v, scale, causal)
 
     # Priority 1: Use MLX's built-in SDPA when available
@@ -187,21 +235,20 @@ def flash_attention(
             return mx.transpose(out_sdpa, (0, 2, 1, 3))
         except (RuntimeError, TypeError) as e:
             # Fall through to custom implementation if SDPA fails
-            # (e.g., unsupported configuration)
+            # (e.g., unsupported configuration like incompatible shapes)
             from mlx_primitives.utils.logging import log_fallback
-            log_fallback("flash_attention (SDPA)", e)
+            log_fallback("flash_attention (SDPA)", e, f"seq_len={seq_len}, head_dim={head_dim}")
 
     # Priority 2: Custom Metal kernel (1 thread per threadgroup limitation)
     # This is a workaround implementation - SDPA is preferred when available
-    if use_metal and _HAS_METAL and seq_len >= 64:
+    if use_metal and _HAS_METAL and seq_len >= FLASH_MIN_SEQ_FOR_METAL:
         try:
-            return _metal_flash_attention(
-                q, k, v, scale, causal, block_q, block_kv
-            )
+            return _metal_flash_attention(q, k, v, scale, causal)
         except RuntimeError as e:
-            # Catch Metal kernel errors, but let programming bugs propagate
+            # Catch Metal kernel errors (e.g., shader compilation, resource limits)
+            # but let programming bugs propagate
             from mlx_primitives.utils.logging import log_fallback
-            log_fallback("flash_attention", e)
+            log_fallback("flash_attention (Metal)", e, f"seq_len={seq_len}, head_dim={head_dim}")
 
     # Priority 3: Python implementation with tiled computation
     return _tiled_flash_attention(q, k, v, scale, causal, block_q, block_kv)
@@ -270,19 +317,16 @@ def _tiled_flash_attention(
 
 
 def _get_flash_attention_kernel() -> mx.fast.metal_kernel:
-    """Get or create the Flash Attention Metal kernel (thread-safe)."""
-    global _flash_attention_kernel
-    if _flash_attention_kernel is None:
-        with _flash_kernel_lock:
-            # Double-check after acquiring lock
-            if _flash_attention_kernel is not None:
-                return _flash_attention_kernel
-            # Flash Attention kernel - simple per-element online softmax
-            # Each threadgroup handles one query position (1 thread per threadgroup)
-            # This is a workaround for MLX metal_kernel not supporting multiple threads
-            # Single-pass online softmax - computes scores once and accumulates V in same loop
-            # This is ~2x faster than the two-pass approach
-            source = """
+    """Get or create the Flash Attention Metal kernel (thread-safe).
+
+    Uses the centralized kernel registry for proper caching.
+    """
+    # Flash Attention kernel - simple per-element online softmax
+    # Each threadgroup handles one query position (1 thread per threadgroup)
+    # This is a workaround for MLX metal_kernel not supporting multiple threads
+    # Single-pass online softmax - computes scores once and accumulates V in same loop
+    # This is ~2x faster than the two-pass approach
+    source = """
         // Flash Attention Metal Kernel - Single Pass Online Softmax
         // One threadgroup (1 thread) per query position
         // Optimized: computes scores once, accumulates V in same loop
@@ -363,7 +407,9 @@ def _get_flash_attention_kernel() -> mx.fast.metal_kernel:
         }
         """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
 
-        _flash_attention_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "flash_attention",
+        lambda: mx.fast.metal_kernel(
             name="flash_attention",
             input_names=[
                 "Q", "K", "V",
@@ -372,8 +418,8 @@ def _get_flash_attention_kernel() -> mx.fast.metal_kernel:
             ],
             output_names=["O"],
             source=source,
-        )
-    return _flash_attention_kernel
+        ),
+    )
 
 
 def _metal_flash_attention(
@@ -382,14 +428,11 @@ def _metal_flash_attention(
     v: mx.array,
     scale: float,
     causal: bool,
-    block_q: int,
-    block_kv: int,
 ) -> mx.array:
     """Metal kernel implementation of Flash Attention.
 
-    Note: block_q and block_kv parameters are kept for API compatibility but
-    are not used by the current kernel implementation. The kernel processes
-    one query position per threadgroup due to MLX metal_kernel limitations.
+    The kernel processes one query position per threadgroup due to MLX
+    metal_kernel limitations (1 thread per threadgroup).
     """
     batch_size, seq_len, num_heads, head_dim = q.shape
 
@@ -472,8 +515,9 @@ def _reference_flash_attention(
     scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
 
     if causal:
-        mask = mx.tril(mx.ones((seq, seq)))
-        scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
+        # Use centralized causal mask utility for consistency
+        mask = create_causal_mask(seq, seq, dtype=scores.dtype)
+        scores = scores + mask[None, None, :, :]
 
     weights = mx.softmax(scores, axis=-1)
     output = weights @ v_t
@@ -516,8 +560,9 @@ def _reference_flash_attention_with_dropout(
     scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
 
     if causal:
-        mask = mx.tril(mx.ones((seq, seq)))
-        scores = mx.where(mask[None, None, :, :] == 1, scores, ATTENTION_MASK_VALUE)
+        # Use centralized causal mask utility for consistency
+        mask = create_causal_mask(seq, seq, dtype=scores.dtype)
+        scores = scores + mask[None, None, :, :]
 
     weights = mx.softmax(scores, axis=-1)
 

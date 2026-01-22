@@ -66,9 +66,17 @@ class SyncPoint:
 
         Call this after CPU operations that modify memory that
         will be used by GPU operations.
+
+        Note:
+            On Apple Silicon's unified memory architecture, CPU/GPU memory
+            coherence is handled automatically by the hardware. This method
+            is intentionally a no-op but exists for API symmetry with
+            mark_gpu_complete() and to support future platforms where
+            explicit synchronization may be required.
         """
-        # On unified memory, this is typically automatic
-        # but we ensure any Python-side operations are flushed
+        # Intentional no-op: Apple Silicon unified memory provides automatic
+        # coherence. This method exists for API completeness and future
+        # compatibility with platforms requiring explicit CPU→GPU sync.
         pass
 
     @property

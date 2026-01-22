@@ -1,5 +1,10 @@
 """Online softmax utilities for memory-efficient attention.
 
+This module is the CANONICAL REFERENCE IMPLEMENTATION of the online softmax
+algorithm used throughout MLX Primitives. Metal shader implementations in
+flash.py, sliding_window.py, and fused_rope_attention.py follow this same
+algorithm but are written in Metal Shading Language for GPU execution.
+
 The online softmax algorithm allows computing softmax incrementally without
 materializing the full attention matrix. This is the key insight behind
 Flash Attention and chunked attention implementations.
@@ -15,6 +20,16 @@ When processing a new chunk, we can merge with the running statistics:
 - o_new = o_old * exp(m_old - m_new) + o_chunk * exp(m_chunk - m_new)
 
 Note: o is kept unnormalized during accumulation. Final output is o / l.
+
+Metal Shader Implementations:
+    The following files contain equivalent Metal implementations:
+    - mlx_primitives/attention/flash.py (_get_flash_attention_kernel)
+    - mlx_primitives/attention/sliding_window.py (Metal kernel)
+    - mlx_primitives/kernels/fused_rope_attention.py (_get_fused_rope_attention_kernel)
+
+    When modifying this algorithm, ensure Metal versions are updated to match.
+    Use constants from mlx_primitives.constants (METAL_SOFTMAX_EPSILON, etc.)
+    to maintain consistency between Python and Metal code paths.
 """
 
 from typing import Tuple

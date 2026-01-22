@@ -22,6 +22,7 @@ Performance Notes:
 """
 
 import os
+import warnings
 from typing import Literal, Optional
 
 import mlx.core as mx
@@ -33,13 +34,29 @@ _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 
 
 def _get_min_seq_for_metal() -> int:
-    """Get minimum sequence length for Metal dispatch, configurable via env var."""
+    """Get minimum sequence length for Metal dispatch, configurable via env var.
+
+    Valid range: 1 to MAX_SEQ_FOR_METAL_SCAN.
+    Invalid values emit a warning and fall back to the default.
+    """
     env_val = os.environ.get("MLX_PRIMITIVES_MIN_SEQ_FOR_METAL")
     if env_val is not None:
         try:
-            return int(env_val)
+            val = int(env_val)
+            if 1 <= val <= MAX_SEQ_FOR_METAL_SCAN:
+                return val
+            else:
+                warnings.warn(
+                    f"MLX_PRIMITIVES_MIN_SEQ_FOR_METAL={val} out of valid range "
+                    f"[1, {MAX_SEQ_FOR_METAL_SCAN}], using default {MIN_SEQ_FOR_METAL}",
+                    stacklevel=2,
+                )
         except ValueError:
-            pass
+            warnings.warn(
+                f"MLX_PRIMITIVES_MIN_SEQ_FOR_METAL='{env_val}' is not a valid integer, "
+                f"using default {MIN_SEQ_FOR_METAL}",
+                stacklevel=2,
+            )
     return MIN_SEQ_FOR_METAL
 
 

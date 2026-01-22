@@ -72,15 +72,18 @@ class StopCondition:
             return last_token == self.value
 
         elif self.condition_type == StopConditionType.MAX_LENGTH:
-            assert isinstance(self.value, int)
+            if not isinstance(self.value, int):
+                raise TypeError(f"MAX_LENGTH value must be int, got {type(self.value).__name__}")
             return total_length >= self.value
 
         elif self.condition_type == StopConditionType.MAX_NEW_TOKENS:
-            assert isinstance(self.value, int)
+            if not isinstance(self.value, int):
+                raise TypeError(f"MAX_NEW_TOKENS value must be int, got {type(self.value).__name__}")
             return new_tokens >= self.value
 
         elif self.condition_type == StopConditionType.CUSTOM:
-            assert callable(self.value)
+            if not callable(self.value):
+                raise TypeError(f"CUSTOM value must be callable, got {type(self.value).__name__}")
             return self.value(generated_tokens)
 
         return False

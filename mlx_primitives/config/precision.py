@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional, Tuple, TYPE_CHECKING
 
@@ -69,6 +69,9 @@ _thread_local = threading.local()
 # Global default configuration (used when thread-local is not set)
 _global_default_config = PrecisionConfig()
 
+# Lock for thread-safe access to global config
+_global_config_lock = threading.Lock()
+
 
 def get_precision_config() -> PrecisionConfig:
     """Get the current precision configuration for this thread.
@@ -98,12 +101,14 @@ def set_global_precision_config(config: PrecisionConfig) -> None:
     """Set the global default precision configuration.
 
     This affects all threads that haven't set thread-local config.
+    Thread-safe: protected by _global_config_lock.
 
     Args:
         config: New global default configuration.
     """
     global _global_default_config
-    _global_default_config = config
+    with _global_config_lock:
+        _global_default_config = config
 
 
 def clear_thread_precision_config() -> None:
@@ -115,24 +120,17 @@ def clear_thread_precision_config() -> None:
 def set_precision_mode(mode: PrecisionMode) -> None:
     """Convenience function to set just the precision mode.
 
+    Thread-safe: protected by _global_config_lock.
+
     Args:
         mode: Precision mode to use.
 
     Example:
         >>> set_precision_mode(PrecisionMode.AUTO)
     """
-    global _default_config
-    _default_config = PrecisionConfig(
-        mode=mode,
-        max_seq_len_fp16=_default_config.max_seq_len_fp16,
-        min_seq_len_fp16=_default_config.min_seq_len_fp16,
-        check_input_range=_default_config.check_input_range,
-        max_safe_magnitude=_default_config.max_safe_magnitude,
-        max_safe_attention_score=_default_config.max_safe_attention_score,
-        accumulate_fp32=_default_config.accumulate_fp32,
-        fallback_on_overflow=_default_config.fallback_on_overflow,
-        warn_on_fallback=_default_config.warn_on_fallback,
-    )
+    global _global_default_config
+    with _global_config_lock:
+        _global_default_config = replace(_global_default_config, mode=mode)
 
 
 @contextmanager

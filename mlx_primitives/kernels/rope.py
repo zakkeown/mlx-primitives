@@ -5,82 +5,81 @@ from rotate_half and concatenation operations, with full VJP (backward pass)
 support for automatic differentiation.
 """
 
-from typing import Tuple, Optional
+import logging
+from typing import Optional, Tuple
+
 import mlx.core as mx
 
-# Cache compiled kernels
-_rope_kernel = None
-_rope_backward_kernel = None
-_rope_qk_kernel = None
+from mlx_primitives.kernels._registry import get_kernel
+
+logger = logging.getLogger(__name__)
 
 
 def _get_rope_kernel():
     """Get or create the RoPE kernel for single tensor."""
-    global _rope_kernel
+    # Each thread handles one (batch, seq, head, dim_pair) element
+    # x_shape: (batch, seq_len, num_heads, head_dim)
+    source = """
+        uint idx = thread_position_in_grid.x;
 
-    if _rope_kernel is None:
-        # Each thread handles one (batch, seq, head, dim_pair) element
-        # x_shape: (batch, seq_len, num_heads, head_dim)
-        source = """
-            uint idx = thread_position_in_grid.x;
+        // Get dimensions from x_shape (auto-provided by MLX)
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint num_heads = x_shape[2];
+        uint head_dim = x_shape[3];
+        uint half_dim = head_dim / 2;
 
-            // Get dimensions from x_shape (auto-provided by MLX)
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint num_heads = x_shape[2];
-            uint head_dim = x_shape[3];
-            uint half_dim = head_dim / 2;
+        // Total dimension pairs to process
+        uint total_pairs = batch_size * seq_len * num_heads * half_dim;
+        if (idx >= total_pairs) return;
 
-            // Total dimension pairs to process
-            uint total_pairs = batch_size * seq_len * num_heads * half_dim;
-            if (idx >= total_pairs) return;
+        // Decompose linear index to (batch, seq, head, dim_pair)
+        uint dim_pair = idx % half_dim;
+        uint rem = idx / half_dim;
+        uint head_idx = rem % num_heads;
+        rem = rem / num_heads;
+        uint seq_idx = rem % seq_len;
+        uint batch_idx = rem / seq_len;
 
-            // Decompose linear index to (batch, seq, head, dim_pair)
-            uint dim_pair = idx % half_dim;
-            uint rem = idx / half_dim;
-            uint head_idx = rem % num_heads;
-            rem = rem / num_heads;
-            uint seq_idx = rem % seq_len;
-            uint batch_idx = rem / seq_len;
+        // Compute index into x tensor
+        // Layout: batch * (seq * heads * dim) + seq * (heads * dim) + head * dim + d
+        uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
+                       seq_idx * (num_heads * head_dim) +
+                       head_idx * head_dim;
 
-            // Compute index into x tensor
-            // Layout: batch * (seq * heads * dim) + seq * (heads * dim) + head * dim + d
-            uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
-                           seq_idx * (num_heads * head_dim) +
-                           head_idx * head_dim;
+        // Get the two elements that form a rotation pair
+        // Standard RoPE pairs: (0, half_dim), (1, half_dim+1), etc.
+        uint d1 = dim_pair;
+        uint d2 = dim_pair + half_dim;
 
-            // Get the two elements that form a rotation pair
-            // Standard RoPE pairs: (0, half_dim), (1, half_dim+1), etc.
-            uint d1 = dim_pair;
-            uint d2 = dim_pair + half_dim;
+        float x1 = x[base_idx + d1];
+        float x2 = x[base_idx + d2];
 
-            float x1 = x[base_idx + d1];
-            float x2 = x[base_idx + d2];
+        // Get cos/sin from precomputed cache
+        // Cache layout: (seq_len, half_dim)
+        uint cache_idx = seq_idx * half_dim + dim_pair;
+        float cos_val = cos_cache[cache_idx];
+        float sin_val = sin_cache[cache_idx];
 
-            // Get cos/sin from precomputed cache
-            // Cache layout: (seq_len, half_dim)
-            uint cache_idx = seq_idx * half_dim + dim_pair;
-            float cos_val = cos_cache[cache_idx];
-            float sin_val = sin_cache[cache_idx];
+        // Apply rotation: out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos
+        float r1 = x1 * cos_val - x2 * sin_val;
+        float r2 = x1 * sin_val + x2 * cos_val;
+        // Use explicit type conversion for bf16 compatibility
+        // decltype(out[0] + out[0]) gives value type (not reference)
+        typedef decltype(out[0] + out[0]) OutT;
+        out[base_idx + d1] = OutT(r1);
+        out[base_idx + d2] = OutT(r2);
+    """
 
-            // Apply rotation: out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos
-            float r1 = x1 * cos_val - x2 * sin_val;
-            float r2 = x1 * sin_val + x2 * cos_val;
-            // Use explicit type conversion for bf16 compatibility
-            // decltype(out[0] + out[0]) gives value type (not reference)
-            typedef decltype(out[0] + out[0]) OutT;
-            out[base_idx + d1] = OutT(r1);
-            out[base_idx + d2] = OutT(r2);
-        """
-
-        _rope_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rope_forward",
+        lambda: mx.fast.metal_kernel(
             name="rope_forward",
             input_names=["x", "cos_cache", "sin_cache"],
             output_names=["out"],
             source=source,
-        )
-
-    return _rope_kernel
+        ),
+    )
 
 
 def _get_rope_backward_kernel():
@@ -92,137 +91,133 @@ def _get_rope_backward_kernel():
             dx1 = dout1*cos + dout2*sin
             dx2 = -dout1*sin + dout2*cos
     """
-    global _rope_backward_kernel
+    source = """
+        uint idx = thread_position_in_grid.x;
 
-    if _rope_backward_kernel is None:
-        source = """
-            uint idx = thread_position_in_grid.x;
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint num_heads = x_shape[2];
+        uint head_dim = x_shape[3];
+        uint half_dim = head_dim / 2;
 
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint num_heads = x_shape[2];
-            uint head_dim = x_shape[3];
-            uint half_dim = head_dim / 2;
+        uint total_pairs = batch_size * seq_len * num_heads * half_dim;
+        if (idx >= total_pairs) return;
 
-            uint total_pairs = batch_size * seq_len * num_heads * half_dim;
-            if (idx >= total_pairs) return;
+        // Decompose linear index to (batch, seq, head, dim_pair)
+        uint dim_pair = idx % half_dim;
+        uint rem = idx / half_dim;
+        uint head_idx = rem % num_heads;
+        rem = rem / num_heads;
+        uint seq_idx = rem % seq_len;
+        uint batch_idx = rem / seq_len;
 
-            // Decompose linear index to (batch, seq, head, dim_pair)
-            uint dim_pair = idx % half_dim;
-            uint rem = idx / half_dim;
-            uint head_idx = rem % num_heads;
-            rem = rem / num_heads;
-            uint seq_idx = rem % seq_len;
-            uint batch_idx = rem / seq_len;
+        uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
+                       seq_idx * (num_heads * head_dim) +
+                       head_idx * head_dim;
 
-            uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
-                           seq_idx * (num_heads * head_dim) +
-                           head_idx * head_dim;
+        uint d1 = dim_pair;
+        uint d2 = dim_pair + half_dim;
 
-            uint d1 = dim_pair;
-            uint d2 = dim_pair + half_dim;
+        // Get upstream gradients
+        float dy1 = dy[base_idx + d1];
+        float dy2 = dy[base_idx + d2];
 
-            // Get upstream gradients
-            float dy1 = dy[base_idx + d1];
-            float dy2 = dy[base_idx + d2];
+        // Get cos/sin from cache
+        uint cache_idx = seq_idx * half_dim + dim_pair;
+        float cos_val = cos_cache[cache_idx];
+        float sin_val = sin_cache[cache_idx];
 
-            // Get cos/sin from cache
-            uint cache_idx = seq_idx * half_dim + dim_pair;
-            float cos_val = cos_cache[cache_idx];
-            float sin_val = sin_cache[cache_idx];
+        // Compute gradients: inverse rotation
+        // dx1 = dy1*cos + dy2*sin
+        // dx2 = -dy1*sin + dy2*cos
+        float dx1 = dy1 * cos_val + dy2 * sin_val;
+        float dx2 = -dy1 * sin_val + dy2 * cos_val;
 
-            // Compute gradients: inverse rotation
-            // dx1 = dy1*cos + dy2*sin
-            // dx2 = -dy1*sin + dy2*cos
-            float dx1 = dy1 * cos_val + dy2 * sin_val;
-            float dx2 = -dy1 * sin_val + dy2 * cos_val;
+        typedef decltype(dx[0] + dx[0]) OutT;
+        dx[base_idx + d1] = OutT(dx1);
+        dx[base_idx + d2] = OutT(dx2);
+    """
 
-            typedef decltype(dx[0] + dx[0]) OutT;
-            dx[base_idx + d1] = OutT(dx1);
-            dx[base_idx + d2] = OutT(dx2);
-        """
-
-        _rope_backward_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rope_backward",
+        lambda: mx.fast.metal_kernel(
             name="rope_backward",
             input_names=["x", "cos_cache", "sin_cache", "dy"],
             output_names=["dx"],
             source=source,
-        )
-
-    return _rope_backward_kernel
+        ),
+    )
 
 
 def _get_rope_qk_kernel():
     """Get or create the fused RoPE kernel for Q and K together."""
-    global _rope_qk_kernel
+    # Process Q and K simultaneously - more efficient memory access
+    source = """
+        uint idx = thread_position_in_grid.x;
 
-    if _rope_qk_kernel is None:
-        # Process Q and K simultaneously - more efficient memory access
-        source = """
-            uint idx = thread_position_in_grid.x;
+        // Get dimensions from q_shape
+        uint batch_size = q_shape[0];
+        uint seq_len = q_shape[1];
+        uint num_heads = q_shape[2];
+        uint head_dim = q_shape[3];
+        uint half_dim = head_dim / 2;
 
-            // Get dimensions from q_shape
-            uint batch_size = q_shape[0];
-            uint seq_len = q_shape[1];
-            uint num_heads = q_shape[2];
-            uint head_dim = q_shape[3];
-            uint half_dim = head_dim / 2;
+        uint total_pairs = batch_size * seq_len * num_heads * half_dim;
+        if (idx >= total_pairs) return;
 
-            uint total_pairs = batch_size * seq_len * num_heads * half_dim;
-            if (idx >= total_pairs) return;
+        // Decompose linear index
+        uint dim_pair = idx % half_dim;
+        uint rem = idx / half_dim;
+        uint head_idx = rem % num_heads;
+        rem = rem / num_heads;
+        uint seq_idx = rem % seq_len;
+        uint batch_idx = rem / seq_len;
 
-            // Decompose linear index
-            uint dim_pair = idx % half_dim;
-            uint rem = idx / half_dim;
-            uint head_idx = rem % num_heads;
-            rem = rem / num_heads;
-            uint seq_idx = rem % seq_len;
-            uint batch_idx = rem / seq_len;
+        uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
+                       seq_idx * (num_heads * head_dim) +
+                       head_idx * head_dim;
 
-            uint base_idx = batch_idx * (seq_len * num_heads * head_dim) +
-                           seq_idx * (num_heads * head_dim) +
-                           head_idx * head_dim;
+        uint d1 = dim_pair;
+        uint d2 = dim_pair + half_dim;
 
-            uint d1 = dim_pair;
-            uint d2 = dim_pair + half_dim;
+        // Load Q values
+        float q1 = q[base_idx + d1];
+        float q2 = q[base_idx + d2];
 
-            // Load Q values
-            float q1 = q[base_idx + d1];
-            float q2 = q[base_idx + d2];
+        // Load K values (may have different num_heads for GQA)
+        // For simplicity, assume same layout - user should handle GQA separately
+        float k1 = k[base_idx + d1];
+        float k2 = k[base_idx + d2];
 
-            // Load K values (may have different num_heads for GQA)
-            // For simplicity, assume same layout - user should handle GQA separately
-            float k1 = k[base_idx + d1];
-            float k2 = k[base_idx + d2];
+        // Get cos/sin from cache
+        uint cache_idx = seq_idx * half_dim + dim_pair;
+        float cos_val = cos_cache[cache_idx];
+        float sin_val = sin_cache[cache_idx];
 
-            // Get cos/sin from cache
-            uint cache_idx = seq_idx * half_dim + dim_pair;
-            float cos_val = cos_cache[cache_idx];
-            float sin_val = sin_cache[cache_idx];
+        // Apply rotation to Q (with explicit type conversion for bf16)
+        float q_r1 = q1 * cos_val - q2 * sin_val;
+        float q_r2 = q1 * sin_val + q2 * cos_val;
+        typedef decltype(q_out[0] + q_out[0]) QOutT;
+        q_out[base_idx + d1] = QOutT(q_r1);
+        q_out[base_idx + d2] = QOutT(q_r2);
 
-            // Apply rotation to Q (with explicit type conversion for bf16)
-            float q_r1 = q1 * cos_val - q2 * sin_val;
-            float q_r2 = q1 * sin_val + q2 * cos_val;
-            typedef decltype(q_out[0] + q_out[0]) QOutT;
-            q_out[base_idx + d1] = QOutT(q_r1);
-            q_out[base_idx + d2] = QOutT(q_r2);
+        // Apply rotation to K (with explicit type conversion for bf16)
+        float k_r1 = k1 * cos_val - k2 * sin_val;
+        float k_r2 = k1 * sin_val + k2 * cos_val;
+        typedef decltype(k_out[0] + k_out[0]) KOutT;
+        k_out[base_idx + d1] = KOutT(k_r1);
+        k_out[base_idx + d2] = KOutT(k_r2);
+    """
 
-            // Apply rotation to K (with explicit type conversion for bf16)
-            float k_r1 = k1 * cos_val - k2 * sin_val;
-            float k_r2 = k1 * sin_val + k2 * cos_val;
-            typedef decltype(k_out[0] + k_out[0]) KOutT;
-            k_out[base_idx + d1] = KOutT(k_r1);
-            k_out[base_idx + d2] = KOutT(k_r2);
-        """
-
-        _rope_qk_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rope_forward_qk",
+        lambda: mx.fast.metal_kernel(
             name="rope_forward_qk",
             input_names=["q", "k", "cos_cache", "sin_cache"],
             output_names=["q_out", "k_out"],
             source=source,
-        )
-
-    return _rope_qk_kernel
+        ),
+    )
 
 
 def precompute_rope_cache(
@@ -368,10 +363,15 @@ def fast_rope(
 
     Returns:
         Rotated tensor of same shape as input.
+
+    Raises:
+        ValueError: If input is not 4D or head_dim is not even.
     """
-    assert x.ndim == 4, "Input must be (batch, seq_len, num_heads, head_dim)"
+    if x.ndim != 4:
+        raise ValueError(f"Input must be 4D (batch, seq_len, num_heads, head_dim), got {x.ndim}D")
     batch_size, seq_len, num_heads, head_dim = x.shape
-    assert head_dim % 2 == 0, "head_dim must be even"
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
 
     # Slice cache to match sequence (with offset)
     cos_slice = cos_cache[offset:offset + seq_len]
@@ -404,12 +404,18 @@ def fast_rope_qk(
 
     Returns:
         Tuple of rotated (q, k) tensors.
+
+    Raises:
+        ValueError: If inputs are not 4D, shapes don't match, or head_dim is not even.
     """
-    assert q.ndim == 4 and k.ndim == 4, "Inputs must be 4D"
-    assert q.shape == k.shape, "Q and K must have same shape for fused kernel"
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError(f"Inputs must be 4D, got q: {q.ndim}D, k: {k.ndim}D")
+    if q.shape != k.shape:
+        raise ValueError(f"Q and K must have same shape for fused kernel, got {q.shape} and {k.shape}")
 
     batch_size, seq_len, num_heads, head_dim = q.shape
-    assert head_dim % 2 == 0, "head_dim must be even"
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
 
     half_dim = head_dim // 2
 
@@ -464,8 +470,8 @@ def rope(
     if use_metal and _USE_METAL_KERNELS:
         try:
             return fast_rope(x, cos_cache, sin_cache, offset)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Metal kernel 'rope' failed, falling back to MLX: %s", e)
 
     # Fallback: Python implementation
     seq_len = x.shape[1]
@@ -515,8 +521,8 @@ def rope_qk(
     if use_metal and _USE_METAL_KERNELS and q.shape == k.shape:
         try:
             return fast_rope_qk(q, k, cos_cache, sin_cache, offset)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Metal kernel 'rope_qk' failed, falling back to separate: %s", e)
 
     # Fallback: apply separately
     q_rot = rope(q, cos_cache, sin_cache, offset, use_metal)

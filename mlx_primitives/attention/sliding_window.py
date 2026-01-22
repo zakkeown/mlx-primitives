@@ -19,23 +19,23 @@ from typing import Optional
 
 import mlx.core as mx
 
+from mlx_primitives.attention._online_softmax import (
+    compute_chunk_attention,
+    online_softmax_merge,
+)
 from mlx_primitives.constants import (
     ATTENTION_MASK_VALUE,
     METAL_ATTENTION_MAX_HEAD_DIM,
     METAL_SOFTMAX_EPSILON,
 )
-from mlx_primitives.attention._online_softmax import (
-    compute_chunk_attention,
-    online_softmax_merge,
-)
 from mlx_primitives.hardware import get_chip_info, get_optimal_attention_config
+from mlx_primitives.kernels._registry import get_kernel
 
 # Check if Metal kernels and SDPA are available
 _HAS_METAL = hasattr(mx.fast, "metal_kernel")
 _HAS_SDPA = hasattr(mx.fast, "scaled_dot_product_attention")
 
-# Kernel cache with thread safety
-_sliding_window_kernel: Optional[mx.fast.metal_kernel] = None
+# Mask lock for thread-safe mask caching (kernel lock moved to registry)
 _sliding_window_lock = threading.Lock()
 
 # Window mask cache (key: (seq_len, window_size, causal) -> additive mask)
@@ -45,14 +45,8 @@ _MAX_MASK_CACHE_SIZE = 32  # Limit cache growth
 
 def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
     """Get or create the sliding window attention kernel (thread-safe)."""
-    global _sliding_window_kernel
-    if _sliding_window_kernel is None:
-        with _sliding_window_lock:
-            # Double-check after acquiring lock
-            if _sliding_window_kernel is not None:
-                return _sliding_window_kernel
-            # Simple version - each thread handles one (batch, head, q_pos)
-            source = """
+    # Simple version - each thread handles one (batch, head, q_pos)
+    source = """
         // Dereference scalar parameters (passed as single-element arrays)
         uint _batch_size = batch_size[0];
         uint _seq_len = seq_len[0];
@@ -123,7 +117,10 @@ def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
             O[q_offset + d] = acc[d] * inv_sum;
         }
         """.replace("SOFTMAX_EPS", str(METAL_SOFTMAX_EPSILON))
-        _sliding_window_kernel = mx.fast.metal_kernel(
+
+    return get_kernel(
+        "sliding_window_attention",
+        lambda: mx.fast.metal_kernel(
             name="sliding_window_attention",
             input_names=[
                 "Q", "K", "V",
@@ -132,8 +129,8 @@ def _get_sliding_window_kernel() -> mx.fast.metal_kernel:
             ],
             output_names=["O"],
             source=source,
-        )
-    return _sliding_window_kernel
+        ),
+    )
 
 
 def _create_sliding_window_additive_mask(
@@ -170,20 +167,14 @@ def _get_cached_window_mask(
     causal: bool,
     dtype: mx.Dtype,
 ) -> mx.array:
-    """Get or create cached sliding window mask."""
+    """Get or create cached sliding window mask (thread-safe)."""
     cache_key = (seq_len, window_size, causal)
 
-    if cache_key in _window_mask_cache:
-        cached = _window_mask_cache[cache_key]
-        # Cast if needed (masks stored as float32)
-        if cached.dtype != dtype:
-            return cached.astype(dtype)
-        return cached
-
+    # All cache access must be protected by the lock to avoid race conditions
     with _sliding_window_lock:
-        # Double-check after lock
         if cache_key in _window_mask_cache:
             cached = _window_mask_cache[cache_key]
+            # Cast if needed (masks stored as float32)
             return cached.astype(dtype) if cached.dtype != dtype else cached
 
         # Create new mask

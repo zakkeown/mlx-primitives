@@ -14,18 +14,14 @@ This module provides GQA implementations that avoid K/V expansion:
 from __future__ import annotations
 
 import math
-import threading
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_primitives.constants import METAL_ATTENTION_MAX_HEAD_DIM
-
-# Kernel caches with thread safety
-_gqa_kernel = None
-_gqa_kernel_tiled = None
-_gqa_kernel_lock = threading.Lock()
+from mlx_primitives.kernels._registry import get_kernel
+from mlx_primitives.utils.masking import create_causal_mask
 
 # Check if metal kernels are available
 _USE_METAL_KERNELS = hasattr(mx.fast, 'metal_kernel')
@@ -45,6 +41,11 @@ def _mlx_fast_gqa(
 
     MLX's SDPA handles GQA natively without K/V expansion.
 
+    Note:
+        This is an internal function. Input validation is performed by the
+        public gqa_attention() wrapper. These assertions are defensive checks
+        that only run in debug mode.
+
     Args:
         q: Query tensor (batch, seq_q, num_q_heads, head_dim).
         k: Key tensor (batch, seq_kv, num_kv_heads, head_dim).
@@ -55,6 +56,17 @@ def _mlx_fast_gqa(
     Returns:
         Output tensor (batch, seq_q, num_q_heads, head_dim).
     """
+    # Defensive assertions for internal function (debug mode only)
+    assert q.ndim == 4, f"_mlx_fast_gqa: Q must be 4D, got {q.ndim}D"
+    assert k.ndim == 4, f"_mlx_fast_gqa: K must be 4D, got {k.ndim}D"
+    assert v.ndim == 4, f"_mlx_fast_gqa: V must be 4D, got {v.ndim}D"
+    assert q.shape[0] == k.shape[0] == v.shape[0], (
+        f"_mlx_fast_gqa: Batch size mismatch: Q={q.shape[0]}, K={k.shape[0]}, V={v.shape[0]}"
+    )
+    assert k.shape[1] == v.shape[1], (
+        f"_mlx_fast_gqa: KV seq_len mismatch: K={k.shape[1]}, V={v.shape[1]}"
+    )
+
     # MLX SDPA expects (batch, heads, seq, dim) layout
     q_t = q.transpose(0, 2, 1, 3)  # (batch, q_heads, seq_q, dim)
     k_t = k.transpose(0, 2, 1, 3)  # (batch, kv_heads, seq_kv, dim)
@@ -80,17 +92,9 @@ def _get_gqa_kernel():
     Each thread processes one (batch, q_head, q_pos) output.
     K/V are indexed using kv_head = q_head / num_groups.
     """
-    global _gqa_kernel
-
-    if _gqa_kernel is None:
-        with _gqa_kernel_lock:
-            # Double-check after acquiring lock
-            if _gqa_kernel is not None:
-                return _gqa_kernel
-
-            # Use constant for array sizes to match METAL_ATTENTION_MAX_HEAD_DIM
-            max_dim = METAL_ATTENTION_MAX_HEAD_DIM
-            source = f"""
+    # Use constant for array sizes to match METAL_ATTENTION_MAX_HEAD_DIM
+    max_dim = METAL_ATTENTION_MAX_HEAD_DIM
+    source = f"""
             uint tid = thread_position_in_grid.x;
 
             // Get dimensions from shapes
@@ -197,14 +201,15 @@ def _get_gqa_kernel():
             }}
             """
 
-            _gqa_kernel = mx.fast.metal_kernel(
-                name="gqa_optimized",
-                input_names=["q", "k", "v", "params"],
-                output_names=["out"],
-                source=source,
-            )
-
-    return _gqa_kernel
+    return get_kernel(
+        "gqa_optimized",
+        lambda: mx.fast.metal_kernel(
+            name="gqa_optimized",
+            input_names=["q", "k", "v", "params"],
+            output_names=["out"],
+            source=source,
+        ),
+    )
 
 
 def _get_gqa_kernel_tiled():
@@ -219,18 +224,10 @@ def _get_gqa_kernel_tiled():
     This provides significant speedup when num_groups > 1 because K/V
     are loaded once and used by multiple Q heads.
     """
-    global _gqa_kernel_tiled
-
-    if _gqa_kernel_tiled is None:
-        with _gqa_kernel_lock:
-            # Double-check after acquiring lock
-            if _gqa_kernel_tiled is not None:
-                return _gqa_kernel_tiled
-
-            # Use constants for array sizes
-            max_dim = METAL_ATTENTION_MAX_HEAD_DIM
-            block_kv = 32  # Must match BLOCK_KV in kernel
-            source = f"""
+    # Use constants for array sizes
+    max_dim = METAL_ATTENTION_MAX_HEAD_DIM
+    block_kv = 32  # Must match BLOCK_KV in kernel
+    source = f"""
             // Block size for Q tiling
             const uint BLOCK_Q = 32;
             const uint BLOCK_KV = 32;
@@ -381,14 +378,15 @@ def _get_gqa_kernel_tiled():
             }}
             """
 
-            _gqa_kernel_tiled = mx.fast.metal_kernel(
-                name="gqa_optimized_tiled",
-                input_names=["q", "k", "v", "params"],
-                output_names=["out"],
-                source=source,
-            )
-
-    return _gqa_kernel_tiled
+    return get_kernel(
+        "gqa_optimized_tiled",
+        lambda: mx.fast.metal_kernel(
+            name="gqa_optimized_tiled",
+            input_names=["q", "k", "v", "params"],
+            output_names=["out"],
+            source=source,
+        ),
+    )
 
 
 def fast_gqa_attention(
@@ -445,6 +443,19 @@ def fast_gqa_attention(
     if head_dim > METAL_ATTENTION_MAX_HEAD_DIM:
         raise ValueError(
             f"head_dim ({head_dim}) exceeds METAL_ATTENTION_MAX_HEAD_DIM ({METAL_ATTENTION_MAX_HEAD_DIM})"
+        )
+
+    # Check for uint32 overflow in Metal shader index calculations.
+    # Metal shaders use uint (32-bit) for computing memory offsets.
+    # Overflow occurs silently, causing data corruption.
+    max_uint32 = 2**31 - 1  # Use signed limit for safety margin
+    total_q_elements = batch_size * seq_q * num_q_heads * head_dim
+    total_kv_elements = batch_size * seq_kv * num_kv_heads * head_dim
+    if total_q_elements > max_uint32 or total_kv_elements > max_uint32:
+        raise ValueError(
+            f"Tensor too large for Metal kernel. "
+            f"Q elements: {total_q_elements:,}, KV elements: {total_kv_elements:,}, "
+            f"max: {max_uint32:,}. Reduce batch size or sequence length."
         )
 
     if scale is None:
@@ -530,12 +541,9 @@ def gqa_attention_reference(
     # Compute attention scores
     scores = (q_t @ k_t.transpose(0, 1, 3, 2)) * scale
 
-    # Causal mask
+    # Causal mask - use centralized utility for consistency across codebase
     if causal:
-        mask = mx.triu(
-            mx.full((seq_q, seq_kv), float("-inf")),
-            k=seq_kv - seq_q + 1,
-        )
+        mask = create_causal_mask(seq_q, seq_kv, dtype=scores.dtype)
         scores = scores + mask
 
     # Softmax and output

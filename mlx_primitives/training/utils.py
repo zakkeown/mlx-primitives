@@ -112,6 +112,15 @@ def unflatten_dict(
 
     for key, value in flat.items():
         parts = key.split(sep)
+
+        # Validate no empty parts (e.g., from malformed keys like "a.b..c")
+        for i, part in enumerate(parts):
+            if not part:
+                raise ValueError(
+                    f"Empty part at position {i} in key '{key}'. "
+                    "This may indicate a malformed checkpoint key (e.g., 'a.b..c')."
+                )
+
         current = result
 
         for i, part in enumerate(parts[:-1]):
@@ -229,7 +238,16 @@ class EMA:
         self.shadow_params = self._ema_update(self.shadow_params, current_params, decay)
 
     def apply_shadow(self) -> None:
-        """Apply EMA weights to model (backup current weights first)."""
+        """Apply EMA weights to model (backup current weights first).
+
+        Raises:
+            RuntimeError: If apply_shadow() is called twice without restore() in between.
+        """
+        if self.backup_params is not None:
+            raise RuntimeError(
+                "apply_shadow() called twice without restore() in between. "
+                "This would overwrite the backup and corrupt model state."
+            )
         self.backup_params = copy_params(self.model.parameters())
         self.model.update(self.shadow_params)
 

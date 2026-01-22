@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Tuple
 
-from mlx_primitives.hardware import ChipFamily, ChipTier, get_chip_info
+from mlx_primitives.hardware import ChipFamily, ChipTier, get_ane_tops, get_chip_info
 
 
 @dataclass(frozen=True)
@@ -44,37 +44,8 @@ class ANECapabilities:
     supports_activations: bool = True
 
 
-# ANE TOPS specifications per chip family
-# Ultra variants have doubled ANE capacity via UltraFusion
-# Source: Apple Silicon specifications and benchmarks
-#
-# NOTE: Only include chips with confirmed, publicly available specs.
-# For unknown or future chips, the code falls back to M1 BASE (11 TOPS).
-_ANE_TOPS: dict[Tuple[ChipFamily, ChipTier], float] = {
-    # M1 family (2020-2022)
-    (ChipFamily.M1, ChipTier.BASE): 11.0,
-    (ChipFamily.M1, ChipTier.PRO): 11.0,
-    (ChipFamily.M1, ChipTier.MAX): 11.0,
-    (ChipFamily.M1, ChipTier.ULTRA): 22.0,
-    # M2 family (2022-2023)
-    (ChipFamily.M2, ChipTier.BASE): 15.8,
-    (ChipFamily.M2, ChipTier.PRO): 15.8,
-    (ChipFamily.M2, ChipTier.MAX): 15.8,
-    (ChipFamily.M2, ChipTier.ULTRA): 31.6,
-    # M3 family (2023-2024)
-    (ChipFamily.M3, ChipTier.BASE): 18.0,
-    (ChipFamily.M3, ChipTier.PRO): 18.0,
-    (ChipFamily.M3, ChipTier.MAX): 18.0,
-    (ChipFamily.M3, ChipTier.ULTRA): 36.0,
-    # M4 family (2024)
-    (ChipFamily.M4, ChipTier.BASE): 38.0,
-    (ChipFamily.M4, ChipTier.PRO): 38.0,
-    (ChipFamily.M4, ChipTier.MAX): 38.0,
-    # M4 Ultra: Not included - M4 Max lacks UltraFusion interconnect
-}
-
-# Default TOPS for unknown chips (conservative M1 BASE estimate)
-_DEFAULT_ANE_TOPS = 11.0
+# NOTE: ANE TOPS lookup is now centralized in mlx_primitives.hardware.detection
+# Use get_ane_tops() from hardware module instead of duplicating the data here
 
 
 def _check_coreml_available() -> bool:
@@ -121,10 +92,17 @@ def _check_coreml_available() -> bool:
         # but it confirms Core ML infrastructure is working
         return True
 
-    except Exception:
-        # Any failure means ANE is not reliably available
-        # This catches: sandbox restrictions, missing entitlements,
-        # hardware not present, etc.
+    except (RuntimeError, OSError, ValueError, ImportError, AttributeError) as e:
+        # Core ML compilation or ANE targeting failed
+        # This catches:
+        # - RuntimeError: shader compilation failures, resource limits
+        # - OSError: sandbox restrictions, missing entitlements
+        # - ValueError: invalid model configuration
+        # - ImportError: missing coremltools submodule
+        # - AttributeError: API changes in coremltools
+        from mlx_primitives.utils.logging import get_logger
+
+        get_logger().debug(f"Core ML ANE check failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -153,8 +131,8 @@ def get_ane_info() -> ANECapabilities:
             max_tensor_size_mb=0,
         )
 
-    # Get TOPS based on chip, falling back to conservative default for unknown chips
-    tops = _ANE_TOPS.get((chip_info.family, chip_info.tier), _DEFAULT_ANE_TOPS)
+    # Get TOPS from hardware module (centralized lookup)
+    tops = get_ane_tops()
 
     # ANE supports fp16 primarily, with some int8 support
     supported_dtypes = ("float16", "float32", "int8")

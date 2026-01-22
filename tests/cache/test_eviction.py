@@ -290,3 +290,90 @@ class TestEvictionPolicyEdgeCases:
         policy = LRUEvictionPolicy()
         priority = policy.get_priority(999)
         assert priority == 0.0
+
+
+class TestEvictionPolicyThreadSafety:
+    """Thread safety tests for eviction policies."""
+
+    def test_lru_concurrent_access(self) -> None:
+        """Test LRU handles concurrent access safely."""
+        import threading
+
+        policy = LRUEvictionPolicy()
+        errors = []
+
+        def worker(seq_id: int) -> None:
+            try:
+                for _ in range(100):
+                    policy.on_create(seq_id)
+                    policy.on_access(seq_id)
+                    policy.get_priority(seq_id)
+                    policy.select_for_eviction([seq_id], 1)
+                    policy.on_delete(seq_id)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+
+    def test_fifo_concurrent_operations(self) -> None:
+        """Test FIFO handles concurrent operations safely."""
+        import threading
+
+        policy = FIFOEvictionPolicy()
+        errors = []
+
+        def creator() -> None:
+            try:
+                for i in range(100):
+                    policy.on_create(i)
+            except Exception as e:
+                errors.append(e)
+
+        def deleter() -> None:
+            try:
+                for i in range(100):
+                    policy.on_delete(i)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=creator),
+            threading.Thread(target=deleter),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+
+
+class TestAttentionScoreEvictionPolicyAdvanced:
+    """Advanced tests for attention score eviction."""
+
+    def test_decay_convergence(self) -> None:
+        """Test that scores converge with consistent input."""
+        policy = AttentionScoreEvictionPolicy(decay_factor=0.9)
+        policy.on_create(1)
+
+        # Repeated 1.0 scores should converge to ~1.0
+        for _ in range(100):
+            policy.update_attention_score(1, 1.0)
+
+        # With decay=0.9, converges to 1.0 * (1-0.9) / (1-(1-0.9)) = 1.0
+        # Actually converges to 1.0 as limit of EMA with constant input
+        priority = policy.get_priority(1)
+        assert priority > 0.9
+
+    def test_attention_score_new_sequence(self) -> None:
+        """Test updating score for non-existent sequence."""
+        policy = AttentionScoreEvictionPolicy()
+        # Should not raise, should create tracking
+        policy.update_attention_score(999, 0.5)
+        assert policy.get_priority(999) == 0.5 * (1 - 0.99)  # Initial update

@@ -24,6 +24,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from mlx_primitives.utils.lock_validator import ordered_lock
+
 if TYPE_CHECKING:
     from mlx_primitives.cache.page_table import PageTable
 
@@ -116,19 +118,19 @@ class LRUEvictionPolicy(EvictionPolicy):
 
     def on_access(self, sequence_id: int) -> None:
         """Update access order - move to end (most recent). O(1) operation."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             if sequence_id in self._access_order:
                 self._access_order.move_to_end(sequence_id)
             self._access_order[sequence_id] = time.time()
 
     def on_create(self, sequence_id: int) -> None:
         """Add new sequence to tracking."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._access_order[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from tracking."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._access_order.pop(sequence_id, None)
 
     def select_for_eviction(
@@ -139,7 +141,7 @@ class LRUEvictionPolicy(EvictionPolicy):
         """Select least recently used sequences."""
         candidate_set = set(candidates)
 
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             # OrderedDict iteration is from oldest to newest
             to_evict = []
             for seq_id in self._access_order:
@@ -152,7 +154,7 @@ class LRUEvictionPolicy(EvictionPolicy):
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on access time (older = lower priority)."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             return self._access_order.get(sequence_id, 0.0)
 
 
@@ -182,12 +184,12 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     def on_create(self, sequence_id: int) -> None:
         """Add new sequence to queue."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._creation_order[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from queue."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._creation_order.pop(sequence_id, None)
 
     def select_for_eviction(
@@ -198,7 +200,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
         """Select oldest sequences."""
         candidate_set = set(candidates)
 
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             to_evict = []
             for seq_id in self._creation_order:
                 if seq_id in candidate_set:
@@ -210,7 +212,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on creation time (older = lower priority)."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             return self._creation_order.get(sequence_id, 0.0)
 
 
@@ -250,18 +252,18 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
 
     def on_access(self, sequence_id: int) -> None:
         """Update access time."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._access_times[sequence_id] = time.time()
 
     def on_create(self, sequence_id: int) -> None:
         """Initialize tracking for new sequence."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._attention_scores[sequence_id] = 0.0
             self._access_times[sequence_id] = time.time()
 
     def on_delete(self, sequence_id: int) -> None:
         """Remove sequence from tracking."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             self._attention_scores.pop(sequence_id, None)
             self._access_times.pop(sequence_id, None)
 
@@ -274,7 +276,7 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
             sequence_id: Sequence ID.
             score: New attention score to incorporate.
         """
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             if sequence_id not in self._attention_scores:
                 self._attention_scores[sequence_id] = 0.0
 
@@ -291,7 +293,7 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
         num_to_evict: int,
     ) -> List[int]:
         """Select sequences with lowest attention scores."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             # Sort by attention score (lowest first)
             scored = [
                 (seq_id, self._attention_scores.get(seq_id, 0.0))
@@ -303,7 +305,7 @@ class AttentionScoreEvictionPolicy(EvictionPolicy):
 
     def get_priority(self, sequence_id: int) -> float:
         """Priority based on attention score (higher = keep longer)."""
-        with self._lock:
+        with ordered_lock("EvictionPolicy", self._lock):
             return self._attention_scores.get(sequence_id, 0.0)
 
 

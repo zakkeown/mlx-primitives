@@ -228,6 +228,13 @@ class KVCache:
         else:
             write_start = start_position
 
+        # Validate write_start to prevent infinite loop on negative values
+        if write_start < 0:
+            raise ValueError(
+                f"Invalid write_start position {write_start}. "
+                f"num_tokens={metadata.num_tokens}, seq_len={seq_len}"
+            )
+
         while tokens_written < seq_len:
             # Calculate block and position
             total_pos = write_start + tokens_written
@@ -284,6 +291,9 @@ class KVCache:
         if position is None:
             # Append mode
             num_new_tokens = k.shape[0]
+            if num_new_tokens == 0:
+                # Early return for empty updates to avoid unnecessary allocation
+                return
             page_table.extend_sequence(layer_seq_id, num_new_tokens)
             self._store_kv(sequence_id, k, v, layer_idx)
         else:
@@ -480,6 +490,21 @@ class KVCache:
             List of user sequence IDs.
         """
         return list(self._sequence_ids.keys())
+
+    def __del__(self) -> None:
+        """Clean up resources when cache is garbage collected.
+
+        Clears all allocators and page tables to help release memory promptly.
+        """
+        # Clear allocators first (they hold the memory pools)
+        if hasattr(self, '_allocators'):
+            for allocator in self._allocators:
+                allocator.clear()
+            self._allocators = None
+        if hasattr(self, '_page_tables'):
+            self._page_tables = None
+        if hasattr(self, '_sequence_ids'):
+            self._sequence_ids = None
 
     def evict_if_needed(
         self,

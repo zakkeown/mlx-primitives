@@ -107,18 +107,22 @@ class StreamingTensor:
             self._mmap = mmap_handle
             self._np_array = np_array
 
-        except Exception:
+        except (IOError, OSError, ValueError, MemoryError) as e:
             # Clean up on failure to prevent handle leaks
+            # Log cleanup failures at debug level for troubleshooting
+            import logging
+            logger = logging.getLogger(__name__)
+
             if mmap_handle is not None:
                 try:
                     mmap_handle.close()
-                except Exception:
-                    pass
+                except (IOError, OSError, BufferError) as cleanup_err:
+                    logger.debug(f"Failed to close mmap during cleanup: {cleanup_err}")
             if file_handle is not None:
                 try:
                     file_handle.close()
-                except Exception:
-                    pass
+                except (IOError, OSError) as cleanup_err:
+                    logger.debug(f"Failed to close file during cleanup: {cleanup_err}")
             raise
 
     def close(self) -> None:
@@ -149,8 +153,12 @@ class StreamingTensor:
         """Clean up resources."""
         try:
             self.close()
-        except Exception:
-            pass  # Ignore errors during cleanup
+        except (IOError, OSError, BufferError, AttributeError):
+            # Ignore expected cleanup errors:
+            # - IOError/OSError: File already closed or invalid
+            # - BufferError: Numpy array still has references
+            # - AttributeError: Object partially initialized
+            pass
 
     def __enter__(self) -> "StreamingTensor":
         """Context manager entry."""

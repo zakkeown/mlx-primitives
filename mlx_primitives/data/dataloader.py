@@ -185,6 +185,8 @@ class DataLoader:
             maxsize=self.num_workers * self.prefetch_factor
         )
         stop_event = threading.Event()
+        # Store worker exceptions to propagate to main thread
+        worker_exception: List[Optional[BaseException]] = [None]
 
         def worker():
             """Worker thread that loads and queues batches."""
@@ -206,6 +208,9 @@ class DataLoader:
                             return
                         batch = [self.dataset[i] for i in indices]
                         prefetch_queue.put(self.collate_fn(batch))
+            except BaseException as e:
+                # Capture exception to propagate to main thread
+                worker_exception[0] = e
             finally:
                 prefetch_queue.put(None)  # Signal completion
 
@@ -217,6 +222,9 @@ class DataLoader:
             while True:
                 batch = prefetch_queue.get()
                 if batch is None:
+                    # Check if worker failed with exception
+                    if worker_exception[0] is not None:
+                        raise worker_exception[0]
                     break
                 yield batch
         finally:

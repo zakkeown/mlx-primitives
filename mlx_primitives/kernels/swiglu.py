@@ -4,72 +4,72 @@ Provides fused SiLU-gated linear unit activation that avoids
 intermediate memory allocation.
 """
 
+import logging
+
 import mlx.core as mx
 
-# Cache compiled kernels
-_swiglu_kernel = None
-_geglu_kernel = None
+from mlx_primitives.constants import GELU_SQRT_2_OVER_PI, GELU_TANH_COEFF
+from mlx_primitives.kernels._registry import get_kernel
+from mlx_primitives.utils import log_fallback
+
+logger = logging.getLogger(__name__)
 
 
 def _get_swiglu_kernel():
     """Get or create the SwiGLU kernel."""
-    global _swiglu_kernel
+    # MLX auto-provides gate_shape when referenced
+    source = """
+        uint idx = thread_position_in_grid.x;
+        uint size = gate_shape[0];  // Flattened array size
+        if (idx >= size) return;
 
-    if _swiglu_kernel is None:
-        # MLX auto-provides gate_shape when referenced
-        source = """
-            uint idx = thread_position_in_grid.x;
-            uint size = gate_shape[0];  // Flattened array size
-            if (idx >= size) return;
+        float g = gate[idx];
+        float u = up[idx];
 
-            float g = gate[idx];
-            float u = up[idx];
+        // SiLU: x * sigmoid(x)
+        float silu_g = g / (1.0f + metal::exp(-g));
+        out[idx] = silu_g * u;
+    """
 
-            // SiLU: x * sigmoid(x)
-            float silu_g = g / (1.0f + metal::exp(-g));
-            out[idx] = silu_g * u;
-        """
-
-        _swiglu_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "swiglu_forward",
+        lambda: mx.fast.metal_kernel(
             name="swiglu_forward",
             input_names=["gate", "up"],
             output_names=["out"],
             source=source,
-        )
-
-    return _swiglu_kernel
+        ),
+    )
 
 
 def _get_geglu_kernel():
     """Get or create the GeGLU kernel."""
-    global _geglu_kernel
+    # MLX auto-provides gate_shape when referenced
+    source = """
+        uint idx = thread_position_in_grid.x;
+        uint size = gate_shape[0];  // Flattened array size
+        if (idx >= size) return;
 
-    if _geglu_kernel is None:
-        # MLX auto-provides gate_shape when referenced
-        source = """
-            uint idx = thread_position_in_grid.x;
-            uint size = gate_shape[0];  // Flattened array size
-            if (idx >= size) return;
+        float g = gate[idx];
+        float u = up[idx];
 
-            float g = gate[idx];
-            float u = up[idx];
+        // GELU approximation (tanh version)
+        const float sqrt_2_over_pi = 0.7978845608f;
+        const float coeff = 0.044715f;
+        float gelu = 0.5f * g * (1.0f + metal::tanh(sqrt_2_over_pi * (g + coeff * g * g * g)));
 
-            // GELU approximation (tanh version)
-            const float sqrt_2_over_pi = 0.7978845608f;
-            const float coeff = 0.044715f;
-            float gelu = 0.5f * g * (1.0f + metal::tanh(sqrt_2_over_pi * (g + coeff * g * g * g)));
+        out[idx] = gelu * u;
+    """
 
-            out[idx] = gelu * u;
-        """
-
-        _geglu_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "geglu_forward",
+        lambda: mx.fast.metal_kernel(
             name="geglu_forward",
             input_names=["gate", "up"],
             output_names=["out"],
             source=source,
-        )
-
-    return _geglu_kernel
+        ),
+    )
 
 
 def _reference_swiglu(gate: mx.array, up: mx.array) -> mx.array:
@@ -88,8 +88,12 @@ def fast_swiglu(gate: mx.array, up: mx.array) -> mx.array:
 
     Returns:
         SwiGLU activation result.
+
+    Raises:
+        ValueError: If gate and up shapes don't match.
     """
-    assert gate.shape == up.shape, "gate and up must have same shape"
+    if gate.shape != up.shape:
+        raise ValueError(f"gate and up must have same shape, got {gate.shape} and {up.shape}")
 
     size = gate.size
 
@@ -133,8 +137,12 @@ def fast_geglu(gate: mx.array, up: mx.array) -> mx.array:
 
     Returns:
         GeGLU activation result.
+
+    Raises:
+        ValueError: If gate and up shapes don't match.
     """
-    assert gate.shape == up.shape, "gate and up must have same shape"
+    if gate.shape != up.shape:
+        raise ValueError(f"gate and up must have same shape, got {gate.shape} and {up.shape}")
 
     kernel = _get_geglu_kernel()
     size = gate.size
@@ -181,8 +189,8 @@ def swiglu(
     if use_metal and _USE_METAL_KERNELS:
         try:
             return fast_swiglu(gate, up)
-        except Exception:
-            pass
+        except Exception as e:
+            log_fallback("swiglu", e, f"gate.shape={gate.shape}, up.shape={up.shape}")
 
     # Fallback: silu(gate) * up
     return mx.sigmoid(gate) * gate * up
@@ -206,11 +214,10 @@ def geglu(
     if use_metal and _USE_METAL_KERNELS:
         try:
             return fast_geglu(gate, up)
-        except Exception:
-            pass
+        except Exception as e:
+            log_fallback("geglu", e, f"gate.shape={gate.shape}, up.shape={up.shape}")
 
     # Fallback: gelu(gate) * up
     # GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    sqrt_2_over_pi = 0.7978845608
     x3 = gate * gate * gate
-    return 0.5 * gate * (1 + mx.tanh(sqrt_2_over_pi * (gate + 0.044715 * x3))) * up
+    return 0.5 * gate * (1 + mx.tanh(GELU_SQRT_2_OVER_PI * (gate + GELU_TANH_COEFF * x3))) * up

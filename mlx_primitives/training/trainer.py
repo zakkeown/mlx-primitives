@@ -231,7 +231,11 @@ class Trainer:
         # Update model
         self.optimizer.update(self.model, grads)
 
-        # Evaluate lazy computation
+        # Evaluate lazy computation to ensure:
+        # 1. Model parameters are updated before next forward pass
+        # 2. Optimizer state is materialized
+        # 3. No race condition with data loading/next backward pass
+        # Note: Gradients don't need eval after optimizer.update() consumes them
         mx.eval(self.model.parameters(), self.optimizer.state)
 
         # Update EMA

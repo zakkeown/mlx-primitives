@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 import mlx.core as mx
 
+from mlx_primitives.utils.dtypes import get_dtype_size
+
 
 @dataclass
 class BlockConfig:
@@ -34,7 +36,9 @@ class BlockConfig:
     def block_memory_bytes(self) -> int:
         """Memory per block in bytes."""
         # K and V for all layers
-        dtype_size = 2 if self.dtype == mx.float16 else 4
+        # Use centralized dtype size utility to correctly handle all dtypes
+        # (float16, bfloat16, int8, etc.)
+        dtype_size = get_dtype_size(self.dtype)
         return (
             self.block_size
             * self.num_kv_heads

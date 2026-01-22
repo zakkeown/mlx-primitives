@@ -37,9 +37,8 @@ from mlx_primitives.kernels.rope import precompute_rope_cache, rope
 # Check for MLX SDPA availability
 _HAS_SDPA = hasattr(mx.fast, "scaled_dot_product_attention")
 
-# Kernel caches (deprecated - kept for backward compatibility)
+# Kernel caches (lazily initialized by getter functions)
 _fused_rope_attention_kernel = None
-_fused_rope_attention_kernel_half = None
 _fused_rope_attention_kernel_cached = None
 _fused_rope_attention_kernel_tiled = None
 
@@ -592,16 +591,22 @@ def fast_fused_rope_attention_tiled(
     Returns:
         Output tensor of shape (batch, seq_q, num_heads, head_dim).
     """
-    assert q.ndim == 4, "Q must be (batch, seq_q, num_heads, head_dim)"
-    assert k.ndim == 4, "K must be (batch, seq_kv, num_heads, head_dim)"
-    assert v.ndim == 4, "V must be (batch, seq_kv, num_heads, head_dim)"
+    if q.ndim != 4:
+        raise ValueError(f"Q must be 4D (batch, seq_q, num_heads, head_dim), got {q.ndim}D")
+    if k.ndim != 4:
+        raise ValueError(f"K must be 4D (batch, seq_kv, num_heads, head_dim), got {k.ndim}D")
+    if v.ndim != 4:
+        raise ValueError(f"V must be 4D (batch, seq_kv, num_heads, head_dim), got {v.ndim}D")
 
     batch_size, seq_q, num_heads, head_dim = q.shape
     _, seq_kv, _, _ = k.shape
 
-    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
-    assert head_dim <= 128, "head_dim must be <= 128 for tiled kernel"
-    assert block_size == 24, "block_size must be 24 (hardcoded in kernel for shared memory with padding)"
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+    if head_dim > 128:
+        raise ValueError(f"head_dim must be <= 128 for tiled kernel, got {head_dim}")
+    if block_size != 24:
+        raise ValueError(f"block_size must be 24 (hardcoded in kernel for shared memory), got {block_size}")
 
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
@@ -681,14 +686,18 @@ def fast_fused_rope_attention(
         >>> cos, sin = precompute_rope_cache(256, 64)
         >>> out = fast_fused_rope_attention(q, k, v, cos_cache=cos, sin_cache=sin, causal=True)
     """
-    assert q.ndim == 4, "Q must be (batch, seq_q, num_heads, head_dim)"
-    assert k.ndim == 4, "K must be (batch, seq_kv, num_heads, head_dim)"
-    assert v.ndim == 4, "V must be (batch, seq_kv, num_heads, head_dim)"
+    if q.ndim != 4:
+        raise ValueError(f"Q must be 4D (batch, seq_q, num_heads, head_dim), got {q.ndim}D")
+    if k.ndim != 4:
+        raise ValueError(f"K must be 4D (batch, seq_kv, num_heads, head_dim), got {k.ndim}D")
+    if v.ndim != 4:
+        raise ValueError(f"V must be 4D (batch, seq_kv, num_heads, head_dim), got {v.ndim}D")
 
     batch_size, seq_q, num_heads, head_dim = q.shape
     _, seq_kv, _, _ = k.shape
 
-    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
 
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
@@ -892,8 +901,14 @@ def _fused_rope_attention_with_vjp(
             return _metal_fused_rope_attention(
                 q, k, v, scale, cos_cache, sin_cache, rope_base, q_offset, kv_offset, causal
             )
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError) as e:
+            from mlx_primitives.utils.logging import log_fallback
+
+            log_fallback(
+                "fused_rope_attention",
+                e,
+                f"shapes: q={q.shape}, k={k.shape}, v={v.shape}",
+            )
     # Fallback to autodiff version
     return _autodiff_rope_attention(q, k, v, scale, rope_base, q_offset, kv_offset, causal)
 

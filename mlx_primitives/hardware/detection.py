@@ -278,9 +278,11 @@ def get_chip_info() -> ChipInfo:
         try:
             device_info = mx.metal.device_info()
             get_logger().debug(f"Metal device info: {device_info}")
-        except Exception as e:
+        except (RuntimeError, AttributeError, OSError) as e:
             # Fallback if Metal not available - DO NOT CACHE
             # This allows retry if Metal becomes available later
+            # Note: Catches RuntimeError (Metal unavailable), AttributeError (no mx.metal),
+            # and OSError (driver issues). Does NOT catch KeyboardInterrupt, SystemExit, etc.
             get_logger().warning(
                 f"Hardware detection failed: {e}. "
                 "Using conservative fallback values (8 GPU cores, 8MB L2 cache). "

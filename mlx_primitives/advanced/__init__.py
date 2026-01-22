@@ -3,9 +3,15 @@
 This module provides advanced building blocks:
 - MoE: Mixture of Experts layers
 - SSM: State Space Models (Mamba)
-- KV Cache: Efficient cache implementations
 - Paged Attention: vLLM-style memory management for serving
 - Quantization: Weight and activation quantization
+
+Note:
+    KV Cache implementations have moved to ``mlx_primitives.cache``.
+    Use the ``create_kv_cache()`` factory function for the recommended API:
+
+    >>> from mlx_primitives.cache import create_kv_cache, CacheType
+    >>> cache = create_kv_cache(CacheType.SIMPLE, batch_size=1, ...)
 """
 
 # Mixture of Experts
@@ -30,7 +36,9 @@ from mlx_primitives.advanced.ssm import (
     H3,
 )
 
-# KV Cache
+# KV Cache - DEPRECATED: These classes are still importable for backwards
+# compatibility, but emit deprecation warnings when instantiated.
+# Users should use mlx_primitives.cache instead.
 from mlx_primitives.advanced.kv_cache import (
     KVCache,
     SlidingWindowCache,
@@ -79,12 +87,12 @@ __all__ = [
     "H3Layer",
     "H3Block",
     "H3",
-    # KV Cache
-    "KVCache",
-    "SlidingWindowCache",
-    "PagedKVCache",
-    "RotatingKVCache",
-    "CompressedKVCache",
+    # KV Cache (DEPRECATED - use mlx_primitives.cache instead)
+    "KVCache",  # Deprecated: use mlx_primitives.cache.SimpleKVCache
+    "SlidingWindowCache",  # Deprecated: use mlx_primitives.cache.SlidingWindowCache
+    "PagedKVCache",  # Deprecated: use mlx_primitives.advanced.paged_attention.PagedKVCache
+    "RotatingKVCache",  # Deprecated: use mlx_primitives.cache.RotatingKVCache
+    "CompressedKVCache",  # Deprecated: use mlx_primitives.cache.CompressedKVCache
     # Paged Attention (vLLM-style)
     "PagedKVCacheV2",
     "BlockManager",

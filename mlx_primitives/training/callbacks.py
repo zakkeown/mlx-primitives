@@ -11,6 +11,7 @@ This module provides callbacks for monitoring and controlling training:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_primitives.training.utils import copy_params, flatten_dict
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -247,7 +250,7 @@ class EarlyStopping(Callback):
                         flatten_dict(state.model.parameters())
                     )
                     if self.verbose:
-                        print(
+                        logger.info(
                             f"EarlyStopping: {self.monitor} improved to {current:.6f}, "
                             f"saved to {self.save_best_to_disk}"
                         )
@@ -255,17 +258,17 @@ class EarlyStopping(Callback):
                     # Store in memory (can OOM on large models)
                     self.best_weights = copy_params(state.model.parameters())
                     if self.verbose:
-                        print(
+                        logger.info(
                             f"EarlyStopping: {self.monitor} improved to {current:.6f}"
                         )
             elif self.verbose:
-                print(
+                logger.info(
                     f"EarlyStopping: {self.monitor} improved to {current:.6f}"
                 )
         else:
             self.wait += 1
             if self.verbose:
-                print(
+                logger.info(
                     f"EarlyStopping: {self.monitor} did not improve. "
                     f"Patience: {self.wait}/{self.patience}"
                 )
@@ -274,7 +277,7 @@ class EarlyStopping(Callback):
                 self.stop_training = True
                 state.stop_training = True  # Set state flag for trainer to check
                 if self.verbose:
-                    print(
+                    logger.info(
                         f"EarlyStopping: Stopping training at epoch {state.epoch}. "
                         f"Best {self.monitor}: {self.best_value:.6f} at epoch {self.best_epoch}"
                     )
@@ -287,7 +290,7 @@ class EarlyStopping(Callback):
             # Load from disk
             state.model.load_weights(str(self.save_best_to_disk))
             if self.verbose:
-                print(
+                logger.info(
                     f"EarlyStopping: Restored best weights from {self.save_best_to_disk} "
                     f"(epoch {self.best_epoch})"
                 )
@@ -295,7 +298,7 @@ class EarlyStopping(Callback):
             # Load from memory
             state.model.update(self.best_weights)
             if self.verbose:
-                print(f"EarlyStopping: Restored best weights from epoch {self.best_epoch}")
+                logger.info(f"EarlyStopping: Restored best weights from epoch {self.best_epoch}")
 
 
 class ModelCheckpoint(Callback):
@@ -376,7 +379,7 @@ class ModelCheckpoint(Callback):
                 self.best_value = current
                 self._save_checkpoint(state, "best")
                 if self.verbose:
-                    print(
+                    logger.info(
                         f"ModelCheckpoint: {self.monitor} improved to {current:.6f}, "
                         f"saving checkpoint"
                     )
@@ -391,7 +394,7 @@ class ModelCheckpoint(Callback):
             mx.save_safetensors(str(checkpoint_path), flatten_dict(weights))
 
             if self.verbose:
-                print(f"ModelCheckpoint: Saved checkpoint to {checkpoint_path}")
+                logger.info(f"ModelCheckpoint: Saved checkpoint to {checkpoint_path}")
 
             # Track saved checkpoints for cleanup
             if name != "best" and checkpoint_path not in self.saved_checkpoints:
@@ -405,7 +408,7 @@ class ModelCheckpoint(Callback):
             if old_checkpoint.exists():
                 old_checkpoint.unlink()
                 if self.verbose:
-                    print(f"ModelCheckpoint: Removed old checkpoint {old_checkpoint}")
+                    logger.info(f"ModelCheckpoint: Removed old checkpoint {old_checkpoint}")
 
 
 class LRMonitor(Callback):
@@ -432,7 +435,7 @@ class LRMonitor(Callback):
         if state.step % self.log_every_n_steps == 0:
             self.lr_history.append((state.step, state.learning_rate))
             if self.verbose:
-                print(f"Step {state.step}: lr = {state.learning_rate:.2e}")
+                logger.info(f"Step {state.step}: lr = {state.learning_rate:.2e}")
 
 
 class GradientMonitor(Callback):
@@ -472,19 +475,19 @@ class GradientMonitor(Callback):
         if state.step % self.log_every_n_steps == 0:
             self.grad_norm_history.append((state.step, grad_norm))
             if self.verbose:
-                print(f"Step {state.step}: grad_norm = {grad_norm:.4f}")
+                logger.info(f"Step {state.step}: grad_norm = {grad_norm:.4f}")
 
         # Warn about potential issues
         if grad_norm < self.warn_threshold_low:
             if self.verbose:
-                print(
-                    f"Warning: Vanishing gradients detected at step {state.step}. "
+                logger.warning(
+                    f"Vanishing gradients detected at step {state.step}. "
                     f"Grad norm: {grad_norm:.2e}"
                 )
         elif grad_norm > self.warn_threshold_high:
             if self.verbose:
-                print(
-                    f"Warning: Exploding gradients detected at step {state.step}. "
+                logger.warning(
+                    f"Exploding gradients detected at step {state.step}. "
                     f"Grad norm: {grad_norm:.2e}"
                 )
 
@@ -516,17 +519,17 @@ class ProgressCallback(Callback):
 
     def on_train_begin(self, state: TrainingState) -> None:
         self.train_start_time = time.time()
-        print("Training started")
+        logger.info("Training started")
 
     def on_train_end(self, state: TrainingState) -> None:
         if self.train_start_time is not None:
             elapsed = time.time() - self.train_start_time
-            print(f"Training completed in {self._format_time(elapsed)}")
+            logger.info(f"Training completed in {self._format_time(elapsed)}")
 
     def on_epoch_begin(self, state: TrainingState) -> None:
         self.epoch_start_time = time.time()
-        print(f"\nEpoch {state.epoch + 1}")
-        print("-" * 40)
+        logger.info(f"Epoch {state.epoch + 1}")
+        logger.info("-" * 40)
 
     def on_epoch_end(self, state: TrainingState) -> None:
         if self.epoch_start_time is not None:
@@ -534,9 +537,9 @@ class ProgressCallback(Callback):
             metrics_str = ", ".join(
                 f"{k}: {v:.4f}" for k, v in state.metrics.items()
             )
-            print(f"Epoch {state.epoch + 1} completed in {self._format_time(elapsed)}")
+            logger.info(f"Epoch {state.epoch + 1} completed in {self._format_time(elapsed)}")
             if metrics_str:
-                print(f"Metrics: {metrics_str}")
+                logger.info(f"Metrics: {metrics_str}")
 
     def on_step_end(self, state: TrainingState) -> None:
         if state.step % self.log_every_n_steps == 0:
@@ -552,7 +555,7 @@ class ProgressCallback(Callback):
                     eta = time_per_step * remaining_steps
                     eta_str = f" | ETA: {self._format_time(eta)}"
 
-            print(f"Step {state.step}: {loss_str} | {lr_str}{eta_str}")
+            logger.info(f"Step {state.step}: {loss_str} | {lr_str}{eta_str}")
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds as human-readable string."""
@@ -736,9 +739,9 @@ class WandbCallback(Callback):
                 notes=self.notes,
                 reinit=True,
             )
-            print(f"WandbCallback: Initialized run {self._run.name}")
+            logger.info(f"WandbCallback: Initialized run {self._run.name}")
         except ImportError:
-            print("WandbCallback: wandb not installed. Install with 'pip install wandb'")
+            logger.warning("WandbCallback: wandb not installed. Install with 'pip install wandb'")
             self._wandb = None
 
     def on_train_end(self, state: TrainingState) -> None:
@@ -776,7 +779,7 @@ class WandbCallback(Callback):
                         os.remove(temp_path)
 
             self._wandb.finish()
-            print("WandbCallback: Run finished")
+            logger.info("WandbCallback: Run finished")
 
     def on_step_end(self, state: TrainingState) -> None:
         if self._wandb is None:
@@ -870,9 +873,9 @@ class TensorBoardCallback(Callback):
                 log_dir=str(self.log_dir),
                 flush_secs=self.flush_secs,
             )
-            print(f"TensorBoardCallback: Logging to {self.log_dir}")
+            logger.info(f"TensorBoardCallback: Logging to {self.log_dir}")
         except ImportError:
-            print(
+            logger.warning(
                 "TensorBoardCallback: tensorboard not installed. "
                 "Install with 'pip install tensorboard'"
             )
@@ -881,7 +884,7 @@ class TensorBoardCallback(Callback):
     def on_train_end(self, state: TrainingState) -> None:
         if self._writer is not None:
             self._writer.close()
-            print("TensorBoardCallback: Writer closed")
+            logger.info("TensorBoardCallback: Writer closed")
 
     def on_step_end(self, state: TrainingState) -> None:
         if self._writer is None:

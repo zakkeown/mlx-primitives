@@ -14,6 +14,14 @@ from mlx_primitives.utils.dtypes import (
     mlx_to_numpy_dtype,
     numpy_to_mlx_dtype,
 )
+from mlx_primitives.utils.exceptions import (
+    CoreMLError,
+    HardwareDetectionError,
+    MetalKernelError,
+    MLXPrimitivesError,
+    MMapError,
+    QuantizationError,
+)
 from mlx_primitives.utils.logging import (
     get_logger,
     has_metal_kernels,
@@ -37,6 +45,13 @@ __all__: list[str] = [
     "is_integer",
     "mlx_to_numpy_dtype",
     "numpy_to_mlx_dtype",
+    # Exceptions
+    "CoreMLError",
+    "HardwareDetectionError",
+    "MetalKernelError",
+    "MLXPrimitivesError",
+    "MMapError",
+    "QuantizationError",
     # Logging
     "get_logger",
     "has_metal_kernels",

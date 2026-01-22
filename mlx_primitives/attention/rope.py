@@ -3,6 +3,13 @@
 Implementation based on the RoFormer paper:
 "RoFormer: Enhanced Transformer with Rotary Position Embedding"
 https://arxiv.org/abs/2104.09864
+
+This module provides:
+- High-level RoPE classes (RoPE, NTKAwareRoPE, YaRNRoPE) for easy integration
+- Automatic Metal acceleration via kernels/rope.py when available
+- Full gradient support through custom VJP implementations
+
+For direct Metal kernel access, use mlx_primitives.kernels.rope instead.
 """
 
 from __future__ import annotations
@@ -13,6 +20,23 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+# Import Metal-accelerated implementations when available
+try:
+    from mlx_primitives.kernels.rope import (
+        rope as _metal_rope,
+        rope_qk as _metal_rope_qk,
+        precompute_rope_cache as _metal_precompute_cache,
+        _USE_METAL_KERNELS,
+    )
+    _HAS_METAL_ROPE = _USE_METAL_KERNELS
+except ImportError:
+    _HAS_METAL_ROPE = False
+    _metal_rope = None
+    _metal_rope_qk = None
+    _metal_precompute_cache = None
+
+from mlx_primitives.utils.logging import log_fallback
+
 
 def _rotate_half(x: mx.array) -> mx.array:
     """Rotate half the hidden dims of the input.
@@ -21,13 +45,22 @@ def _rotate_half(x: mx.array) -> mx.array:
     dimension and swaps/negates the halves to implement the rotation.
 
     Args:
-        x: Input tensor of shape (..., dim) where dim is even.
+        x: Input tensor of shape (..., dim) where dim must be even.
 
     Returns:
         Rotated tensor of same shape as input.
+
+    Raises:
+        ValueError: If the last dimension is not even.
     """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"RoPE requires even head dimension, got {x.shape[-1]}. "
+            "Odd dimensions would cause silent data truncation."
+        )
+    half_dim = x.shape[-1] // 2
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:]
     return mx.concatenate([-x2, x1], axis=-1)
 
 
@@ -78,8 +111,12 @@ def apply_rope(
     offset: int = 0,
     cos_doubled: mx.array | None = None,
     sin_doubled: mx.array | None = None,
+    use_metal: bool = True,
 ) -> Tuple[mx.array, mx.array]:
     """Apply rotary position embeddings to query and key tensors.
+
+    Automatically uses Metal-accelerated kernels when available for 4D inputs,
+    with full gradient support. Falls back to Python implementation otherwise.
 
     Args:
         q: Query tensor of shape (..., seq_len, num_heads, head_dim) or
@@ -90,13 +127,23 @@ def apply_rope(
         sin: Precomputed sine tensor of shape (max_seq_len, head_dim // 2).
         offset: Position offset for incremental decoding.
         cos_doubled: Optional precomputed doubled cos (max_seq_len, head_dim).
-            If provided, avoids per-call concatenation.
+            If provided, avoids per-call concatenation. Ignored when using Metal.
         sin_doubled: Optional precomputed doubled sin (max_seq_len, head_dim).
-            If provided, avoids per-call concatenation.
+            If provided, avoids per-call concatenation. Ignored when using Metal.
+        use_metal: Whether to use Metal kernels when available (default: True).
 
     Returns:
         Tuple of rotated (q, k) tensors with same shapes as input.
     """
+    # Try Metal-accelerated path for 4D inputs
+    if use_metal and _HAS_METAL_ROPE and q.ndim == 4 and k.ndim == 4:
+        try:
+            # Metal kernels use half_dim cos/sin directly (not doubled)
+            return _metal_rope_qk(q, k, cos, sin, offset, use_metal=True)
+        except Exception as e:
+            log_fallback("rope_qk", e, f"q.shape={q.shape}, k.shape={k.shape}")
+
+    # Python fallback implementation
     # Get sequence length from queries
     # Handle both (batch, seq, heads, dim) and (batch, seq, dim) formats
     if q.ndim == 4:

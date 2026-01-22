@@ -40,7 +40,7 @@ class SimpleKVCache:
         num_heads: int,
         head_dim: int,
         max_seq_len: int,
-        dtype: mx.Dtype = mx.float32,
+        dtype: mx.Dtype = mx.float16,
     ):
         """Initialize the cache.
 
@@ -49,7 +49,7 @@ class SimpleKVCache:
             num_heads: Number of attention heads.
             head_dim: Dimension per head.
             max_seq_len: Maximum sequence length to cache.
-            dtype: Data type for storage.
+            dtype: Data type for storage (default: float16 for memory efficiency).
         """
         self._batch_size = batch_size
         self._num_heads = num_heads
@@ -165,6 +165,11 @@ class SimpleKVCache:
             raise ValueError(f"Invalid reset length: {length}")
         self._current_len = length
 
+    def __del__(self) -> None:
+        """Clean up cache memory when garbage collected."""
+        self._k_cache = None
+        self._v_cache = None
+
 
 class SlidingWindowCache:
     """Sliding window KV cache for long context attention.
@@ -189,7 +194,7 @@ class SlidingWindowCache:
         num_heads: int,
         head_dim: int,
         window_size: int,
-        dtype: mx.Dtype = mx.float32,
+        dtype: mx.Dtype = mx.float16,
     ):
         """Initialize sliding window cache.
 
@@ -198,7 +203,7 @@ class SlidingWindowCache:
             num_heads: Number of attention heads.
             head_dim: Dimension per head.
             window_size: Number of recent tokens to keep.
-            dtype: Data type for storage.
+            dtype: Data type for storage (default: float16 for memory efficiency).
         """
         self._batch_size = batch_size
         self._num_heads = num_heads
@@ -329,6 +334,11 @@ class SlidingWindowCache:
         self._current_len = 0
         self._total_seen = 0
 
+    def __del__(self) -> None:
+        """Clean up cache memory when garbage collected."""
+        self._k_cache = None
+        self._v_cache = None
+
 
 class RotatingKVCache:
     """Rotating (circular buffer) KV cache.
@@ -354,7 +364,7 @@ class RotatingKVCache:
         num_heads: int,
         head_dim: int,
         max_size: int,
-        dtype: mx.Dtype = mx.float32,
+        dtype: mx.Dtype = mx.float16,
     ):
         """Initialize rotating cache.
 
@@ -363,7 +373,7 @@ class RotatingKVCache:
             num_heads: Number of attention heads.
             head_dim: Dimension per head.
             max_size: Maximum number of tokens to store.
-            dtype: Data type for storage.
+            dtype: Data type for storage (default: float16 for memory efficiency).
         """
         self._batch_size = batch_size
         self._num_heads = num_heads
@@ -489,3 +499,8 @@ class RotatingKVCache:
         self._v_cache = mx.zeros_like(self._v_cache)
         self._write_pos = 0
         self._filled = False
+
+    def __del__(self) -> None:
+        """Clean up cache memory when garbage collected."""
+        self._k_cache = None
+        self._v_cache = None

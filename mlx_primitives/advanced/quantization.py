@@ -1028,8 +1028,15 @@ class GPTQLinear(nn.Module):
             # We'll compute H_inv columns as needed, but for block processing
             # we need the full inverse for the block
             Hinv = mx.linalg.inv(H_damped)
-        except Exception:
-            # Fallback to simple quantization if Hessian is singular
+        except (RuntimeError, ValueError) as e:
+            # Hessian is singular or not positive definite - use simpler quantization
+            from mlx_primitives.utils.logging import log_fallback
+
+            log_fallback(
+                "GPTQ Hessian inversion",
+                e,
+                "falling back to simple quantization",
+            )
             self._simple_quantize(W)
             return
 

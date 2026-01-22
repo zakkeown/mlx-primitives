@@ -4,6 +4,7 @@ This module provides optimized attention variants including:
 - Sliding window attention (fused Metal kernel)
 - Flash Attention (O(n) memory via tiled online softmax)
 - Chunked cross-attention for very long KV sequences
+- Rotary Position Embeddings (RoPE) with Metal acceleration
 """
 
 from mlx_primitives.attention.sliding_window import (
@@ -21,6 +22,13 @@ from mlx_primitives.attention.chunked import (
     chunked_cross_attention,
     estimate_memory_savings,
 )
+from mlx_primitives.attention.rope import (
+    RoPE,
+    NTKAwareRoPE,
+    YaRNRoPE,
+    apply_rope,
+    precompute_freqs_cis,
+)
 
 __all__ = [
     # Sliding window
@@ -35,4 +43,10 @@ __all__ = [
     "chunked_cross_attention",
     "ChunkedCrossAttention",
     "estimate_memory_savings",
+    # RoPE
+    "RoPE",
+    "NTKAwareRoPE",
+    "YaRNRoPE",
+    "apply_rope",
+    "precompute_freqs_cis",
 ]

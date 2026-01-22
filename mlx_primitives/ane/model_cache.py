@@ -200,8 +200,8 @@ class CoreMLModelCache:
             # Disk full, permissions, etc. - log but don't fail
             logger.warning(f"Failed to save Core ML model to {path}: {e}")
         except Exception as e:
-            # Other unexpected errors - log at debug level
-            logger.debug(f"Unexpected error saving Core ML model to {path}: {e}")
+            # Other unexpected errors - log at warning level since they are unexpected
+            logger.warning(f"Unexpected error saving Core ML model to {path}: {e}")
 
     def clear_memory_cache(self) -> None:
         """Clear in-memory cache."""

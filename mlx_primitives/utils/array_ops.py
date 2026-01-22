@@ -147,8 +147,17 @@ def scatter_where(
     # Use a loop-based approach since MLX doesn't have scatter_add with indices
     # This is O(capacity) GPU operations, not ideal but workable
     count_val = int(count.item())
+    if count_val == 0:
+        return output
+
+    # Batch the indices extraction to avoid O(n) GPU syncs in the loop.
+    # Previously, indices[i].item() was called per iteration causing a sync each time.
+    # Now we sync once with eval+tolist, reducing O(n) syncs to O(1).
+    valid_indices = indices[:count_val]
+    mx.eval(valid_indices)
+    idx_list = valid_indices.tolist()
+
     for i in range(count_val):
-        idx = int(indices[i].item())
-        output = output.at[idx].add(gathered[i])
+        output = output.at[idx_list[i]].add(gathered[i])
 
     return output

@@ -4,110 +4,108 @@ Provides fused layer normalization that computes mean, variance, and
 normalization in a single pass per row.
 """
 
+import logging
 from typing import Optional
+
 import mlx.core as mx
 
-# Cache compiled kernels
-_layernorm_kernel = None
-_layernorm_affine_kernel = None
+from mlx_primitives.kernels._registry import get_kernel
+
+logger = logging.getLogger(__name__)
 
 
 def _get_layernorm_kernel():
     """Get or create the LayerNorm kernel (no affine params)."""
-    global _layernorm_kernel
+    # Each thread handles one row, computes mean+var in 2 passes
+    source = """
+        uint row_idx = thread_position_in_grid.x;
 
-    if _layernorm_kernel is None:
-        # Each thread handles one row, computes mean+var in 2 passes
-        source = """
-            uint row_idx = thread_position_in_grid.x;
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint hidden_dim = x_shape[2];
+        uint total_rows = batch_size * seq_len;
 
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint hidden_dim = x_shape[2];
-            uint total_rows = batch_size * seq_len;
+        if (row_idx >= total_rows) return;
 
-            if (row_idx >= total_rows) return;
+        uint row_offset = row_idx * hidden_dim;
 
-            uint row_offset = row_idx * hidden_dim;
+        // Pass 1: Compute mean
+        float sum = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            sum += x[row_offset + i];
+        }
+        float mean = sum / float(hidden_dim);
 
-            // Pass 1: Compute mean
-            float sum = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                sum += x[row_offset + i];
-            }
-            float mean = sum / float(hidden_dim);
+        // Pass 2: Compute variance
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float diff = x[row_offset + i] - mean;
+            sum_sq += diff * diff;
+        }
+        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
 
-            // Pass 2: Compute variance
-            float sum_sq = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float diff = x[row_offset + i] - mean;
-                sum_sq += diff * diff;
-            }
-            float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        // Pass 3: Normalize
+        for (uint i = 0; i < hidden_dim; i++) {
+            out[row_offset + i] = (x[row_offset + i] - mean) * var_inv;
+        }
+    """
 
-            // Pass 3: Normalize
-            for (uint i = 0; i < hidden_dim; i++) {
-                out[row_offset + i] = (x[row_offset + i] - mean) * var_inv;
-            }
-        """
-
-        _layernorm_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "layernorm_forward",
+        lambda: mx.fast.metal_kernel(
             name="layernorm_forward",
             input_names=["x"],
             output_names=["out"],
             source=source,
-        )
-
-    return _layernorm_kernel
+        ),
+    )
 
 
 def _get_layernorm_affine_kernel():
     """Get or create the LayerNorm kernel with affine params (gamma, beta)."""
-    global _layernorm_affine_kernel
+    source = """
+        uint row_idx = thread_position_in_grid.x;
 
-    if _layernorm_affine_kernel is None:
-        source = """
-            uint row_idx = thread_position_in_grid.x;
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint hidden_dim = x_shape[2];
+        uint total_rows = batch_size * seq_len;
 
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint hidden_dim = x_shape[2];
-            uint total_rows = batch_size * seq_len;
+        if (row_idx >= total_rows) return;
 
-            if (row_idx >= total_rows) return;
+        uint row_offset = row_idx * hidden_dim;
 
-            uint row_offset = row_idx * hidden_dim;
+        // Pass 1: Compute mean
+        float sum = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            sum += x[row_offset + i];
+        }
+        float mean = sum / float(hidden_dim);
 
-            // Pass 1: Compute mean
-            float sum = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                sum += x[row_offset + i];
-            }
-            float mean = sum / float(hidden_dim);
+        // Pass 2: Compute variance
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float diff = x[row_offset + i] - mean;
+            sum_sq += diff * diff;
+        }
+        float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
 
-            // Pass 2: Compute variance
-            float sum_sq = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float diff = x[row_offset + i] - mean;
-                sum_sq += diff * diff;
-            }
-            float var_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        // Pass 3: Normalize with affine transform
+        for (uint i = 0; i < hidden_dim; i++) {
+            float normalized = (x[row_offset + i] - mean) * var_inv;
+            out[row_offset + i] = normalized * gamma[i] + beta[i];
+        }
+    """
 
-            // Pass 3: Normalize with affine transform
-            for (uint i = 0; i < hidden_dim; i++) {
-                float normalized = (x[row_offset + i] - mean) * var_inv;
-                out[row_offset + i] = normalized * gamma[i] + beta[i];
-            }
-        """
-
-        _layernorm_affine_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "layernorm_affine_forward",
+        lambda: mx.fast.metal_kernel(
             name="layernorm_affine_forward",
             input_names=["x", "gamma", "beta"],
             output_names=["out"],
             source=source,
-        )
-
-    return _layernorm_affine_kernel
+        ),
+    )
 
 
 def _reference_layernorm(
@@ -225,8 +223,8 @@ def layernorm(
     if use_metal and _USE_METAL_KERNELS:
         try:
             return fast_layernorm(x, gamma, beta, eps)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Metal kernel 'layernorm' failed, falling back to MLX: %s", e)
 
     # Fallback to pure MLX
     mean = mx.mean(x, axis=-1, keepdims=True)

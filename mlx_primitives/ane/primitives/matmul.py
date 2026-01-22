@@ -191,8 +191,16 @@ def _compile_matmul_model(spec: ModelSpec) -> "ct.models.MLModel":
         )
         return model
 
-    except Exception:
+    except (ImportError, AttributeError, RuntimeError) as e:
+        # ML Program API unavailable (coremltools < 7.0) or conversion failed
         # Fallback to older neural network API
+        from mlx_primitives.utils.logging import log_fallback
+
+        log_fallback(
+            "Core ML ML Program API",
+            e,
+            "using legacy NeuralNetworkBuilder",
+        )
         input_features = [
             ("a", ct.models.datatypes.Array(*a_shape)),
             ("b", ct.models.datatypes.Array(*b_shape)),

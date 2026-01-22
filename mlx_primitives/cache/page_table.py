@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from mlx_primitives.cache.block_allocator import BlockAllocator
+from mlx_primitives.utils.lock_validator import ordered_lock
 
 
 @dataclass
@@ -111,7 +112,7 @@ class PageTable:
     @property
     def num_sequences(self) -> int:
         """Number of active sequences."""
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             return len(self._sequences)
 
     @property
@@ -135,7 +136,7 @@ class PageTable:
         Returns:
             New sequence ID.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             sequence_id = self._next_sequence_id
             self._next_sequence_id += 1
 
@@ -186,7 +187,7 @@ class PageTable:
         Raises:
             KeyError: If sequence doesn't exist.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 raise KeyError(f"Sequence {sequence_id} not found")
 
@@ -209,7 +210,7 @@ class PageTable:
             sequence_id: Sequence to truncate.
             new_length: New number of tokens (must be <= current).
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 raise KeyError(f"Sequence {sequence_id} not found")
 
@@ -247,7 +248,7 @@ class PageTable:
         Returns:
             New forked sequence ID.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 raise KeyError(f"Sequence {sequence_id} not found")
 
@@ -283,7 +284,7 @@ class PageTable:
         Returns:
             List of physical block indices.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 raise KeyError(f"Sequence {sequence_id} not found")
 
@@ -305,7 +306,7 @@ class PageTable:
         Returns:
             Block table tensor of shape (batch, max_blocks) with -1 padding.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if not sequence_ids:
                 return mx.array([], dtype=mx.int32)
 
@@ -339,7 +340,7 @@ class PageTable:
         Returns:
             Context lengths tensor of shape (batch,).
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             lengths = [self._sequences[sid].num_tokens for sid in sequence_ids]
             return mx.array(lengths, dtype=mx.int32)
 
@@ -352,7 +353,7 @@ class PageTable:
         Returns:
             Sequence metadata.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 raise KeyError(f"Sequence {sequence_id} not found")
             return self._sequences[sequence_id]
@@ -367,7 +368,7 @@ class PageTable:
         Returns:
             Tuple of (block_id, position_in_block).
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             metadata = self._sequences[sequence_id]
             block_idx = token_idx // self.block_size
             pos_in_block = token_idx % self.block_size
@@ -379,7 +380,7 @@ class PageTable:
         Args:
             sequence_id: Sequence to delete.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             if sequence_id not in self._sequences:
                 return
 
@@ -396,7 +397,7 @@ class PageTable:
         Returns:
             List of sequence IDs.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             return list(self._sequences.keys())
 
     def get_sequences_by_access_time(self, ascending: bool = True) -> List[int]:
@@ -408,7 +409,7 @@ class PageTable:
         Returns:
             Sorted list of sequence IDs.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             return sorted(
                 self._sequences.keys(),
                 key=lambda sid: self._sequences[sid].last_access_time,
@@ -417,7 +418,7 @@ class PageTable:
 
     def clear(self) -> None:
         """Delete all sequences."""
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             for seq_id in list(self._sequences.keys()):
                 # delete_sequence is re-entrant with RLock
                 self.delete_sequence(seq_id)
@@ -428,7 +429,7 @@ class PageTable:
         Returns:
             Dictionary with statistics.
         """
-        with self._lock:
+        with ordered_lock("PageTable", self._lock):
             num_seqs = len(self._sequences)
             total_tokens = sum(m.num_tokens for m in self._sequences.values())
             total_blocks = sum(len(m.block_table) for m in self._sequences.values())

@@ -29,6 +29,33 @@ from mlx_primitives.training import (
     checkpoint_sequential,
 )
 
+# Cache management
+from mlx_primitives.cache import (
+    create_kv_cache,
+    KVCache,
+    KVCacheConfig,
+    MultiLayerKVCache,
+    SimpleKVCache,
+    SlidingWindowCache,
+    RotatingKVCache,
+    CompressedKVCache,
+    paged_attention,
+)
+
+# Hardware detection
+from mlx_primitives.hardware import (
+    get_chip_info,
+    ChipFamily,
+    ChipTier,
+)
+
+# Type-safe enums
+from mlx_primitives.constants import (
+    Layout,
+    CacheType,
+    EvictionPolicy,
+)
+
 __version__ = "0.2.0"
 
 __all__ = [
@@ -51,4 +78,22 @@ __all__ = [
     # Training
     "checkpoint",
     "checkpoint_sequential",
+    # Cache
+    "create_kv_cache",
+    "KVCache",
+    "KVCacheConfig",
+    "MultiLayerKVCache",
+    "SimpleKVCache",
+    "SlidingWindowCache",
+    "RotatingKVCache",
+    "CompressedKVCache",
+    "paged_attention",
+    # Hardware
+    "get_chip_info",
+    "ChipFamily",
+    "ChipTier",
+    # Enums
+    "Layout",
+    "CacheType",
+    "EvictionPolicy",
 ]

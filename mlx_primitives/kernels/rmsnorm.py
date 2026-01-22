@@ -5,66 +5,64 @@ the normalization computation into a single kernel pass, with full VJP
 (backward pass) support for automatic differentiation.
 """
 
-from pathlib import Path
-from typing import Optional, Tuple
+import logging
+from typing import Tuple
 
 import mlx.core as mx
 
-# Cache compiled kernels
-_rmsnorm_kernel = None
-_rmsnorm_backward_kernel = None
-_rmsnorm_residual_kernel = None
+from mlx_primitives.kernels._registry import get_kernel
+from mlx_primitives.utils import log_fallback
+
+logger = logging.getLogger(__name__)
 
 
 def _get_rmsnorm_kernel():
     """Get or create the RMSNorm kernel."""
-    global _rmsnorm_kernel
+    # Simple element-wise kernel - each thread handles one row
+    # MLX auto-provides x_shape, x_strides, x_ndim when referenced
+    source = """
+        // Get row index from grid position
+        uint row_idx = thread_position_in_grid.x;
 
-    if _rmsnorm_kernel is None:
-        # Simple element-wise kernel - each thread handles one row
-        # MLX auto-provides x_shape, x_strides, x_ndim when referenced
-        source = """
-            // Get row index from grid position
-            uint row_idx = thread_position_in_grid.x;
+        // Get dimensions from input shape (auto-provided by MLX)
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint hidden_dim = x_shape[2];
+        uint total_rows = batch_size * seq_len;
 
-            // Get dimensions from input shape (auto-provided by MLX)
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint hidden_dim = x_shape[2];
-            uint total_rows = batch_size * seq_len;
+        if (row_idx >= total_rows) return;
 
-            if (row_idx >= total_rows) return;
+        uint row_offset = row_idx * hidden_dim;
 
-            uint row_offset = row_idx * hidden_dim;
+        // Compute sum of squares
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float val = x[row_offset + i];
+            sum_sq += val * val;
+        }
 
-            // Compute sum of squares
-            float sum_sq = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float val = x[row_offset + i];
-                sum_sq += val * val;
-            }
+        // Compute RMS inverse
+        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
 
-            // Compute RMS inverse
-            float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        // Get output type for explicit casting (required for bf16)
+        typedef decltype(out[0] + out[0]) OutT;
 
-            // Get output type for explicit casting (required for bf16)
-            typedef decltype(out[0] + out[0]) OutT;
+        // Normalize and scale
+        for (uint i = 0; i < hidden_dim; i++) {
+            float val = x[row_offset + i];
+            out[row_offset + i] = OutT(val * rms_inv * weight[i]);
+        }
+    """
 
-            // Normalize and scale
-            for (uint i = 0; i < hidden_dim; i++) {
-                float val = x[row_offset + i];
-                out[row_offset + i] = OutT(val * rms_inv * weight[i]);
-            }
-        """
-
-        _rmsnorm_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rmsnorm_forward",
+        lambda: mx.fast.metal_kernel(
             name="rmsnorm_forward",
             input_names=["x", "weight"],
             output_names=["out"],
             source=source,
-        )
-
-    return _rmsnorm_kernel
+        ),
+    )
 
 
 def _get_rmsnorm_backward_kernel():
@@ -80,110 +78,106 @@ def _get_rmsnorm_backward_kernel():
         - dweight = sum(dy * x / rms, axis=(0,1))
         - dx = (dy * weight / rms) - x * sum(dy * weight * x, axis=-1) / (rms^3 * hidden_dim)
     """
-    global _rmsnorm_backward_kernel
+    source = """
+        uint row_idx = thread_position_in_grid.x;
 
-    if _rmsnorm_backward_kernel is None:
-        source = """
-            uint row_idx = thread_position_in_grid.x;
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint hidden_dim = x_shape[2];
+        uint total_rows = batch_size * seq_len;
 
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint hidden_dim = x_shape[2];
-            uint total_rows = batch_size * seq_len;
+        if (row_idx >= total_rows) return;
 
-            if (row_idx >= total_rows) return;
+        uint row_offset = row_idx * hidden_dim;
 
-            uint row_offset = row_idx * hidden_dim;
+        // Recompute RMS (could cache but memory vs compute tradeoff)
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float val = x[row_offset + i];
+            sum_sq += val * val;
+        }
+        float variance = sum_sq / float(hidden_dim);
+        float rms = metal::sqrt(variance + 1e-6f);
+        float rms_inv = 1.0f / rms;
+        float rms_inv3 = rms_inv * rms_inv * rms_inv;
 
-            // Recompute RMS (could cache but memory vs compute tradeoff)
-            float sum_sq = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float val = x[row_offset + i];
-                sum_sq += val * val;
-            }
-            float variance = sum_sq / float(hidden_dim);
-            float rms = metal::sqrt(variance + 1e-6f);
-            float rms_inv = 1.0f / rms;
-            float rms_inv3 = rms_inv * rms_inv * rms_inv;
+        // Compute sum(dy * weight * x) for this row
+        float dot_sum = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float dy_val = dy[row_offset + i];
+            float x_val = x[row_offset + i];
+            float w_val = weight[i];
+            dot_sum += dy_val * w_val * x_val;
+        }
+        float scale = dot_sum * rms_inv3 / float(hidden_dim);
 
-            // Compute sum(dy * weight * x) for this row
-            float dot_sum = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float dy_val = dy[row_offset + i];
-                float x_val = x[row_offset + i];
-                float w_val = weight[i];
-                dot_sum += dy_val * w_val * x_val;
-            }
-            float scale = dot_sum * rms_inv3 / float(hidden_dim);
+        typedef decltype(dx[0] + dx[0]) OutT;
 
-            typedef decltype(dx[0] + dx[0]) OutT;
+        // Compute dx for each element
+        for (uint i = 0; i < hidden_dim; i++) {
+            float dy_val = dy[row_offset + i];
+            float x_val = x[row_offset + i];
+            float w_val = weight[i];
 
-            // Compute dx for each element
-            for (uint i = 0; i < hidden_dim; i++) {
-                float dy_val = dy[row_offset + i];
-                float x_val = x[row_offset + i];
-                float w_val = weight[i];
+            // dx = dy * weight / rms - x * scale
+            float grad = dy_val * w_val * rms_inv - x_val * scale;
+            dx[row_offset + i] = OutT(grad);
+        }
+    """
 
-                // dx = dy * weight / rms - x * scale
-                float grad = dy_val * w_val * rms_inv - x_val * scale;
-                dx[row_offset + i] = OutT(grad);
-            }
-        """
-
-        _rmsnorm_backward_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rmsnorm_backward",
+        lambda: mx.fast.metal_kernel(
             name="rmsnorm_backward",
             input_names=["x", "weight", "dy"],
             output_names=["dx"],
             source=source,
-        )
-
-    return _rmsnorm_backward_kernel
+        ),
+    )
 
 
 def _get_rmsnorm_residual_kernel():
     """Get or create the fused RMSNorm + residual kernel."""
-    global _rmsnorm_residual_kernel
+    source = """
+        uint row_idx = thread_position_in_grid.x;
 
-    if _rmsnorm_residual_kernel is None:
-        source = """
-            uint row_idx = thread_position_in_grid.x;
+        uint batch_size = x_shape[0];
+        uint seq_len = x_shape[1];
+        uint hidden_dim = x_shape[2];
+        uint total_rows = batch_size * seq_len;
 
-            uint batch_size = x_shape[0];
-            uint seq_len = x_shape[1];
-            uint hidden_dim = x_shape[2];
-            uint total_rows = batch_size * seq_len;
+        if (row_idx >= total_rows) return;
 
-            if (row_idx >= total_rows) return;
+        uint row_offset = row_idx * hidden_dim;
 
-            uint row_offset = row_idx * hidden_dim;
+        // Compute sum of squares of (x + residual)
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < hidden_dim; i++) {
+            float val = x[row_offset + i] + residual[row_offset + i];
+            sum_sq += val * val;
+        }
 
-            // Compute sum of squares of (x + residual)
-            float sum_sq = 0.0f;
-            for (uint i = 0; i < hidden_dim; i++) {
-                float val = x[row_offset + i] + residual[row_offset + i];
-                sum_sq += val * val;
-            }
+        float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
 
-            float rms_inv = metal::rsqrt(sum_sq / float(hidden_dim) + 1e-6f);
+        // Get output type for explicit casting (required for bf16)
+        typedef decltype(out[0] + out[0]) OutT;
 
-            // Get output type for explicit casting (required for bf16)
-            typedef decltype(out[0] + out[0]) OutT;
+        // Normalize and scale
+        for (uint i = 0; i < hidden_dim; i++) {
+            float val = x[row_offset + i] + residual[row_offset + i];
+            out[row_offset + i] = OutT(val * rms_inv * weight[i]);
+        }
+    """
 
-            // Normalize and scale
-            for (uint i = 0; i < hidden_dim; i++) {
-                float val = x[row_offset + i] + residual[row_offset + i];
-                out[row_offset + i] = OutT(val * rms_inv * weight[i]);
-            }
-        """
-
-        _rmsnorm_residual_kernel = mx.fast.metal_kernel(
+    return get_kernel(
+        "rmsnorm_residual",
+        lambda: mx.fast.metal_kernel(
             name="rmsnorm_residual",
             input_names=["x", "residual", "weight"],
             output_names=["out"],
             source=source,
-        )
-
-    return _rmsnorm_residual_kernel
+        ),
+    )
 
 
 def _reference_rmsnorm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -375,20 +369,8 @@ def fast_rmsnorm_residual(
     return result
 
 
-# Try to enable fast path when available
-_USE_METAL_KERNELS = True
-
-try:
-    # Test if metal kernels work
-    _test = mx.zeros((1, 1, 64))
-    _weight = mx.ones((64,))
-    # This will fail if metal_kernel isn't available
-    if hasattr(mx.fast, 'metal_kernel'):
-        pass
-    else:
-        _USE_METAL_KERNELS = False
-except Exception:
-    _USE_METAL_KERNELS = False
+# Check if metal kernels are available
+_USE_METAL_KERNELS = hasattr(mx.fast, 'metal_kernel')
 
 
 def rmsnorm(
@@ -413,8 +395,8 @@ def rmsnorm(
     if use_metal and _USE_METAL_KERNELS:
         try:
             return fast_rmsnorm(x, weight, eps)
-        except Exception:
-            pass
+        except Exception as e:
+            log_fallback("rmsnorm", e, f"x.shape={x.shape}")
 
     # Fallback to pure MLX (compute in float32 for reduced precision dtypes)
     orig_dtype = x.dtype
