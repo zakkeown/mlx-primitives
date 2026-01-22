@@ -226,6 +226,30 @@ class TestAdaptiveAvgPool2dParity:
             err_msg=f"AdaptiveAvgPool2d backward mismatch (JAX) [{size}, output={output_size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_global_pooling(self, skip_without_jax):
+        """Test global pooling special case (1, 1)."""
+        from mlx_primitives.layers import AdaptiveAvgPool2d
+
+        batch, channels, height, width = 2, 64, 32, 32
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, height, width).astype(np.float32)
+
+        pool_mlx = AdaptiveAvgPool2d((1, 1))
+        x_mlx = mx.array(x_np)
+        mlx_out = pool_mlx(x_mlx)
+        mx.eval(mlx_out)
+
+        # JAX reference - global average pooling
+        jax_out = jnp.mean(jnp.array(x_np), axis=(2, 3), keepdims=True)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), np.array(jax_out),
+            rtol=1e-5, atol=1e-6,
+            err_msg="Global avg pooling mismatch (JAX)"
+        )
+
 
 class TestAdaptiveMaxPool1dParity:
     @pytest.mark.parity_jax
@@ -415,6 +439,30 @@ class TestAdaptiveMaxPool2dParity:
             _to_numpy(mlx_grad), np.array(jax_grad),
             rtol=rtol * 10, atol=atol * 10,
             err_msg=f"AdaptiveMaxPool2d backward mismatch (JAX) [{size}, output={output_size}]"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_global_pooling(self, skip_without_jax):
+        """Test global max pooling special case (1, 1)."""
+        from mlx_primitives.layers import AdaptiveMaxPool2d
+
+        batch, channels, height, width = 2, 64, 32, 32
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, height, width).astype(np.float32)
+
+        pool_mlx = AdaptiveMaxPool2d((1, 1))
+        x_mlx = mx.array(x_np)
+        mlx_out = pool_mlx(x_mlx)
+        mx.eval(mlx_out)
+
+        # JAX reference - global max pooling
+        jax_out = jnp.max(jnp.array(x_np), axis=(2, 3), keepdims=True)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), np.array(jax_out),
+            rtol=1e-5, atol=1e-6,
+            err_msg="Global max pooling mismatch (JAX)"
         )
 
 
@@ -622,6 +670,55 @@ class TestGeMParity:
             err_msg=f"GeM backward mismatch (JAX) [{size}, p={p}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_p_equals_1(self, skip_without_jax):
+        """Test GeM with p=1 (equivalent to average pooling)."""
+        from mlx_primitives.layers import GeM
+
+        batch, channels, height, width = 2, 64, 8, 8
+        np.random.seed(42)
+        x_np = np.abs(np.random.randn(batch, channels, height, width).astype(np.float32)) + 1e-6
+
+        gem_mlx = GeM(p=1.0, eps=1e-6, learnable=False)
+        x_mlx = mx.array(x_np)
+        mlx_out = gem_mlx(x_mlx)
+        mx.eval(mlx_out)
+
+        # p=1 should be equivalent to average pooling
+        jax_out = jnp.mean(jnp.array(x_np), axis=(2, 3), keepdims=True)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), np.array(jax_out),
+            rtol=1e-4, atol=1e-5,
+            err_msg="GeM p=1 should equal average pooling (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_large_p(self, skip_without_jax):
+        """Test GeM with large p (approaches max pooling)."""
+        from mlx_primitives.layers import GeM
+
+        batch, channels, height, width = 2, 64, 8, 8
+        np.random.seed(42)
+        x_np = np.abs(np.random.randn(batch, channels, height, width).astype(np.float32)) + 1e-6
+
+        gem_mlx = GeM(p=10.0, eps=1e-6, learnable=False)
+        x_mlx = mx.array(x_np)
+        mlx_out = gem_mlx(x_mlx)
+        mx.eval(mlx_out)
+
+        # Large p approaches max pooling
+        jax_max = jnp.max(jnp.array(x_np), axis=(2, 3), keepdims=True)
+
+        # GeM with large p should be close to max but not exact
+        mlx_np = _to_numpy(mlx_out)
+        jax_np = np.array(jax_max)
+
+        # GeM with large p should be <= max (and close to it)
+        assert np.all(mlx_np <= jax_np * 1.01), "GeM large p should be close to max"
+
 
 # =============================================================================
 # 1D Pooling Tests
@@ -776,6 +873,60 @@ class TestAvgPool1dParity:
             err_msg=f"AvgPool1d backward mismatch [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.parametrize("padding", [0, 1, 2])
+    def test_with_padding(self, padding, skip_without_jax):
+        """Test AvgPool1d with padding."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 5
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size, padding=padding)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        # NumPy reference with padding
+        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding)), mode='constant')
+        ref_out = _numpy_avg_pool1d(x_padded, kernel_size)
+
+        rtol, atol = get_tolerance("pooling", "adaptive_avg_pool1d", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), ref_out,
+            rtol=rtol, atol=atol,
+            err_msg=f"AvgPool1d with padding={padding} mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_kernel_equals_input(self, skip_without_jax):
+        """Test AvgPool1d when kernel_size equals input length (global pooling)."""
+        from mlx_primitives.layers.pooling import AvgPool1d
+
+        batch, channels, length = 4, 64, 32
+        kernel_size = length
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = AvgPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        # Global average pooling reference
+        ref_out = np.mean(x_np, axis=2, keepdims=True)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), ref_out,
+            rtol=1e-5, atol=1e-6,
+            err_msg="AvgPool1d global pooling mismatch (JAX)"
+        )
+
 
 class TestMaxPool1dParity:
     """Tests for MaxPool1d parity with NumPy reference."""
@@ -891,6 +1042,87 @@ class TestMaxPool1dParity:
             err_msg=f"MaxPool1d backward mismatch [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.parametrize("padding", [0, 1, 2])
+    def test_with_padding(self, padding, skip_without_jax):
+        """Test MaxPool1d with padding."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 4, 64, 128
+        kernel_size = 5
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size, padding=padding)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        # NumPy reference with padding (use -inf for max pooling)
+        x_padded = np.pad(x_np, ((0, 0), (0, 0), (padding, padding)),
+                         mode='constant', constant_values=-np.inf)
+        ref_out = _numpy_max_pool1d(x_padded, kernel_size)
+
+        rtol, atol = get_tolerance("pooling", "adaptive_max_pool1d", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), ref_out,
+            rtol=rtol, atol=atol,
+            err_msg=f"MaxPool1d with padding={padding} mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_kernel_equals_input(self, skip_without_jax):
+        """Test MaxPool1d when kernel_size equals input length (global max pooling)."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 4, 64, 32
+        kernel_size = length
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, length).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        # Global max pooling reference
+        ref_out = np.max(x_np, axis=2, keepdims=True)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), ref_out,
+            rtol=1e-5, atol=1e-6,
+            err_msg="MaxPool1d global pooling mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_with_negative_values(self, skip_without_jax):
+        """Test MaxPool1d with all negative values."""
+        from mlx_primitives.layers.pooling import MaxPool1d
+
+        batch, channels, length = 2, 32, 64
+        kernel_size = 3
+
+        np.random.seed(42)
+        x_np = -np.abs(np.random.randn(batch, channels, length)).astype(np.float32)
+
+        pool = MaxPool1d(kernel_size=kernel_size)
+        x_mlx = mx.array(x_np)
+        mlx_out = pool(x_mlx)
+        mx.eval(mlx_out)
+
+        # NumPy reference
+        ref_out = _numpy_max_pool1d(x_np, kernel_size)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), ref_out,
+            rtol=1e-5, atol=1e-6,
+            err_msg="MaxPool1d with negative values mismatch (JAX)"
+        )
+
 
 # =============================================================================
 # 2D Pooling Tests
@@ -901,7 +1133,8 @@ class TestSpatialPyramidPoolingParity:
     @pytest.mark.forward_parity
     @pytest.mark.parametrize("size", ["tiny", "small", "medium", "large"])
     @pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
-    def test_forward_parity(self, size, dtype, skip_without_jax):
+    @pytest.mark.parametrize("levels", [[1], [1, 2], [1, 2, 4], [1, 2, 4, 8]])
+    def test_forward_parity(self, size, dtype, levels, skip_without_jax):
         """Test SpatialPyramidPooling forward pass parity with JAX."""
         from mlx_primitives.layers import SpatialPyramidPooling
 
@@ -910,8 +1143,6 @@ class TestSpatialPyramidPoolingParity:
         channels = config["channels"]
         height = config["height"]
         width = config["width"]
-
-        levels = [1, 2, 4]  # Standard SPP levels
 
         np.random.seed(42)
         x_np = np.random.randn(batch, channels, height, width).astype(np.float32)
@@ -935,7 +1166,7 @@ class TestSpatialPyramidPoolingParity:
         np.testing.assert_allclose(
             _to_numpy(mlx_out), jax_out,
             rtol=rtol, atol=atol,
-            err_msg=f"SpatialPyramidPooling forward mismatch (JAX) [{size}, {dtype}]"
+            err_msg=f"SpatialPyramidPooling forward mismatch (JAX) [{size}, {dtype}, levels={levels}]"
         )
 
     @pytest.mark.parity_jax
@@ -951,7 +1182,7 @@ class TestSpatialPyramidPoolingParity:
         height = config["height"]
         width = config["width"]
 
-        levels = [1, 2, 4]  # Standard SPP levels
+        levels = [1, 2, 4]
 
         np.random.seed(42)
         x_np = np.random.randn(batch, channels, height, width).astype(np.float32)
@@ -1006,3 +1237,26 @@ class TestSpatialPyramidPoolingParity:
             rtol=rtol * 10, atol=atol * 10,
             err_msg=f"SpatialPyramidPooling backward mismatch (JAX) [{size}]"
         )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_output_shape(self, skip_without_jax):
+        """Test SPP output shape matches expected."""
+        from mlx_primitives.layers import SpatialPyramidPooling
+
+        batch, channels, height, width = 2, 256, 13, 13
+        levels = [1, 2, 4]
+
+        # Expected output: channels * (1 + 4 + 16) = channels * 21
+        expected_features = channels * sum(level**2 for level in levels)
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, channels, height, width).astype(np.float32)
+
+        spp_mlx = SpatialPyramidPooling(output_sizes=levels)
+        x_mlx = mx.array(x_np)
+        mlx_out = spp_mlx(x_mlx)
+        mx.eval(mlx_out)
+
+        assert mlx_out.shape == (batch, expected_features), \
+            f"SPP output shape mismatch: expected {(batch, expected_features)}, got {mlx_out.shape}"

@@ -1,0 +1,88 @@
+site_name: MLX Primitives
+site_description: High-performance building blocks for MLX on Apple Silicon
+site_url: https://zakkeown.github.io/mlx-primitives
+
+repo_name: zakkeown/mlx-primitives
+repo_url: https://github.com/zakkeown/mlx-primitives
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - toc.follow
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            members_order: source
+            merge_init_into_class: true
+            show_signature_annotations: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting_started.md
+  - Guides:
+    - guides/index.md
+    - Architecture: guides/architecture.md
+    - Performance: guides/performance.md
+  - API Reference:
+    - api/index.md
+    - attention: api/attention.md
+    - primitives: api/primitives.md
+    - kernels: api/kernels.md
+    - cache: api/cache.md
+    - generation: api/generation.md
+    - training: api/training.md
+    - hardware: api/hardware.md
+    - memory: api/memory.md
+    - dsl: api/dsl.md
+    - advanced: api/advanced.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/zakkeown/mlx-primitives

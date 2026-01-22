@@ -1050,3 +1050,73 @@ class TestQuickGELUBackwardParity:
             rtol=rtol, atol=atol,
             err_msg=f"QuickGELU backward mismatch (JAX) [{size}]"
         )
+
+
+# =============================================================================
+# Edge Case Tests
+# =============================================================================
+
+class TestActivationEdgeCases:
+    """Edge case tests for activation functions."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_extreme_values(self, skip_without_jax):
+        """Test activations with extreme positive/negative values."""
+        x_np = np.array([-100.0, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0], dtype=np.float32)
+
+        # Test GELU with extreme values
+        x_mlx = mx.array(x_np)
+        mlx_out = nn.gelu(x_mlx)
+        mx.eval(mlx_out)
+
+        x_jax = jnp.array(x_np)
+        jax_out = jnn.gelu(x_jax, approximate=False)
+
+        # For extreme values, allow larger tolerance
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=1e-4, atol=1e-5,
+            err_msg="GELU extreme values mismatch (JAX)"
+        )
+
+        # Test SiLU with extreme values
+        mlx_silu = nn.silu(x_mlx)
+        mx.eval(mlx_silu)
+        jax_silu = jnn.silu(x_jax)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_silu), _to_numpy(jax_silu),
+            rtol=1e-4, atol=1e-5,
+            err_msg="SiLU extreme values mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_single_element(self, skip_without_jax):
+        """Test activations with single element tensors."""
+        from mlx_primitives.layers import quick_gelu, mish
+
+        x_np = np.array([0.5], dtype=np.float32)
+
+        # Test various activations
+        activations = [
+            (nn.gelu, lambda x: jnn.gelu(x, approximate=False), "GELU"),
+            (nn.silu, jnn.silu, "SiLU"),
+            (nn.relu, jnn.relu, "ReLU"),
+            (quick_gelu, lambda x: x * jnn.sigmoid(1.702 * x), "QuickGELU"),
+        ]
+
+        for mlx_fn, jax_fn, name in activations:
+            x_mlx = mx.array(x_np)
+            mlx_out = mlx_fn(x_mlx)
+            mx.eval(mlx_out)
+
+            x_jax = jnp.array(x_np)
+            jax_out = jax_fn(x_jax)
+
+            np.testing.assert_allclose(
+                _to_numpy(mlx_out), _to_numpy(jax_out),
+                rtol=1e-5, atol=1e-6,
+                err_msg=f"{name} single element mismatch (JAX)"
+            )

@@ -601,3 +601,171 @@ class TestH3LayerParity:
         assert grad_np.shape == x_np.shape, "Gradient shape mismatch"
         assert not np.any(np.isnan(grad_np)), f"NaN in gradient [{size}]"
         assert not np.any(np.isinf(grad_np)), f"Inf in gradient [{size}]"
+
+
+# =============================================================================
+# Edge Case Tests
+# =============================================================================
+
+class TestSSMEdgeCases:
+    """Edge case tests for SSM operations."""
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_single_sequence_element(self, skip_without_jax):
+        """Test selective scan with single sequence element."""
+        from mlx_primitives.advanced.ssm import selective_scan
+
+        batch, seq, d_inner, d_state = 2, 1, 32, 8
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, d_inner).astype(np.float32)
+        delta_np = np.abs(np.random.randn(batch, seq, d_inner).astype(np.float32)) + 0.01
+        A_np = -np.abs(np.random.randn(d_inner, d_state).astype(np.float32))
+        B_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        C_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        D_np = np.random.randn(d_inner).astype(np.float32) * 0.1
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mlx_out = selective_scan(
+                mx.array(x_np), mx.array(delta_np), mx.array(A_np),
+                mx.array(B_np), mx.array(C_np), mx.array(D_np),
+                warn_on_long_seq=False
+            )
+        mx.eval(mlx_out)
+
+        # JAX reference
+        jax_out = jax_selective_scan_reference(
+            jnp.array(x_np), jnp.array(delta_np), jnp.array(A_np),
+            jnp.array(B_np), jnp.array(C_np), jnp.array(D_np)
+        )
+
+        rtol, atol = get_tolerance("ssm", "selective_scan", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Selective scan with seq=1 mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_single_batch(self, skip_without_jax):
+        """Test selective scan with single batch."""
+        from mlx_primitives.advanced.ssm import selective_scan
+
+        batch, seq, d_inner, d_state = 1, 32, 64, 16
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, d_inner).astype(np.float32)
+        delta_np = np.abs(np.random.randn(batch, seq, d_inner).astype(np.float32)) + 0.01
+        A_np = -np.abs(np.random.randn(d_inner, d_state).astype(np.float32))
+        B_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        C_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        D_np = np.random.randn(d_inner).astype(np.float32) * 0.1
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mlx_out = selective_scan(
+                mx.array(x_np), mx.array(delta_np), mx.array(A_np),
+                mx.array(B_np), mx.array(C_np), mx.array(D_np),
+                warn_on_long_seq=False
+            )
+        mx.eval(mlx_out)
+
+        jax_out = jax_selective_scan_reference(
+            jnp.array(x_np), jnp.array(delta_np), jnp.array(A_np),
+            jnp.array(B_np), jnp.array(C_np), jnp.array(D_np)
+        )
+
+        rtol, atol = get_tolerance("ssm", "selective_scan", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Selective scan with batch=1 mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_no_skip_connection(self, skip_without_jax):
+        """Test selective scan without skip connection (D=None)."""
+        from mlx_primitives.advanced.ssm import selective_scan
+
+        batch, seq, d_inner, d_state = 2, 16, 32, 8
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, d_inner).astype(np.float32)
+        delta_np = np.abs(np.random.randn(batch, seq, d_inner).astype(np.float32)) + 0.01
+        A_np = -np.abs(np.random.randn(d_inner, d_state).astype(np.float32))
+        B_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        C_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mlx_out = selective_scan(
+                mx.array(x_np), mx.array(delta_np), mx.array(A_np),
+                mx.array(B_np), mx.array(C_np), None,
+                warn_on_long_seq=False
+            )
+        mx.eval(mlx_out)
+
+        jax_out = jax_selective_scan_reference(
+            jnp.array(x_np), jnp.array(delta_np), jnp.array(A_np),
+            jnp.array(B_np), jnp.array(C_np), None
+        )
+
+        rtol, atol = get_tolerance("ssm", "selective_scan", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Selective scan without D mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_small_delta(self, skip_without_jax):
+        """Test selective scan with very small delta values."""
+        from mlx_primitives.advanced.ssm import selective_scan
+
+        batch, seq, d_inner, d_state = 2, 16, 32, 8
+
+        np.random.seed(42)
+        x_np = np.random.randn(batch, seq, d_inner).astype(np.float32)
+        # Very small delta - tests numerical stability
+        delta_np = np.abs(np.random.randn(batch, seq, d_inner).astype(np.float32)) * 0.001 + 1e-6
+        A_np = -np.abs(np.random.randn(d_inner, d_state).astype(np.float32))
+        B_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        C_np = np.random.randn(batch, seq, d_state).astype(np.float32) * 0.1
+        D_np = np.random.randn(d_inner).astype(np.float32) * 0.1
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mlx_out = selective_scan(
+                mx.array(x_np), mx.array(delta_np), mx.array(A_np),
+                mx.array(B_np), mx.array(C_np), mx.array(D_np),
+                warn_on_long_seq=False
+            )
+        mx.eval(mlx_out)
+
+        jax_out = jax_selective_scan_reference(
+            jnp.array(x_np), jnp.array(delta_np), jnp.array(A_np),
+            jnp.array(B_np), jnp.array(C_np), jnp.array(D_np)
+        )
+
+        out_np = _to_numpy(mlx_out)
+        ref_np = _to_numpy(jax_out)
+
+        # Small delta should give results dominated by skip connection
+        assert not np.any(np.isnan(out_np)), "NaN with small delta"
+        assert not np.any(np.isinf(out_np)), "Inf with small delta"
+
+        rtol, atol = get_tolerance("ssm", "selective_scan", "fp32")
+        np.testing.assert_allclose(
+            out_np, ref_np,
+            rtol=rtol, atol=atol,
+            err_msg="Selective scan with small delta mismatch (JAX)"
+        )

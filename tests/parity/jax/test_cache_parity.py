@@ -289,6 +289,108 @@ class TestPagedAttentionParity:
         assert not np.isnan(v_grad_np).any(), f"NaN in V gradient [{size}]"
         assert not np.isinf(v_grad_np).any(), f"Inf in V gradient [{size}]"
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
+    def test_different_block_sizes(self, block_size, skip_without_jax):
+        """Test paged attention with different block sizes."""
+        from mlx_primitives.cache.paged_attention import (
+            paged_attention,
+            create_block_table_from_lengths,
+        )
+
+        batch = 2
+        seq = 256
+        num_heads = 8
+        head_dim = 64
+
+        np.random.seed(456)
+        mx.random.seed(456)
+
+        q_np = np.random.randn(batch, 1, num_heads, head_dim).astype(np.float32)
+        k_pool_np = np.random.randn(batch * ((seq + block_size - 1) // block_size), block_size, num_heads, head_dim).astype(np.float32)
+        v_pool_np = np.random.randn(batch * ((seq + block_size - 1) // block_size), block_size, num_heads, head_dim).astype(np.float32)
+
+        context_lens_np = np.full(batch, seq, dtype=np.int32)
+
+        q_mlx = mx.array(q_np)
+        k_pool_mlx = mx.array(k_pool_np)
+        v_pool_mlx = mx.array(v_pool_np)
+        context_lens_mlx = mx.array(context_lens_np)
+        block_tables_mlx = create_block_table_from_lengths(context_lens_mlx, block_size)
+        mx.eval(block_tables_mlx)
+        block_tables_np = _to_numpy(block_tables_mlx).astype(np.int32)
+
+        mlx_out = paged_attention(
+            q_mlx, k_pool_mlx, v_pool_mlx, block_tables_mlx, context_lens_mlx,
+            block_size=block_size
+        )
+        mx.eval(mlx_out)
+
+        jax_out = jax_paged_attention(
+            q_np, k_pool_np, v_pool_np, block_tables_np, context_lens_np,
+            block_size=block_size
+        )
+
+        rtol, atol = get_tolerance("cache", "paged_attention", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), jax_out, rtol=rtol, atol=atol,
+            err_msg=f"Paged attention mismatch with block_size={block_size} (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_variable_sequence_lengths(self, skip_without_jax):
+        """Test paged attention with variable sequence lengths in batch."""
+        from mlx_primitives.cache.paged_attention import (
+            paged_attention,
+            create_block_table_from_lengths,
+        )
+
+        batch = 4
+        max_seq = 256
+        num_heads = 8
+        head_dim = 64
+        block_size = 32
+
+        np.random.seed(101112)
+        mx.random.seed(101112)
+
+        # Variable sequence lengths
+        seq_lens = np.array([64, 128, 192, 256], dtype=np.int32)
+
+        q_np = np.random.randn(batch, 1, num_heads, head_dim).astype(np.float32)
+
+        # Calculate total blocks needed
+        total_blocks = sum((s + block_size - 1) // block_size for s in seq_lens) + batch
+        k_pool_np = np.random.randn(total_blocks, block_size, num_heads, head_dim).astype(np.float32)
+        v_pool_np = np.random.randn(total_blocks, block_size, num_heads, head_dim).astype(np.float32)
+
+        q_mlx = mx.array(q_np)
+        k_pool_mlx = mx.array(k_pool_np)
+        v_pool_mlx = mx.array(v_pool_np)
+        context_lens_mlx = mx.array(seq_lens)
+        block_tables_mlx = create_block_table_from_lengths(context_lens_mlx, block_size)
+        mx.eval(block_tables_mlx)
+        block_tables_np = _to_numpy(block_tables_mlx).astype(np.int32)
+
+        mlx_out = paged_attention(
+            q_mlx, k_pool_mlx, v_pool_mlx, block_tables_mlx, context_lens_mlx,
+            block_size=block_size
+        )
+        mx.eval(mlx_out)
+
+        jax_out = jax_paged_attention(
+            q_np, k_pool_np, v_pool_np, block_tables_np, seq_lens,
+            block_size=block_size
+        )
+
+        rtol, atol = get_tolerance("cache", "paged_attention", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), jax_out, rtol=rtol, atol=atol,
+            err_msg="Variable seq length paged attention mismatch (JAX)"
+        )
+
 
 # =============================================================================
 # Block Allocation Parity Tests
@@ -398,6 +500,109 @@ class TestEvictionPoliciesParity:
                 f"MLX={mlx_evicted}, ref={ref_evicted}"
             )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_lru_eviction_order(self, skip_without_jax):
+        """Test LRU eviction selects correct blocks."""
+        mlx_lru = LRUEvictionPolicy()
+        ref_lru = ReferenceLRU()
+
+        # Create sequences 0, 1, 2, 3
+        for i in range(4):
+            mlx_lru.on_create(i)
+            ref_lru.on_create(i)
+
+        # Access 0 again (moves to end, so eviction order is now 1, 2, 3, 0)
+        mlx_lru.on_access(0)
+        ref_lru.on_access(0)
+
+        # Access 2 (moves to end, so order is 1, 3, 0, 2)
+        mlx_lru.on_access(2)
+        ref_lru.on_access(2)
+
+        # Evict 2 - should be [1, 3]
+        candidates = [0, 1, 2, 3]
+        mlx_evicted = mlx_lru.select_for_eviction(candidates, 2)
+        ref_evicted = ref_lru.select_for_eviction(candidates, 2)
+
+        assert mlx_evicted == [1, 3], f"LRU order mismatch: got {mlx_evicted}, expected [1, 3]"
+        assert mlx_evicted == ref_evicted
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_fifo_eviction_order(self, skip_without_jax):
+        """Test FIFO eviction selects correct blocks."""
+        mlx_fifo = FIFOEvictionPolicy()
+        ref_fifo = ReferenceFIFO()
+
+        # Create sequences 0, 1, 2, 3
+        for i in range(4):
+            mlx_fifo.on_create(i)
+            ref_fifo.on_create(i)
+
+        # Access 0 multiple times (should NOT change order for FIFO)
+        for _ in range(5):
+            mlx_fifo.on_access(0)
+            ref_fifo.on_access(0)
+
+        # Evict 2 - should be [0, 1] (first created)
+        candidates = [0, 1, 2, 3]
+        mlx_evicted = mlx_fifo.select_for_eviction(candidates, 2)
+        ref_evicted = ref_fifo.select_for_eviction(candidates, 2)
+
+        assert mlx_evicted == [0, 1], f"FIFO order mismatch: got {mlx_evicted}, expected [0, 1]"
+        assert mlx_evicted == ref_evicted
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_attention_score_eviction(self, skip_without_jax):
+        """Test attention-score based eviction policy."""
+        from mlx_primitives.cache.eviction import AttentionScoreEvictionPolicy
+
+        class ReferenceAttentionScore:
+            """Reference attention score eviction implementation."""
+            def __init__(self, decay_factor: float = 0.99):
+                self._decay = decay_factor
+                self._scores: dict = {}
+
+            def on_create(self, key: int) -> None:
+                self._scores[key] = 0.0
+
+            def update_score(self, key: int, score: float) -> None:
+                if key not in self._scores:
+                    self._scores[key] = 0.0
+                self._scores[key] = self._decay * self._scores[key] + (1 - self._decay) * score
+
+            def select_for_eviction(self, candidates: List[int], n: int) -> List[int]:
+                scored = [(k, self._scores.get(k, 0.0)) for k in candidates]
+                scored.sort(key=lambda x: x[1])
+                return [k for k, _ in scored[:n]]
+
+        decay_factor = 0.99
+        mlx_policy = AttentionScoreEvictionPolicy(decay_factor=decay_factor)
+        ref_policy = ReferenceAttentionScore(decay_factor=decay_factor)
+
+        # Create sequences
+        for i in range(4):
+            mlx_policy.on_create(i)
+            ref_policy.on_create(i)
+
+        # Update attention scores
+        scores = [(0, 0.1), (1, 0.9), (2, 0.5), (3, 0.3)]
+        for seq_id, score in scores:
+            mlx_policy.update_attention_score(seq_id, score)
+            ref_policy.update_score(seq_id, score)
+
+        # Evict 2 - should be [0, 3] (lowest scores)
+        candidates = [0, 1, 2, 3]
+        mlx_evicted = mlx_policy.select_for_eviction(candidates, 2)
+        ref_evicted = ref_policy.select_for_eviction(candidates, 2)
+
+        assert mlx_evicted == ref_evicted, (
+            f"Attention score eviction mismatch: MLX={mlx_evicted}, ref={ref_evicted}"
+        )
+        assert set(mlx_evicted) == {0, 3}
+
 
 # =============================================================================
 # Speculative Verification Parity Tests
@@ -479,6 +684,86 @@ class TestSpeculativeVerificationParity:
                 mlx_accept, expected, rtol=rtol, atol=atol,
                 err_msg=f"Expected acceptance prob mismatch"
             )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_rejection_sampling(self, skip_without_jax):
+        """Test rejection sampling for corrected tokens."""
+        vocab_size = 100
+        seed = 54321
+
+        # Create a scenario where rejection is guaranteed
+        draft_log_probs = np.array([-0.01], dtype=np.float32)  # ~99% prob
+        target_log_probs = np.zeros((2, vocab_size), dtype=np.float32)
+        target_log_probs[0, 0] = -10.0  # Very low prob for draft token
+        target_log_probs[0, 1:] = -2.3  # Higher prob for other tokens
+        target_log_probs = target_log_probs - np.log(
+            np.exp(target_log_probs).sum(axis=-1, keepdims=True)
+        )
+
+        draft_tokens = [0]
+
+        # Run MLX
+        mx.random.seed(seed)
+        mlx_accepted, mlx_correction = speculative_verify(
+            draft_tokens,
+            mx.array(draft_log_probs),
+            mx.array(target_log_probs),
+        )
+
+        # Run reference
+        rng = np.random.default_rng(seed)
+        ref_accepted, ref_correction = reference_speculative_verify(
+            draft_tokens,
+            draft_log_probs,
+            target_log_probs,
+            rng,
+        )
+
+        # Should reject since draft prob >> target prob
+        assert mlx_accepted == 0, f"Expected rejection, got {mlx_accepted} accepted"
+        assert ref_accepted == 0
+
+        # Correction token should not be 0 (the rejected token)
+        assert mlx_correction != 0, "Correction token should not be the rejected token"
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    @pytest.mark.parametrize("num_speculative", [1, 2, 4, 8])
+    def test_different_speculation_lengths(self, num_speculative, skip_without_jax):
+        """Test with different speculation lengths."""
+        vocab_size = 500
+        seed = 99999
+
+        np.random.seed(seed)
+
+        draft_tokens = list(np.random.randint(0, vocab_size, (num_speculative,)))
+        draft_log_probs = np.random.randn(num_speculative).astype(np.float32) * 0.3
+        target_log_probs = np.random.randn(num_speculative + 1, vocab_size).astype(np.float32)
+        target_log_probs = target_log_probs - np.log(
+            np.exp(target_log_probs).sum(axis=-1, keepdims=True)
+        )
+
+        mx.random.seed(42)
+        mlx_accepted, _ = speculative_verify(
+            draft_tokens,
+            mx.array(draft_log_probs),
+            mx.array(target_log_probs),
+        )
+
+        rng = np.random.default_rng(42)
+        ref_accepted, _ = reference_speculative_verify(
+            draft_tokens,
+            draft_log_probs,
+            target_log_probs,
+            rng,
+        )
+
+        assert mlx_accepted == ref_accepted, (
+            f"Acceptance count mismatch for num_spec={num_speculative}: "
+            f"MLX={mlx_accepted}, ref={ref_accepted}"
+        )
+        assert 0 <= mlx_accepted <= num_speculative
 
 
 # =============================================================================

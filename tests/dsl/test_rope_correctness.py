@@ -349,7 +349,6 @@ class TestRopeForwardCorrectness:
 class TestRopeInlineCorrectness:
     """Test rope_inline kernel (computes cos/sin on the fly)."""
 
-    @pytest.mark.xfail(reason="Metal cos/sin type ambiguity in DSL codegen")
     def test_rope_inline_basic(self) -> None:
         """Inline RoPE should match precomputed cache version."""
         import mlx.core as mx
@@ -399,7 +398,6 @@ class TestRopeInlineCorrectness:
             rtol=1e-4, atol=1e-4
         )
 
-    @pytest.mark.xfail(reason="Metal cos/sin type ambiguity in DSL codegen")
     @pytest.mark.parametrize("base", [10000.0, 500000.0])
     def test_rope_inline_different_bases(self, base: float) -> None:
         """Test inline with different RoPE bases."""
@@ -437,7 +435,6 @@ class TestRopeInlineCorrectness:
 class TestRopeQKFusedCorrectness:
     """Test fused Q/K RoPE for GQA models."""
 
-    @pytest.mark.xfail(reason="Kernel output handling for multiple outputs needs adjustment")
     def test_rope_qk_fused_basic(self) -> None:
         """Test fused Q/K processing matches separate processing."""
         import mlx.core as mx
@@ -487,7 +484,6 @@ class TestRopeQKFusedCorrectness:
             np.array(k_result), k_expected, rtol=1e-4, atol=1e-4
         )
 
-    @pytest.mark.xfail(reason="Kernel output handling for multiple outputs needs adjustment")
     @pytest.mark.parametrize("q_heads,kv_heads", [(32, 8), (32, 4), (16, 2), (8, 1)])
     def test_rope_qk_fused_gqa_ratios(self, q_heads: int, kv_heads: int) -> None:
         """Test different Q/KV head ratios (GQA configurations)."""

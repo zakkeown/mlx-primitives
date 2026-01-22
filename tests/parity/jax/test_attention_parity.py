@@ -395,6 +395,102 @@ class TestFlashAttentionParity:
             err_msg="Flash attention causal masking mismatch"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_scale_factor_parity(self, skip_without_jax):
+        """Test custom scale factor produces same results as JAX."""
+        from mlx_primitives.attention.flash import flash_attention
+
+        batch, seq, heads, head_dim = 2, 128, 8, 64
+        custom_scale = 0.5  # Non-default scale
+
+        np.random.seed(42)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # MLX with custom scale
+        q_mlx = mx.array(q_np)
+        k_mlx = mx.array(k_np)
+        v_mlx = mx.array(v_np)
+        mlx_out = flash_attention(q_mlx, k_mlx, v_mlx, causal=False, scale=custom_scale)
+        mx.eval(mlx_out)
+
+        # JAX with custom scale
+        q_jax = jnp.array(q_np).transpose(0, 2, 1, 3)
+        k_jax = jnp.array(k_np).transpose(0, 2, 1, 3)
+        v_jax = jnp.array(v_np).transpose(0, 2, 1, 3)
+        jax_out = _jax_reference_attention(q_jax, k_jax, v_jax, scale=custom_scale)
+        jax_out = jax_out.transpose(0, 2, 1, 3)
+
+        rtol, atol = get_tolerance("attention", "flash_attention", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Flash attention scale factor mismatch"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.edge_case
+    def test_edge_cases(self, skip_without_jax):
+        """Test attention edge cases (single token, single head, etc.)."""
+        from mlx_primitives.attention.flash import flash_attention
+
+        # Single token
+        batch, seq, heads, head_dim = 2, 1, 8, 64
+
+        np.random.seed(42)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # MLX
+        q_mlx = mx.array(q_np)
+        k_mlx = mx.array(k_np)
+        v_mlx = mx.array(v_np)
+        mlx_out = flash_attention(q_mlx, k_mlx, v_mlx, causal=False)
+        mx.eval(mlx_out)
+
+        # JAX
+        q_jax = jnp.array(q_np).transpose(0, 2, 1, 3)
+        k_jax = jnp.array(k_np).transpose(0, 2, 1, 3)
+        v_jax = jnp.array(v_np).transpose(0, 2, 1, 3)
+        jax_out = _jax_reference_attention(q_jax, k_jax, v_jax)
+        jax_out = jax_out.transpose(0, 2, 1, 3)
+
+        rtol, atol = get_tolerance("attention", "flash_attention", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Single token attention mismatch"
+        )
+
+        # Single head
+        batch, seq, heads, head_dim = 2, 64, 1, 64
+
+        np.random.seed(43)
+        q_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        v_np = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        q_mlx = mx.array(q_np)
+        k_mlx = mx.array(k_np)
+        v_mlx = mx.array(v_np)
+        mlx_out = flash_attention(q_mlx, k_mlx, v_mlx, causal=False)
+        mx.eval(mlx_out)
+
+        q_jax = jnp.array(q_np).transpose(0, 2, 1, 3)
+        k_jax = jnp.array(k_np).transpose(0, 2, 1, 3)
+        v_jax = jnp.array(v_np).transpose(0, 2, 1, 3)
+        jax_out = _jax_reference_attention(q_jax, k_jax, v_jax)
+        jax_out = jax_out.transpose(0, 2, 1, 3)
+
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out), _to_numpy(jax_out),
+            rtol=rtol, atol=atol,
+            err_msg="Single head attention mismatch"
+        )
+
 
 # =============================================================================
 # Sliding Window Attention Parity Tests
@@ -738,6 +834,31 @@ class TestALiBiAttentionParity:
             err_msg=f"ALiBi attention forward mismatch [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_slope_computation_parity(self, skip_without_jax):
+        """Test ALiBi slope computation matches JAX reference."""
+        from mlx_primitives.attention.alibi import alibi_bias
+
+        for num_heads in [4, 8, 12, 16, 32]:
+            seq_len = 64
+
+            # Get MLX ALiBi bias
+            mlx_bias = alibi_bias(seq_len, seq_len, num_heads)
+            mx.eval(mlx_bias)
+
+            # JAX reference slopes and bias
+            jax_slopes = _jax_alibi_slopes(num_heads)[:, None, None]
+            positions = jnp.arange(seq_len)
+            distance = positions[None, :] - positions[:, None]
+            jax_bias = jax_slopes * distance
+
+            np.testing.assert_allclose(
+                _to_numpy(mlx_bias), _to_numpy(jax_bias),
+                rtol=1e-5, atol=1e-6,
+                err_msg=f"ALiBi slope computation mismatch for num_heads={num_heads} (JAX)"
+            )
+
 
 # =============================================================================
 # Quantized KV Cache Attention Parity Tests
@@ -834,6 +955,34 @@ class TestRoPEVariantsParity:
             err_msg=f"RoPE K forward mismatch [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_frequency_computation_parity(self, skip_without_jax):
+        """Test RoPE frequency computation matches JAX reference."""
+        from mlx_primitives.attention.rope import precompute_freqs_cis
+
+        head_dim = 64
+        seq_len = 128
+        base = 10000.0
+
+        # MLX precompute
+        cos_mlx, sin_mlx, cos_doubled_mlx, sin_doubled_mlx = precompute_freqs_cis(head_dim, seq_len, base=base)
+        mx.eval(cos_mlx, sin_mlx)
+
+        # JAX precompute
+        cos_jax, sin_jax, _, _ = _jax_precompute_freqs(head_dim, seq_len, base=base)
+
+        np.testing.assert_allclose(
+            _to_numpy(cos_mlx), _to_numpy(cos_jax),
+            rtol=1e-5, atol=1e-6,
+            err_msg="RoPE cos frequency computation mismatch (JAX)"
+        )
+        np.testing.assert_allclose(
+            _to_numpy(sin_mlx), _to_numpy(sin_jax),
+            rtol=1e-5, atol=1e-6,
+            err_msg="RoPE sin frequency computation mismatch (JAX)"
+        )
+
 
 # =============================================================================
 # Layout Variants Parity Tests
@@ -895,6 +1044,50 @@ class TestLayoutVariantsParity:
             _to_numpy(mlx_out), _to_numpy(jax_out),
             rtol=rtol, atol=atol,
             err_msg=f"Layout {layout} forward mismatch"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_layout_conversion_parity(self, skip_without_jax):
+        """Test that BHSD and BSHD layouts produce equivalent results."""
+        from mlx_primitives.attention.flash import flash_attention
+
+        batch, seq, heads, head_dim = 2, 64, 8, 64
+
+        np.random.seed(42)
+        # Start with BSHD layout
+        q_bshd = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        k_bshd = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+        v_bshd = np.random.randn(batch, seq, heads, head_dim).astype(np.float32)
+
+        # Convert to BHSD
+        q_bhsd = np.transpose(q_bshd, (0, 2, 1, 3))
+        k_bhsd = np.transpose(k_bshd, (0, 2, 1, 3))
+        v_bhsd = np.transpose(v_bshd, (0, 2, 1, 3))
+
+        # MLX with BSHD
+        q_mlx_bshd = mx.array(q_bshd)
+        k_mlx_bshd = mx.array(k_bshd)
+        v_mlx_bshd = mx.array(v_bshd)
+        mlx_out_bshd = flash_attention(q_mlx_bshd, k_mlx_bshd, v_mlx_bshd, causal=False, layout="BSHD")
+        mx.eval(mlx_out_bshd)
+
+        # MLX with BHSD
+        q_mlx_bhsd = mx.array(q_bhsd)
+        k_mlx_bhsd = mx.array(k_bhsd)
+        v_mlx_bhsd = mx.array(v_bhsd)
+        mlx_out_bhsd = flash_attention(q_mlx_bhsd, k_mlx_bhsd, v_mlx_bhsd, causal=False, layout="BHSD")
+        mx.eval(mlx_out_bhsd)
+
+        # Convert BHSD output to BSHD for comparison
+        mlx_out_bhsd_as_bshd = mx.transpose(mlx_out_bhsd, (0, 2, 1, 3))
+        mx.eval(mlx_out_bhsd_as_bshd)
+
+        rtol, atol = get_tolerance("attention", "flash_attention", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(mlx_out_bshd), _to_numpy(mlx_out_bhsd_as_bshd),
+            rtol=rtol, atol=atol,
+            err_msg="Layout conversion BHSD/BSHD results should be equivalent"
         )
 
 

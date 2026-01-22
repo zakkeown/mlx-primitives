@@ -72,6 +72,65 @@ class TestINT8QuantizationParity:
             err_msg=f"INT8 scale mismatch (JAX) [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_scale_computation(self, skip_without_jax):
+        """Test INT8 scale computation matches JAX reference."""
+        from mlx_primitives.advanced.quantization import quantize_tensor
+
+        np.random.seed(42)
+        x_np = np.random.randn(64, 64).astype(np.float32)
+
+        # MLX
+        x_mlx = mx.array(x_np)
+        _, scale_mlx, _ = quantize_tensor(x_mlx, num_bits=8, symmetric=True)
+        mx.eval(scale_mlx)
+
+        # JAX reference: scale = absmax / 127
+        x_absmax = np.max(np.abs(x_np))
+        scale_jax = x_absmax / 127.0
+
+        rtol, atol = get_tolerance("quantization", "int8_quantize", "fp32")
+        np.testing.assert_allclose(
+            _to_numpy(scale_mlx),
+            scale_jax,
+            rtol=rtol, atol=atol,
+            err_msg="INT8 scale computation mismatch (JAX)"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_zero_point_computation(self, skip_without_jax):
+        """Test INT8 zero point computation for asymmetric quantization."""
+        from mlx_primitives.advanced.quantization import quantize_tensor
+
+        np.random.seed(42)
+        # Use asymmetric data (all positive) to test zero point
+        x_np = np.random.uniform(0, 10, (64, 64)).astype(np.float32)
+
+        # MLX asymmetric quantization
+        x_mlx = mx.array(x_np)
+        _, scale_mlx, zp_mlx = quantize_tensor(x_mlx, num_bits=8, symmetric=False)
+        mx.eval(scale_mlx, zp_mlx)
+
+        # JAX reference asymmetric quantization
+        x_min = np.min(x_np)
+        x_max = np.max(x_np)
+        qmin, qmax = -128, 127
+        scale_jax = (x_max - x_min) / (qmax - qmin)
+        scale_jax = max(scale_jax, 1e-8)
+        zp_jax = qmin - np.round(x_min / scale_jax)
+        zp_jax = np.clip(zp_jax, qmin, qmax)
+
+        rtol, atol = get_tolerance("quantization", "int8_quantize", "fp32")
+        # Allow 1 unit difference due to rounding
+        np.testing.assert_allclose(
+            _to_numpy(zp_mlx),
+            zp_jax,
+            rtol=rtol, atol=max(atol, 1.0),
+            err_msg="INT8 zero point computation mismatch (JAX)"
+        )
+
 
 class TestINT8DequantizationParity:
     @pytest.mark.parity_jax
@@ -108,6 +167,35 @@ class TestINT8DequantizationParity:
             _to_numpy(mlx_deq), jax_deq,
             rtol=rtol, atol=atol,
             err_msg=f"INT8 dequantization mismatch (JAX) [{size}]"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_roundtrip(self, skip_without_jax):
+        """Test quantize -> dequantize roundtrip error matches JAX."""
+        from mlx_primitives.advanced.quantization import quantize_tensor, dequantize_tensor
+
+        np.random.seed(42)
+        x_np = np.random.randn(128, 128).astype(np.float32)
+
+        # MLX roundtrip
+        x_mlx = mx.array(x_np)
+        x_q_mlx, scale_mlx, _ = quantize_tensor(x_mlx, num_bits=8, symmetric=True)
+        x_deq_mlx = dequantize_tensor(x_q_mlx, scale_mlx, None)
+        mx.eval(x_deq_mlx)
+        mlx_error = np.abs(_to_numpy(x_deq_mlx) - x_np).mean()
+
+        # JAX reference roundtrip
+        jax_q, jax_scale, _ = jax_quantize_int8(x_np, per_channel=False, symmetric=True)
+        jax_deq = jax_dequantize_int8(jax_q, jax_scale, None)
+        jax_error = np.abs(jax_deq - x_np).mean()
+
+        # Roundtrip errors should be comparable
+        rtol, atol = get_tolerance("quantization", "int8_dequantize", "fp32")
+        np.testing.assert_allclose(
+            mlx_error, jax_error,
+            rtol=rtol, atol=atol,
+            err_msg="INT8 roundtrip error mismatch (JAX)"
         )
 
 
@@ -192,6 +280,43 @@ class TestINT4DequantizationParity:
             err_msg=f"INT4 dequantization mismatch (JAX) [{size}, group_size={group_size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_roundtrip(self, skip_without_jax):
+        """Test INT4 quantize -> dequantize roundtrip error."""
+        from mlx_primitives.advanced.quantization import Int4Linear
+        import mlx.nn as nn
+
+        np.random.seed(42)
+        n, k = 128, 128
+        group_size = 32
+        weight_np = np.random.randn(n, k).astype(np.float32) * 0.02
+
+        # MLX roundtrip via Int4Linear
+        linear_mlx = nn.Linear(k, n, bias=False)
+        linear_mlx.weight = mx.array(weight_np)
+        mx.eval(linear_mlx.parameters())
+
+        int4_mlx = Int4Linear.from_linear(linear_mlx, group_size=group_size)
+        mx.eval(int4_mlx.scales, int4_mlx.weight_packed)
+
+        mlx_deq = int4_mlx.unpack_weights()
+        mx.eval(mlx_deq)
+        mlx_error = np.abs(_to_numpy(mlx_deq) - weight_np).mean()
+
+        # JAX reference roundtrip
+        jax_q, jax_scales, _ = jax_quantize_int4(weight_np, group_size=group_size)
+        jax_deq = jax_dequantize_int4(jax_q, jax_scales, group_size)
+        jax_error = np.abs(jax_deq - weight_np).mean()
+
+        # Roundtrip errors should be comparable (INT4 has more error than INT8)
+        rtol, atol = get_tolerance("quantization", "int4_dequantize", "fp32")
+        np.testing.assert_allclose(
+            mlx_error, jax_error,
+            rtol=rtol, atol=atol,
+            err_msg="INT4 roundtrip error mismatch (JAX)"
+        )
+
 
 class TestINT8LinearParity:
     @pytest.mark.parity_jax
@@ -240,6 +365,56 @@ class TestINT8LinearParity:
             err_msg=f"INT8 linear mismatch (JAX) [{size}]"
         )
 
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_vs_fp32_linear(self, skip_without_jax):
+        """Test INT8 linear vs FP32 linear error bounds."""
+        from mlx_primitives.advanced.quantization import QuantizedLinear
+        import mlx.nn as nn
+
+        np.random.seed(42)
+        batch_seq, in_features, out_features = 64, 256, 256
+        x_np = np.random.randn(batch_seq, in_features).astype(np.float32)
+        weight_np = np.random.randn(out_features, in_features).astype(np.float32) * 0.02
+
+        # MLX FP32 baseline
+        fp32_layer = nn.Linear(in_features, out_features, bias=False)
+        fp32_layer.weight = mx.array(weight_np)
+        mx.eval(fp32_layer.parameters())
+        x_mlx = mx.array(x_np)
+        fp32_out = fp32_layer(x_mlx)
+        mx.eval(fp32_out)
+
+        # MLX INT8 quantized
+        qlinear_mlx = QuantizedLinear.from_linear(fp32_layer, num_bits=8, per_channel=True)
+        mx.eval(qlinear_mlx.weight_q, qlinear_mlx.weight_scale)
+        int8_out = qlinear_mlx(x_mlx)
+        mx.eval(int8_out)
+
+        mlx_error = np.abs(_to_numpy(int8_out) - _to_numpy(fp32_out)).mean()
+
+        # JAX FP32 baseline
+        fp32_out_jax = x_np @ weight_np.T
+
+        # JAX INT8 quantized (per-channel)
+        w_absmax = np.max(np.abs(weight_np), axis=1, keepdims=True)
+        w_scale = w_absmax / 127.0
+        w_scale = np.clip(w_scale, 1e-8, None)
+        w_q = np.round(weight_np / w_scale)
+        w_q = np.clip(w_q, -128, 127)
+        w_deq = w_q * w_scale
+        int8_out_jax = x_np @ w_deq.T
+
+        jax_error = np.abs(int8_out_jax - fp32_out_jax).mean()
+
+        # Quantization error should be similar between frameworks
+        rtol, atol = get_tolerance("quantization", "int8_linear", "fp32")
+        np.testing.assert_allclose(
+            mlx_error, jax_error,
+            rtol=rtol, atol=atol,
+            err_msg="INT8 vs FP32 error bounds mismatch (JAX)"
+        )
+
 
 class TestINT4LinearParity:
     @pytest.mark.parity_jax
@@ -286,6 +461,53 @@ class TestINT4LinearParity:
             _to_numpy(mlx_out), jax_out,
             rtol=rtol, atol=atol,
             err_msg=f"INT4 linear mismatch (JAX) [{size}, group_size={group_size}]"
+        )
+
+    @pytest.mark.parity_jax
+    @pytest.mark.forward_parity
+    def test_vs_fp32_linear(self, skip_without_jax):
+        """Test INT4 linear vs FP32 linear error bounds."""
+        from mlx_primitives.advanced.quantization import Int4Linear
+        import mlx.nn as nn
+
+        np.random.seed(42)
+        batch_seq, in_features, out_features = 64, 256, 256
+        group_size = 32
+        x_np = np.random.randn(batch_seq, in_features).astype(np.float32)
+        weight_np = np.random.randn(out_features, in_features).astype(np.float32) * 0.02
+
+        # MLX FP32 baseline
+        fp32_layer = nn.Linear(in_features, out_features, bias=False)
+        fp32_layer.weight = mx.array(weight_np)
+        mx.eval(fp32_layer.parameters())
+        x_mlx = mx.array(x_np)
+        fp32_out = fp32_layer(x_mlx)
+        mx.eval(fp32_out)
+
+        # MLX INT4 quantized
+        int4_layer = Int4Linear.from_linear(fp32_layer, group_size=group_size)
+        mx.eval(int4_layer.scales, int4_layer.weight_packed)
+        int4_out = int4_layer(x_mlx)
+        mx.eval(int4_out)
+
+        mlx_error = np.abs(_to_numpy(int4_out) - _to_numpy(fp32_out)).mean()
+
+        # JAX FP32 baseline
+        fp32_out_jax = x_np @ weight_np.T
+
+        # JAX INT4 reference
+        jax_q, jax_scales, _ = jax_quantize_int4(weight_np, group_size=group_size)
+        int4_out_jax = jax_int4_linear(x_np, jax_q, jax_scales, group_size, None)
+
+        jax_error = np.abs(int4_out_jax - fp32_out_jax).mean()
+
+        # Quantization error should be similar between frameworks
+        # INT4 typically has ~5-10% relative error (higher than INT8)
+        rtol, atol = get_tolerance("quantization", "int4_linear", "fp32")
+        np.testing.assert_allclose(
+            mlx_error, jax_error,
+            rtol=rtol, atol=atol,
+            err_msg="INT4 vs FP32 error bounds mismatch (JAX)"
         )
 
 

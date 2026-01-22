@@ -4,9 +4,10 @@ High-performance building blocks for [MLX](https://github.com/ml-explore/mlx) on
 
 ## Quick Links
 
-- [Getting Started](getting_started.md)
-- [API Reference](api/attention.md)
-- [Guides](guides/precision.md)
+- [Getting Started](getting_started.md) - Installation and first steps
+- [API Reference](api/index.md) - Complete API documentation
+- [Guides](guides/index.md) - Architecture and performance guides
+- [Examples](https://github.com/zakkeown/mlx-primitives/tree/main/examples) - Runnable code examples
 
 ## Installation
 

@@ -395,8 +395,17 @@ class ASTParser(ast.NodeVisitor):
         return result
 
     def visit_If(self, node: ast.If) -> IRNode:
-        """Handle if statements."""
+        """Handle if statements.
+
+        Variables declared inside if/else branches are scoped to those branches.
+        A variable declared in the if-branch is not considered declared in the
+        else-branch, and vice versa. This matches Metal/C scoping rules.
+        """
         condition = self.visit(node.test)
+
+        # Save declared_vars state before entering if-body
+        # This ensures else-branch starts with the same scope as if-branch
+        declared_before_if = self.declared_vars.copy()
 
         body = []
         for stmt in node.body:
@@ -404,11 +413,24 @@ class ASTParser(ast.NodeVisitor):
             if ir_node is not None:
                 body.append(ir_node)
 
+        # Track what was declared in if-body
+        declared_in_if = self.declared_vars - declared_before_if
+
+        # Restore declared_vars before entering else-body
+        # Variables declared only in if-body shouldn't affect else-body scoping
+        self.declared_vars = declared_before_if.copy()
+
         orelse = []
         for stmt in node.orelse:
             ir_node = self.visit(stmt)
             if ir_node is not None:
                 orelse.append(ir_node)
+
+        # After if-else, restore declared_vars to only what was declared BEFORE
+        # the if statement. Variables declared inside if/else blocks are scoped
+        # to those blocks and don't exist in the outer scope (Metal/C behavior).
+        # This ensures that subsequent if-blocks can re-declare the same variables.
+        self.declared_vars = declared_before_if
 
         return IRIf(condition, body, orelse)
 
@@ -454,7 +476,10 @@ class ASTParser(ast.NodeVisitor):
         else:
             raise CompilationError("For loop must use range() or mt.static_for()")
 
-        # Mark variable as declared
+        # Save declared_vars before entering loop body
+        declared_before_loop = self.declared_vars.copy()
+
+        # Mark loop variable as declared (it's in scope for the loop body)
         self.declared_vars.add(var_name)
         self.local_vars[var_name] = TypeInfo(IRType.SCALAR, uint32)
 
@@ -463,6 +488,12 @@ class ASTParser(ast.NodeVisitor):
             ir_node = self.visit(stmt)
             if ir_node is not None:
                 body.append(ir_node)
+
+        # Restore declared_vars after loop - variables declared inside loop
+        # body are scoped to that body and don't exist outside (Metal/C behavior).
+        # Keep the loop variable in scope as it's declared before the loop body.
+        self.declared_vars = declared_before_loop
+        self.declared_vars.add(var_name)
 
         return IRFor(
             var=IRVariable(var_name, TypeInfo(IRType.SCALAR, uint32)),
@@ -495,6 +526,9 @@ class ASTParser(ast.NodeVisitor):
         if start_val is None or end_val is None or step_val is None:
             raise CompilationError("static_for() bounds must be compile-time constants")
 
+        # Save declared_vars before entering loop body
+        declared_before_loop = self.declared_vars.copy()
+
         # Mark variable as declared
         self.declared_vars.add(var_name)
         self.local_vars[var_name] = TypeInfo(IRType.SCALAR, uint32)
@@ -505,6 +539,10 @@ class ASTParser(ast.NodeVisitor):
             ir_node = self.visit(stmt)
             if ir_node is not None:
                 body.append(ir_node)
+
+        # Restore declared_vars after loop - variables inside body are scoped
+        self.declared_vars = declared_before_loop
+        self.declared_vars.add(var_name)
 
         return IRStaticFor(
             var_name=var_name,
@@ -1317,8 +1355,22 @@ class ASTParser(ast.NodeVisitor):
             # Most math functions return float - this is well-defined behavior
             return TypeInfo(IRType.SCALAR, float32)
         elif isinstance(node, IRBinaryOp):
-            # Return type of left operand
-            return self._infer_type(node.left)
+            # Type promotion for binary operations
+            # Float types should propagate through arithmetic operations
+            left_type = self._infer_type(node.left)
+            right_type = self._infer_type(node.right)
+
+            # Check if either operand is a float type
+            float_dtypes = {MetalDType.FLOAT32, MetalDType.FLOAT16, MetalDType.BFLOAT16}
+            left_is_float = (left_type.dtype is not None and
+                           left_type.dtype.metal_dtype in float_dtypes)
+            right_is_float = (right_type.dtype is not None and
+                            right_type.dtype.metal_dtype in float_dtypes)
+
+            # Promote to float if either operand is float
+            if right_is_float and not left_is_float:
+                return right_type
+            return left_type
         elif isinstance(node, IRLoad):
             # Load type should ideally come from pointer type
             if node.type_info is not None:
